@@ -10,3 +10,4 @@ Rive 是本地优先 agent team runtime 的体系文档。
 4. [Phase 2 Fact Ledger 设计](./04-phase2-fact-ledger-design.md)
 5. [Phase 2 Fact Ledger 测试计划](./05-phase2-fact-ledger-test-plan.md)
 6. [Phase 3 Dispatch Ledger 设计](./06-phase3-dispatch-ledger-design.md)
+7. [Phase 3 Dispatch Ledger 测试计划](./07-phase3-dispatch-ledger-test-plan.md)
