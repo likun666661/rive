@@ -1,0 +1,31 @@
+[package]
+name = "rive"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "rive"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rive"
+path = "src/bin/rive.rs"
+
+[[bin]]
+name = "team"
+path = "src/bin/team.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+hex = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+uuid = { version = "1.11", features = ["v4"] }
+walkdir = "2.5"
+
+[dev-dependencies]
+tempfile = "3.14"
