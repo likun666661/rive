@@ -17,6 +17,7 @@ Agent Fact Snapshot Evidence MVP
 ```text
 workspace/path
   -> snapshot capture
+  -> Evidence Workspace Interface
   -> manifest + hashes + blobs
   -> evidence.snapshot_captured event
   -> evidence_ref / snapshot_ref
@@ -84,7 +85,64 @@ dispatch state machine
 - `agentfs diff/timeline/fs` 未来可以导入成 `evidence_ref`。
 - AgentFS 文件变化不能直接改变 dispatch、task、node、graph 状态。
 
-## 4. 一阶段 CLI
+## 4. Evidence Workspace Interface
+
+一阶段必须在 snapshot capture 和底层目录/文件系统之间加抽象接口。上层 capture 逻辑不能直接绑定本地目录结构、`.rive/evidence` 文件布局或 AgentFS。
+
+建议分成三层：
+
+```text
+SnapshotCapture
+  -> EvidenceWorkspace / SnapshotSource
+  -> SnapshotStore / EventStore
+```
+
+`SnapshotCapture` 只处理捕获流程、manifest 生成和 hash 规则。
+
+`EvidenceWorkspace` 只提供和底层工作现场交互的能力：
+
+```text
+list_entries(scope, ignore_rules) -> entries
+metadata(path) -> size / mtime / kind
+read_bytes(path) -> stream / bytes
+hash(path) -> digest
+diff(base_ref?, scope) -> diff_ref / summary?   # v0 可以 no-op
+```
+
+`SnapshotStore` 负责写 manifest、blob 和 event：
+
+```text
+write_blob(bytes) -> blob_ref
+write_manifest(manifest) -> manifest_ref
+append_event(evidence.snapshot_captured)
+resolve_ref(ref) -> readable location / bytes
+```
+
+一阶段默认实现：
+
+```text
+LocalFsEvidenceWorkspace
+LocalSnapshotStore
+SqliteEventStore
+```
+
+测试必须额外提供：
+
+```text
+FakeEvidenceWorkspace / InMemoryEvidenceWorkspace
+```
+
+以证明核心 capture 逻辑不依赖真实文件目录布局。
+
+未来 AgentFS 只需要新增：
+
+```text
+AgentFsEvidenceWorkspace
+```
+
+它可以从 `agentfs fs/diff/timeline` 读取 evidence，但不能绕过 Rive event path 写 fact。
+
+## 5. 一阶段 CLI
 
 一阶段只需要这些命令。
 
@@ -101,7 +159,7 @@ team self-check
 
 `team self-check` 只用于检查 agent-facing ABI 的环境准备情况，不实现 `team send/report/status`。
 
-## 5. Workspace Layout
+## 6. Workspace Layout
 
 `rive init` 创建：
 
@@ -119,7 +177,7 @@ team self-check
 
 一阶段中，`tasks.md` 和 `PROTOCOL.md` 可以是占位/说明文件，不参与事实推导。
 
-## 6. Snapshot Object
+## 7. Snapshot Object
 
 snapshot 是一次证据捕获。
 
@@ -143,7 +201,7 @@ backend = local
 
 `dispatch_id` 在一阶段只是可选关联字段，不要求 dispatch 表或 dispatch 状态机存在。
 
-## 7. Manifest
+## 8. Manifest
 
 manifest 存储在 `.rive/evidence/snapshots/<snapshot_id>/manifest.json`。
 
@@ -177,7 +235,7 @@ manifest 存储在 `.rive/evidence/snapshots/<snapshot_id>/manifest.json`。
 
 manifest 自身也必须有 hash。未来 fact event 引用的是 `evidence_ref` / `snapshot_id` / `manifest_hash`，而不是自由文本说明。
 
-## 8. Evidence Event
+## 9. Evidence Event
 
 capture 成功后写入 SQLite event。
 
@@ -206,7 +264,7 @@ evidence.snapshot_captured
 
 这个 event 只创建 evidence fact。它不改变任何业务状态。
 
-## 9. Read Model
+## 10. Read Model
 
 所有输出继续沿用 protocol/display 分层。
 
@@ -232,7 +290,7 @@ evidence.snapshot_captured
 
 agent 或后续 runtime 只能依赖 `protocol` 字段。`display` 只给人读。
 
-## 10. Ignore / Safety Rules
+## 11. Ignore / Safety Rules
 
 一阶段必须有明确跳过语义。
 
@@ -249,7 +307,7 @@ agent 或后续 runtime 只能依赖 `protocol` 字段。`display` 只给人读�
 
 不存在路径、无权限路径、hash 失败、大文件超过阈值，都要有稳定 error/skip code。
 
-## 11. 一阶段不做什么
+## 12. 一阶段不做什么
 
 明确不做：
 
@@ -261,12 +319,15 @@ agent 或后续 runtime 只能依赖 `protocol` 字段。`display` 只给人读�
 - AgentFS mount/run/sync 管理。
 - 根据 snapshot 自动判断 done/reviewable。
 
-## 12. 验收标准
+## 13. 验收标准
 
 一阶段验收：
 
 - `rive init` 能初始化 workspace。
 - `rive snapshot capture` 能对指定 path 生成 manifest、hash、blob refs。
+- snapshot capture 逻辑只依赖 `EvidenceWorkspace` / `SnapshotSource` 抽象，不直接依赖本地目录结构。
+- 有 fake/in-memory workspace 测试核心 capture 逻辑。
+- 有 local fs backend 端到端测试。
 - `rive snapshot list/show` 能查询 snapshot。
 - capture 写入 `evidence.snapshot_captured` event。
 - snapshot 输出有 `protocol` / `display` 分层。
@@ -276,7 +337,7 @@ agent 或后续 runtime 只能依赖 `protocol` 字段。`display` 只给人读�
 - 忽略路径、大文件、不存在路径、无权限路径有明确语义。
 - `cargo test` 覆盖以上核心规则。
 
-## 13. 后续阶段
+## 14. 后续阶段
 
 只有在一阶段完成后，才进入后续阶段：
 
@@ -285,4 +346,3 @@ agent 或后续 runtime 只能依赖 `protocol` 字段。`display` 只给人读�
 3. Work Graph review/done projection 引用 evidence。
 4. PTY transcript capture。
 5. AgentFS importer/backend。
-
