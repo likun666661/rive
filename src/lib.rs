@@ -1,3 +1,4 @@
+pub mod debug_trace;
 pub mod dispatch;
 pub mod facts;
 pub mod output;
