@@ -6,3 +6,4 @@ Rive 是本地优先 agent team runtime 的体系文档。
 
 1. [Agent 协作协议](./01-agent-collaboration-protocol.md)
 2. [Rust CLI 实现阶段与 AgentFS 策略](./02-rust-cli-implementation-plan.md)
+3. [Phase 1 Snapshot Evidence 测试计划](./03-phase1-snapshot-evidence-test-plan.md)
