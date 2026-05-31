@@ -34,6 +34,40 @@ pub struct EventStore {
     conn: Connection,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactRecord {
+    pub event_id: String,
+    pub command_id: String,
+    pub created_at: DateTime<Utc>,
+    pub workspace_id: String,
+    pub actor_agent_id: String,
+    pub actor_run_id: Option<String>,
+    pub fact_type: String,
+    pub body_hash: String,
+    pub body_blob_ref: String,
+    pub evidence_refs: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertFactInput {
+    pub event: EventRecord,
+    pub command_id: String,
+    pub workspace_id: String,
+    pub actor_agent_id: String,
+    pub actor_run_id: Option<String>,
+    pub fact_type: String,
+    pub body_hash: String,
+    pub body_blob_ref: String,
+    pub evidence_refs: Value,
+}
+
+#[derive(Debug, Clone)]
+pub enum IdempotencyResolution<T> {
+    Inserted(T),
+    Replayed(T),
+    Conflict(T),
+}
+
 impl EventStore {
     pub fn open(path: &Path) -> Result<Self> {
         Ok(Self {
@@ -64,6 +98,19 @@ impl EventStore {
               manifest_hash TEXT NOT NULL,
               file_count INTEGER NOT NULL,
               total_bytes INTEGER NOT NULL,
+              FOREIGN KEY(event_id) REFERENCES events(event_id)
+            );
+            CREATE TABLE IF NOT EXISTS facts (
+              event_id TEXT PRIMARY KEY,
+              command_id TEXT NOT NULL UNIQUE,
+              created_at TEXT NOT NULL,
+              workspace_id TEXT NOT NULL,
+              actor_agent_id TEXT NOT NULL,
+              actor_run_id TEXT,
+              fact_type TEXT NOT NULL,
+              body_hash TEXT NOT NULL,
+              body_blob_ref TEXT NOT NULL,
+              evidence_refs_json TEXT NOT NULL,
               FOREIGN KEY(event_id) REFERENCES events(event_id)
             );
             "#,
@@ -155,6 +202,120 @@ impl EventStore {
         }
         Ok(events)
     }
+
+    pub fn insert_fact_idempotent(
+        &self,
+        input: &InsertFactInput,
+    ) -> Result<IdempotencyResolution<FactRecord>> {
+        if let Some(existing) = self.get_fact_by_command_id(&input.command_id)? {
+            if existing.actor_agent_id == input.actor_agent_id
+                && existing.workspace_id == input.workspace_id
+                && existing.actor_run_id == input.actor_run_id
+                && existing.fact_type == input.fact_type
+                && existing.body_hash == input.body_hash
+                && existing.evidence_refs == input.evidence_refs
+            {
+                return Ok(IdempotencyResolution::Replayed(existing));
+            }
+            return Ok(IdempotencyResolution::Conflict(existing));
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO events (event_id, event_type, created_at, payload_json) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                input.event.event_id,
+                input.event.event_type,
+                input.event.created_at.to_rfc3339(),
+                serde_json::to_string(&input.event.payload)?,
+            ],
+        )?;
+        tx.execute(
+            r#"
+            INSERT INTO facts (
+              event_id, command_id, created_at, workspace_id, actor_agent_id,
+              actor_run_id, fact_type, body_hash, body_blob_ref, evidence_refs_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+            params![
+                input.event.event_id,
+                input.command_id,
+                input.event.created_at.to_rfc3339(),
+                input.workspace_id,
+                input.actor_agent_id,
+                input.actor_run_id,
+                input.fact_type,
+                input.body_hash,
+                input.body_blob_ref,
+                serde_json::to_string(&input.evidence_refs)?,
+            ],
+        )?;
+        tx.commit()?;
+
+        Ok(IdempotencyResolution::Inserted(FactRecord {
+            event_id: input.event.event_id.clone(),
+            command_id: input.command_id.clone(),
+            created_at: input.event.created_at,
+            workspace_id: input.workspace_id.clone(),
+            actor_agent_id: input.actor_agent_id.clone(),
+            actor_run_id: input.actor_run_id.clone(),
+            fact_type: input.fact_type.clone(),
+            body_hash: input.body_hash.clone(),
+            body_blob_ref: input.body_blob_ref.clone(),
+            evidence_refs: input.evidence_refs.clone(),
+        }))
+    }
+
+    pub fn list_facts(&self) -> Result<Vec<FactRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT event_id, command_id, created_at, workspace_id, actor_agent_id,
+                   actor_run_id, fact_type, body_hash, body_blob_ref, evidence_refs_json
+            FROM facts
+            ORDER BY created_at DESC
+            "#,
+        )?;
+        let rows = stmt.query_map([], row_to_fact)?;
+        let mut facts = Vec::new();
+        for row in rows {
+            facts.push(row?);
+        }
+        Ok(facts)
+    }
+
+    pub fn get_fact_by_event_id(&self, event_id: &str) -> Result<Option<FactRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT event_id, command_id, created_at, workspace_id, actor_agent_id,
+                   actor_run_id, fact_type, body_hash, body_blob_ref, evidence_refs_json
+            FROM facts
+            WHERE event_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![event_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_fact(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_fact_by_command_id(&self, command_id: &str) -> Result<Option<FactRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT event_id, command_id, created_at, workspace_id, actor_agent_id,
+                   actor_run_id, fact_type, body_hash, body_blob_ref, evidence_refs_json
+            FROM facts
+            WHERE command_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![command_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_fact(row)?))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotRecord> {
@@ -187,6 +348,25 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRecord> {
         created_at: parse_time_for_sql(&created_at)?,
         payload: serde_json::from_str(&payload_json).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(err))
+        })?,
+    })
+}
+
+fn row_to_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<FactRecord> {
+    let created_at: String = row.get(2)?;
+    let evidence_refs_json: String = row.get(9)?;
+    Ok(FactRecord {
+        event_id: row.get(0)?,
+        command_id: row.get(1)?,
+        created_at: parse_time_for_sql(&created_at)?,
+        workspace_id: row.get(3)?,
+        actor_agent_id: row.get(4)?,
+        actor_run_id: row.get(5)?,
+        fact_type: row.get(6)?,
+        body_hash: row.get(7)?,
+        body_blob_ref: row.get(8)?,
+        evidence_refs: serde_json::from_str(&evidence_refs_json).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(err))
         })?,
     })
 }
