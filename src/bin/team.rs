@@ -268,6 +268,7 @@ fn record_fact(
     let workspace = find_workspace(std::path::Path::new(&actor.workspace))?;
     let store = EventStore::open(&workspace.db_path())?;
     store.init_schema()?;
+    authenticate_actor(&store, &actor)?;
     let snapshot_store = LocalSnapshotStore::new(&workspace);
     let recorder = FactRecorder::new(&workspace, &store, &snapshot_store);
     let mut body = Vec::new();
@@ -341,7 +342,7 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
     } else if lower.contains("actor not authenticated") {
         ("actor_not_authenticated", false, "stop_and_report")
     } else if lower.contains("invalid agent token") {
-        ("invalid_agent_token", false, "stop_and_report")
+        ("agent_token_invalid", false, "stop_and_report")
     } else if lower.contains("agent not found") {
         ("agent_not_found", false, "stop_and_report")
     } else if lower.contains("dispatch not assigned") {

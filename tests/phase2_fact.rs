@@ -324,3 +324,65 @@ fn manifest_integrity_error_is_rejected() {
     );
     assert_eq!(error["protocol"]["code"], "evidence_integrity_error");
 }
+
+#[test]
+fn generic_fact_requires_registered_agent_and_valid_token() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("work.txt"), "ready\n").unwrap();
+    run_json(rive_cmd().arg("init").arg(temp.path()));
+    let agent_id = add_worker_agent(&temp);
+    let capture = run_json(
+        rive_cmd()
+            .arg("snapshot")
+            .arg("capture")
+            .arg("--path")
+            .arg(temp.path()),
+    );
+    let snapshot_id = capture["protocol"]["snapshot_id"].as_str().unwrap();
+
+    let fake_agent = run_json_expect_error(
+        team_cmd()
+            .env("RIVE_WORKSPACE", temp.path())
+            .env("RIVE_AGENT_ID", "agent_fake")
+            .env("RIVE_AGENT_TOKEN", "fake-token")
+            .arg("fact")
+            .arg("record")
+            .arg("--type")
+            .arg("observation")
+            .arg("--snapshot")
+            .arg(snapshot_id)
+            .arg("--command-id")
+            .arg("cmd-fake-generic")
+            .arg("--stdin"),
+        Some("fake generic fact\n"),
+    );
+    assert_eq!(fake_agent["protocol"]["code"], "agent_not_found");
+
+    let wrong_token = run_json_expect_error(
+        team_cmd()
+            .env("RIVE_WORKSPACE", temp.path())
+            .env("RIVE_AGENT_ID", &agent_id)
+            .env("RIVE_AGENT_TOKEN", "wrong-token")
+            .arg("fact")
+            .arg("record")
+            .arg("--type")
+            .arg("observation")
+            .arg("--snapshot")
+            .arg(snapshot_id)
+            .arg("--command-id")
+            .arg("cmd-wrong-token-generic")
+            .arg("--stdin"),
+        Some("wrong token generic fact\n"),
+    );
+    assert_eq!(wrong_token["protocol"]["code"], "agent_token_invalid");
+
+    let conn = Connection::open(temp.path().join(".rive/rive.db")).unwrap();
+    let fake_fact_count: i64 = conn
+        .query_row(
+            "select count(*) from facts where actor_agent_id = 'agent_fake'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(fake_fact_count, 0);
+}
