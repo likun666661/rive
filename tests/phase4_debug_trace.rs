@@ -325,7 +325,14 @@ fn trace_errors_and_install_templates_are_stable() {
             .arg(temp.path()),
     );
     let codex_path = codex["protocol"]["path"].as_str().unwrap();
-    let codex_hook = fs::read_to_string(codex_path).unwrap();
+    let codex_hooks_json = fs::read_to_string(codex_path).unwrap();
+    assert!(codex_hooks_json.contains("RIVE-MANAGED-CODEX-TRACE-HOOKS"));
+    assert!(codex_hooks_json.contains("SessionStart"));
+    assert!(codex_hooks_json.contains("PostToolUse"));
+    let codex_hook_path = temp
+        .path()
+        .join(".rive/debug/adapters/codex-rive-trace-hook.sh");
+    let codex_hook = fs::read_to_string(codex_hook_path).unwrap();
     assert!(codex_hook.contains("rive debug trace ingest --adapter codex-hook --stdin"));
     assert!(codex_hook.contains("|| true"));
     let codex_again = run_json(
@@ -338,7 +345,10 @@ fn trace_errors_and_install_templates_are_stable() {
             .arg("--workspace")
             .arg(temp.path()),
     );
-    assert_eq!(codex_again["protocol"]["status"], "unchanged");
+    assert_eq!(
+        codex_again["protocol"]["status"],
+        "config:unchanged; script:unchanged"
+    );
 
     let opencode = run_json(
         rive_cmd()

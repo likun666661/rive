@@ -671,22 +671,41 @@ fn normalize_opencode(payload: &Value, input: &IngestTraceInput) -> NormalizedEv
 }
 
 pub fn install_codex_hook(workspace: &Workspace) -> Result<TraceInstallProtocol> {
-    let dir = workspace.debug_dir().join("adapters");
-    fs::create_dir_all(&dir)?;
-    let path = dir.join("codex-rive-trace-hook.sh");
+    let script_dir = workspace.debug_dir().join("adapters");
+    fs::create_dir_all(&script_dir)?;
+    let script_path = script_dir.join("codex-rive-trace-hook.sh");
     let content = "#!/bin/sh\n# RIVE-MANAGED-CODEX-TRACE-HOOK\nrive debug trace ingest --adapter codex-hook --stdin >/dev/null 2>/dev/null || true\nexit 0\n";
-    let status = write_managed_file(&path, content, "RIVE-MANAGED-CODEX-TRACE-HOOK")?;
+    let script_status = write_managed_file(&script_path, content, "RIVE-MANAGED-CODEX-TRACE-HOOK")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&path)?.permissions();
+        let mut perms = fs::metadata(&script_path)?.permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(&path, perms)?;
+        fs::set_permissions(&script_path, perms)?;
     }
+    let config_dir = workspace.root.join(".codex");
+    fs::create_dir_all(&config_dir)?;
+    let config_path = config_dir.join("hooks.json");
+    let command = script_path.to_string_lossy();
+    let config = serde_json::to_string_pretty(&json!({
+        "_rive_managed": "RIVE-MANAGED-CODEX-TRACE-HOOKS",
+        "hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": command}]}],
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": command}]}],
+            "PreToolUse": [{"hooks": [{"type": "command", "command": command}]}],
+            "PostToolUse": [{"hooks": [{"type": "command", "command": command}]}],
+            "PermissionRequest": [{"hooks": [{"type": "command", "command": command}]}],
+            "SubagentStart": [{"hooks": [{"type": "command", "command": command}]}],
+            "SubagentStop": [{"hooks": [{"type": "command", "command": command}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": command}]}]
+        }
+    }))?;
+    let config_status =
+        write_managed_file(&config_path, &config, "RIVE-MANAGED-CODEX-TRACE-HOOKS")?;
     Ok(TraceInstallProtocol {
         target: "codex".to_string(),
-        path: path.display().to_string(),
-        status,
+        path: config_path.display().to_string(),
+        status: format!("config:{config_status}; script:{script_status}"),
     })
 }
 
@@ -733,11 +752,8 @@ export default async function RiveTracePlugin() {
 pub fn uninstall_managed(workspace: &Workspace, target: &str) -> Result<TraceInstallProtocol> {
     let (path, marker) = match target {
         "codex" => (
-            workspace
-                .debug_dir()
-                .join("adapters")
-                .join("codex-rive-trace-hook.sh"),
-            "RIVE-MANAGED-CODEX-TRACE-HOOK",
+            workspace.root.join(".codex").join("hooks.json"),
+            "RIVE-MANAGED-CODEX-TRACE-HOOKS",
         ),
         "opencode" => (
             workspace
@@ -760,6 +776,18 @@ pub fn uninstall_managed(workspace: &Workspace, target: &str) -> Result<TraceIns
     } else {
         "skipped_missing"
     };
+    if target == "codex" {
+        let script_path = workspace
+            .debug_dir()
+            .join("adapters")
+            .join("codex-rive-trace-hook.sh");
+        if script_path.exists() {
+            let content = fs::read_to_string(&script_path)?;
+            if content.contains("RIVE-MANAGED-CODEX-TRACE-HOOK") {
+                fs::remove_file(&script_path)?;
+            }
+        }
+    }
     Ok(TraceInstallProtocol {
         target: target.to_string(),
         path: path.display().to_string(),
