@@ -1,3 +1,4 @@
+pub mod facts;
 pub mod output;
 pub mod snapshot;
 pub mod store;

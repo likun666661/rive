@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
+use rive::facts::{protocol_from_fact, FactDisplay, FactListDisplay, FactListProtocol};
 use rive::output::{Envelope, ErrorEnvelope};
 use rive::snapshot::{
     read_manifest, CaptureDisplay, CaptureOptions, CaptureProtocol, LocalFsEvidenceWorkspace,
@@ -33,6 +34,10 @@ enum Commands {
         #[command(subcommand)]
         command: EvidenceCommands,
     },
+    Fact {
+        #[command(subcommand)]
+        command: FactCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -56,6 +61,12 @@ enum SnapshotCommands {
 #[derive(Subcommand)]
 enum EvidenceCommands {
     List,
+}
+
+#[derive(Subcommand)]
+enum FactCommands {
+    List,
+    Show { event_id: String },
 }
 
 fn main() {
@@ -206,6 +217,35 @@ fn run() -> Result<()> {
                 print_json(&Envelope::new(protocol, display))
             }
         },
+        Commands::Fact { command } => match command {
+            FactCommands::List => {
+                let workspace = find_workspace(&std::env::current_dir()?)?;
+                let store = EventStore::open(&workspace.db_path())?;
+                let facts = store.list_facts()?;
+                let protocol = FactListProtocol {
+                    facts: facts
+                        .iter()
+                        .map(|fact| protocol_from_fact(fact, "read"))
+                        .collect(),
+                };
+                let display = FactListDisplay {
+                    summary: format!("{} facts", facts.len()),
+                };
+                print_json(&Envelope::new(protocol, display))
+            }
+            FactCommands::Show { event_id } => {
+                let workspace = find_workspace(&std::env::current_dir()?)?;
+                let store = EventStore::open(&workspace.db_path())?;
+                let fact = store
+                    .get_fact_by_event_id(&event_id)?
+                    .ok_or_else(|| anyhow!("fact not found: {event_id}"))?;
+                let protocol = protocol_from_fact(&fact, "read");
+                let display = FactDisplay {
+                    summary: format!("{} fact {}", protocol.fact_type, protocol.event_id),
+                };
+                print_json(&Envelope::new(protocol, display))
+            }
+        },
     }
 }
 
@@ -219,6 +259,10 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
     let lower = message.to_lowercase();
     let (code, action) = if lower.contains("no .rive workspace") {
         ("workspace_not_found", "run_rive_init")
+    } else if lower.contains("evidence not found") {
+        ("evidence_not_found", "fix_arguments")
+    } else if lower.contains("idempotency conflict") {
+        ("idempotency_conflict", "inspect_projection")
     } else if lower.contains("does not exist") || lower.contains("not found") {
         ("not_found", "fix_arguments")
     } else if lower.contains("permission denied") {
