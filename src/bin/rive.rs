@@ -1,7 +1,13 @@
+use std::io::Read;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
+use rive::dispatch::{
+    agent_protocol, dispatch_protocol, AddAgentInput, AddAgentProtocol, AgentListProtocol,
+    CancelDispatchCommand, CancelDispatchOutcome, CreateDispatchInput, CreateDispatchOutcome,
+    DispatchListProtocol, DispatchService,
+};
 use rive::facts::{protocol_from_fact, FactDisplay, FactListDisplay, FactListProtocol};
 use rive::output::{Envelope, ErrorEnvelope};
 use rive::snapshot::{
@@ -9,7 +15,7 @@ use rive::snapshot::{
     LocalSnapshotStore, SnapshotCapture, SnapshotListDisplay, SnapshotListProtocol,
     SnapshotShowDisplay, SnapshotShowProtocol, SnapshotSummaryProtocol,
 };
-use rive::store::EventStore;
+use rive::store::{AgentRole, EventStore};
 use rive::workspace::{find_workspace, init_workspace};
 
 #[derive(Parser)]
@@ -37,6 +43,14 @@ enum Commands {
     Fact {
         #[command(subcommand)]
         command: FactCommands,
+    },
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommands,
+    },
+    Dispatch {
+        #[command(subcommand)]
+        command: DispatchCommands,
     },
 }
 
@@ -67,6 +81,46 @@ enum EvidenceCommands {
 enum FactCommands {
     List,
     Show { event_id: String },
+}
+
+#[derive(Subcommand)]
+enum AgentCommands {
+    Add {
+        name: String,
+        #[arg(long)]
+        role: String,
+        #[arg(long)]
+        token: Option<String>,
+    },
+    List,
+    Show {
+        name_or_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DispatchCommands {
+    Create {
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long = "command-id")]
+        command_id: String,
+        #[arg(long)]
+        stdin: bool,
+    },
+    List,
+    Show {
+        dispatch_id: String,
+    },
+    Cancel {
+        dispatch_id: String,
+        #[arg(long = "command-id")]
+        command_id: String,
+        #[arg(long)]
+        reason: String,
+    },
 }
 
 fn main() {
@@ -246,6 +300,143 @@ fn run() -> Result<()> {
                 print_json(&Envelope::new(protocol, display))
             }
         },
+        Commands::Agent { command } => match command {
+            AgentCommands::Add { name, role, token } => {
+                let workspace = find_workspace(&std::env::current_dir()?)?;
+                let store = EventStore::open(&workspace.db_path())?;
+                store.init_schema()?;
+                let snapshot_store = LocalSnapshotStore::new(&workspace);
+                let service = DispatchService::new(&workspace, &store, &snapshot_store);
+                let outcome = service.add_agent(AddAgentInput {
+                    name,
+                    role: AgentRole::parse(&role)?,
+                    token,
+                })?;
+                let protocol = AddAgentProtocol {
+                    agent: agent_protocol(&outcome.agent),
+                    token: outcome.token,
+                };
+                let display = serde_json::json!({
+                    "summary": format!("Added {} agent {}", protocol.agent.role, protocol.agent.name),
+                    "token_note": "Store this token; only its hash is persisted.",
+                });
+                print_json(&Envelope::new(protocol, display))
+            }
+            AgentCommands::List => {
+                let workspace = find_workspace(&std::env::current_dir()?)?;
+                let store = EventStore::open(&workspace.db_path())?;
+                store.init_schema()?;
+                let agents = store.list_agents()?;
+                let protocol = AgentListProtocol {
+                    agents: agents.iter().map(agent_protocol).collect(),
+                };
+                let display = serde_json::json!({
+                    "summary": format!("{} agents", agents.len()),
+                });
+                print_json(&Envelope::new(protocol, display))
+            }
+            AgentCommands::Show { name_or_id } => {
+                let workspace = find_workspace(&std::env::current_dir()?)?;
+                let store = EventStore::open(&workspace.db_path())?;
+                store.init_schema()?;
+                let agent = store
+                    .get_agent(&name_or_id)?
+                    .ok_or_else(|| anyhow!("agent not found: {name_or_id}"))?;
+                let protocol = agent_protocol(&agent);
+                let display = serde_json::json!({
+                    "summary": format!("{} agent {}", protocol.role, protocol.name),
+                });
+                print_json(&Envelope::new(protocol, display))
+            }
+        },
+        Commands::Dispatch { command } => match command {
+            DispatchCommands::Create {
+                target,
+                title,
+                command_id,
+                stdin,
+            } => {
+                if !stdin {
+                    return Err(anyhow!("dispatch create requires --stdin"));
+                }
+                let workspace = find_workspace(&std::env::current_dir()?)?;
+                let store = EventStore::open(&workspace.db_path())?;
+                store.init_schema()?;
+                let snapshot_store = LocalSnapshotStore::new(&workspace);
+                let service = DispatchService::new(&workspace, &store, &snapshot_store);
+                let mut body = Vec::new();
+                std::io::stdin().read_to_end(&mut body)?;
+                let outcome = service.create_dispatch(CreateDispatchInput {
+                    command_id,
+                    target_agent: target,
+                    title,
+                    body,
+                })?;
+                let (dispatch, idempotency_status) = match outcome {
+                    CreateDispatchOutcome::Inserted(dispatch) => (dispatch, "inserted"),
+                    CreateDispatchOutcome::Replayed(dispatch) => (dispatch, "replayed"),
+                };
+                let protocol = dispatch_protocol(&dispatch, idempotency_status);
+                let display = serde_json::json!({
+                    "summary": format!("Dispatch {} is {}", protocol.dispatch_id, protocol.state),
+                });
+                print_json(&Envelope::new(protocol, display))
+            }
+            DispatchCommands::List => {
+                let workspace = find_workspace(&std::env::current_dir()?)?;
+                let store = EventStore::open(&workspace.db_path())?;
+                store.init_schema()?;
+                let dispatches = store.list_dispatches()?;
+                let protocol = DispatchListProtocol {
+                    dispatches: dispatches
+                        .iter()
+                        .map(|dispatch| dispatch_protocol(dispatch, "read"))
+                        .collect(),
+                };
+                let display = serde_json::json!({
+                    "summary": format!("{} dispatches", dispatches.len()),
+                });
+                print_json(&Envelope::new(protocol, display))
+            }
+            DispatchCommands::Show { dispatch_id } => {
+                let workspace = find_workspace(&std::env::current_dir()?)?;
+                let store = EventStore::open(&workspace.db_path())?;
+                store.init_schema()?;
+                let dispatch = store
+                    .get_dispatch(&dispatch_id)?
+                    .ok_or_else(|| anyhow!("dispatch not found: {dispatch_id}"))?;
+                let protocol = dispatch_protocol(&dispatch, "read");
+                let display = serde_json::json!({
+                    "summary": format!("Dispatch {} is {}", protocol.dispatch_id, protocol.state),
+                });
+                print_json(&Envelope::new(protocol, display))
+            }
+            DispatchCommands::Cancel {
+                dispatch_id,
+                command_id,
+                reason,
+            } => {
+                let workspace = find_workspace(&std::env::current_dir()?)?;
+                let store = EventStore::open(&workspace.db_path())?;
+                store.init_schema()?;
+                let snapshot_store = LocalSnapshotStore::new(&workspace);
+                let service = DispatchService::new(&workspace, &store, &snapshot_store);
+                let outcome = service.cancel_dispatch(CancelDispatchCommand {
+                    command_id,
+                    dispatch_id,
+                    reason,
+                })?;
+                let (dispatch, idempotency_status) = match outcome {
+                    CancelDispatchOutcome::Inserted(dispatch) => (dispatch, "inserted"),
+                    CancelDispatchOutcome::Replayed(dispatch) => (dispatch, "replayed"),
+                };
+                let protocol = dispatch_protocol(&dispatch, idempotency_status);
+                let display = serde_json::json!({
+                    "summary": format!("Dispatch {} is {}", protocol.dispatch_id, protocol.state),
+                });
+                print_json(&Envelope::new(protocol, display))
+            }
+        },
     }
 }
 
@@ -259,6 +450,14 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
     let lower = message.to_lowercase();
     let (code, action) = if lower.contains("no .rive workspace") {
         ("workspace_not_found", "run_rive_init")
+    } else if lower.contains("invalid agent role") {
+        ("invalid_agent_role", "fix_arguments")
+    } else if lower.contains("dispatch target must be worker") {
+        ("invalid_dispatch_target", "fix_arguments")
+    } else if lower.contains("dispatch closed") {
+        ("dispatch_closed", "inspect_projection")
+    } else if lower.contains("missing command id") {
+        ("missing_command_id", "fix_arguments")
     } else if lower.contains("evidence not found") {
         ("evidence_not_found", "fix_arguments")
     } else if lower.contains("idempotency conflict") {

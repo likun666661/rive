@@ -48,6 +48,111 @@ pub struct FactRecord {
     pub evidence_refs: Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AgentRole {
+    Orchestrator,
+    Worker,
+}
+
+impl AgentRole {
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "orchestrator" => Ok(Self::Orchestrator),
+            "worker" => Ok(Self::Worker),
+            _ => anyhow::bail!("invalid agent role: {value}"),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Orchestrator => "orchestrator",
+            Self::Worker => "worker",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRecord {
+    pub agent_id: String,
+    pub name: String,
+    pub role: AgentRole,
+    pub token_hash: String,
+    pub created_at: DateTime<Utc>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DispatchState {
+    Open,
+    Reported,
+    Blocked,
+    Failed,
+    Cancelled,
+}
+
+impl DispatchState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Reported => "reported",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn is_open_for_status(&self) -> bool {
+        matches!(self, Self::Open | Self::Blocked)
+    }
+
+    pub fn is_open_for_report(&self) -> bool {
+        matches!(self, Self::Open | Self::Blocked)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchRecord {
+    pub dispatch_id: String,
+    pub created_event_id: String,
+    pub command_id: String,
+    pub target_agent_id: String,
+    pub title: String,
+    pub body_hash: String,
+    pub body_blob_ref: String,
+    pub state: DispatchState,
+    pub latest_fact_event_id: Option<String>,
+    pub latest_report_status: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertDispatchInput {
+    pub event: EventRecord,
+    pub command_id: String,
+    pub dispatch_id: String,
+    pub target_agent_id: String,
+    pub title: String,
+    pub body_hash: String,
+    pub body_blob_ref: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DispatchTransitionInput {
+    pub fact: InsertFactInput,
+    pub dispatch_id: String,
+    pub next_state: DispatchState,
+    pub latest_report_status: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CancelDispatchInput {
+    pub event: EventRecord,
+    pub command_id: String,
+    pub dispatch_id: String,
+    pub reason_hash: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct InsertFactInput {
     pub event: EventRecord,
@@ -112,6 +217,38 @@ impl EventStore {
               body_blob_ref TEXT NOT NULL,
               evidence_refs_json TEXT NOT NULL,
               FOREIGN KEY(event_id) REFERENCES events(event_id)
+            );
+            CREATE TABLE IF NOT EXISTS agents (
+              agent_id TEXT PRIMARY KEY,
+              name TEXT NOT NULL UNIQUE,
+              role TEXT NOT NULL,
+              token_hash TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              status TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS dispatches (
+              dispatch_id TEXT PRIMARY KEY,
+              created_event_id TEXT NOT NULL,
+              command_id TEXT NOT NULL UNIQUE,
+              target_agent_id TEXT NOT NULL,
+              title TEXT NOT NULL,
+              body_hash TEXT NOT NULL,
+              body_blob_ref TEXT NOT NULL,
+              state TEXT NOT NULL,
+              latest_fact_event_id TEXT,
+              latest_report_status TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY(created_event_id) REFERENCES events(event_id),
+              FOREIGN KEY(target_agent_id) REFERENCES agents(agent_id)
+            );
+            CREATE TABLE IF NOT EXISTS dispatch_cancellations (
+              command_id TEXT PRIMARY KEY,
+              event_id TEXT NOT NULL UNIQUE,
+              dispatch_id TEXT NOT NULL,
+              reason_hash TEXT NOT NULL,
+              FOREIGN KEY(event_id) REFERENCES events(event_id),
+              FOREIGN KEY(dispatch_id) REFERENCES dispatches(dispatch_id)
             );
             "#,
         )?;
@@ -201,6 +338,18 @@ impl EventStore {
             events.push(row?);
         }
         Ok(events)
+    }
+
+    pub fn get_event_by_id(&self, event_id: &str) -> Result<Option<EventRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, event_type, created_at, payload_json FROM events WHERE event_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![event_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_event(row)?))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn insert_fact_idempotent(
@@ -316,6 +465,410 @@ impl EventStore {
             Ok(None)
         }
     }
+
+    pub fn insert_agent(&self, agent: &AgentRecord) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO agents (agent_id, name, role, token_hash, created_at, status)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                agent.agent_id,
+                agent.name,
+                agent.role.as_str(),
+                agent.token_hash,
+                agent.created_at.to_rfc3339(),
+                agent.status,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_agent_with_event(&self, event: &EventRecord, agent: &AgentRecord) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO events (event_id, event_type, created_at, payload_json) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                event.event_id,
+                event.event_type,
+                event.created_at.to_rfc3339(),
+                serde_json::to_string(&event.payload)?,
+            ],
+        )?;
+        tx.execute(
+            r#"
+            INSERT INTO agents (agent_id, name, role, token_hash, created_at, status)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                agent.agent_id,
+                agent.name,
+                agent.role.as_str(),
+                agent.token_hash,
+                agent.created_at.to_rfc3339(),
+                agent.status,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_agents(&self) -> Result<Vec<AgentRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT agent_id, name, role, token_hash, created_at, status FROM agents ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], row_to_agent)?;
+        let mut agents = Vec::new();
+        for row in rows {
+            agents.push(row?);
+        }
+        Ok(agents)
+    }
+
+    pub fn get_agent(&self, name_or_id: &str) -> Result<Option<AgentRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT agent_id, name, role, token_hash, created_at, status
+            FROM agents
+            WHERE agent_id = ?1 OR name = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![name_or_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_agent(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn insert_dispatch_idempotent(
+        &self,
+        input: &InsertDispatchInput,
+    ) -> Result<IdempotencyResolution<DispatchRecord>> {
+        if let Some(existing) = self.get_dispatch_by_command_id(&input.command_id)? {
+            if existing.target_agent_id == input.target_agent_id
+                && existing.title == input.title
+                && existing.body_hash == input.body_hash
+            {
+                return Ok(IdempotencyResolution::Replayed(existing));
+            }
+            return Ok(IdempotencyResolution::Conflict(existing));
+        }
+
+        let now = input.event.created_at;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO events (event_id, event_type, created_at, payload_json) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                input.event.event_id,
+                input.event.event_type,
+                input.event.created_at.to_rfc3339(),
+                serde_json::to_string(&input.event.payload)?,
+            ],
+        )?;
+        tx.execute(
+            r#"
+            INSERT INTO dispatches (
+              dispatch_id, created_event_id, command_id, target_agent_id, title,
+              body_hash, body_blob_ref, state, latest_fact_event_id,
+              latest_report_status, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?10)
+            "#,
+            params![
+                input.dispatch_id,
+                input.event.event_id,
+                input.command_id,
+                input.target_agent_id,
+                input.title,
+                input.body_hash,
+                input.body_blob_ref,
+                DispatchState::Open.as_str(),
+                now.to_rfc3339(),
+                now.to_rfc3339(),
+            ],
+        )?;
+        tx.commit()?;
+
+        Ok(IdempotencyResolution::Inserted(DispatchRecord {
+            dispatch_id: input.dispatch_id.clone(),
+            created_event_id: input.event.event_id.clone(),
+            command_id: input.command_id.clone(),
+            target_agent_id: input.target_agent_id.clone(),
+            title: input.title.clone(),
+            body_hash: input.body_hash.clone(),
+            body_blob_ref: input.body_blob_ref.clone(),
+            state: DispatchState::Open,
+            latest_fact_event_id: None,
+            latest_report_status: None,
+            created_at: now,
+            updated_at: now,
+        }))
+    }
+
+    pub fn transition_dispatch_with_fact_idempotent(
+        &self,
+        input: &DispatchTransitionInput,
+    ) -> Result<IdempotencyResolution<(FactRecord, DispatchRecord)>> {
+        if let Some(existing_fact) = self.get_fact_by_command_id(&input.fact.command_id)? {
+            let dispatch = self
+                .get_dispatch(&input.dispatch_id)?
+                .ok_or_else(|| anyhow::anyhow!("dispatch not found: {}", input.dispatch_id))?;
+            if existing_fact.actor_agent_id == input.fact.actor_agent_id
+                && existing_fact.workspace_id == input.fact.workspace_id
+                && existing_fact.actor_run_id == input.fact.actor_run_id
+                && existing_fact.fact_type == input.fact.fact_type
+                && existing_fact.body_hash == input.fact.body_hash
+                && existing_fact.evidence_refs == input.fact.evidence_refs
+                && dispatch.latest_fact_event_id.as_deref() == Some(existing_fact.event_id.as_str())
+            {
+                return Ok(IdempotencyResolution::Replayed((existing_fact, dispatch)));
+            }
+            return Ok(IdempotencyResolution::Conflict((existing_fact, dispatch)));
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO events (event_id, event_type, created_at, payload_json) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                input.fact.event.event_id,
+                input.fact.event.event_type,
+                input.fact.event.created_at.to_rfc3339(),
+                serde_json::to_string(&input.fact.event.payload)?,
+            ],
+        )?;
+        tx.execute(
+            r#"
+            INSERT INTO facts (
+              event_id, command_id, created_at, workspace_id, actor_agent_id,
+              actor_run_id, fact_type, body_hash, body_blob_ref, evidence_refs_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+            params![
+                input.fact.event.event_id,
+                input.fact.command_id,
+                input.fact.event.created_at.to_rfc3339(),
+                input.fact.workspace_id,
+                input.fact.actor_agent_id,
+                input.fact.actor_run_id,
+                input.fact.fact_type,
+                input.fact.body_hash,
+                input.fact.body_blob_ref,
+                serde_json::to_string(&input.fact.evidence_refs)?,
+            ],
+        )?;
+        tx.execute(
+            r#"
+            UPDATE dispatches
+            SET state = ?1,
+                latest_fact_event_id = ?2,
+                latest_report_status = ?3,
+                updated_at = ?4
+            WHERE dispatch_id = ?5
+            "#,
+            params![
+                input.next_state.as_str(),
+                input.fact.event.event_id,
+                input.latest_report_status,
+                input.fact.event.created_at.to_rfc3339(),
+                input.dispatch_id,
+            ],
+        )?;
+        tx.commit()?;
+
+        let fact = FactRecord {
+            event_id: input.fact.event.event_id.clone(),
+            command_id: input.fact.command_id.clone(),
+            created_at: input.fact.event.created_at,
+            workspace_id: input.fact.workspace_id.clone(),
+            actor_agent_id: input.fact.actor_agent_id.clone(),
+            actor_run_id: input.fact.actor_run_id.clone(),
+            fact_type: input.fact.fact_type.clone(),
+            body_hash: input.fact.body_hash.clone(),
+            body_blob_ref: input.fact.body_blob_ref.clone(),
+            evidence_refs: input.fact.evidence_refs.clone(),
+        };
+        let dispatch = self
+            .get_dispatch(&input.dispatch_id)?
+            .ok_or_else(|| anyhow::anyhow!("dispatch not found: {}", input.dispatch_id))?;
+        Ok(IdempotencyResolution::Inserted((fact, dispatch)))
+    }
+
+    pub fn list_dispatches(&self) -> Result<Vec<DispatchRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT dispatch_id, created_event_id, command_id, target_agent_id, title,
+                   body_hash, body_blob_ref, state, latest_fact_event_id,
+                   latest_report_status, created_at, updated_at
+            FROM dispatches
+            ORDER BY created_at DESC
+            "#,
+        )?;
+        let rows = stmt.query_map([], row_to_dispatch)?;
+        let mut dispatches = Vec::new();
+        for row in rows {
+            dispatches.push(row?);
+        }
+        Ok(dispatches)
+    }
+
+    pub fn list_dispatches_for_agent(&self, agent_id: &str) -> Result<Vec<DispatchRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT dispatch_id, created_event_id, command_id, target_agent_id, title,
+                   body_hash, body_blob_ref, state, latest_fact_event_id,
+                   latest_report_status, created_at, updated_at
+            FROM dispatches
+            WHERE target_agent_id = ?1
+            ORDER BY created_at DESC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![agent_id], row_to_dispatch)?;
+        let mut dispatches = Vec::new();
+        for row in rows {
+            dispatches.push(row?);
+        }
+        Ok(dispatches)
+    }
+
+    pub fn get_dispatch(&self, dispatch_id: &str) -> Result<Option<DispatchRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT dispatch_id, created_event_id, command_id, target_agent_id, title,
+                   body_hash, body_blob_ref, state, latest_fact_event_id,
+                   latest_report_status, created_at, updated_at
+            FROM dispatches
+            WHERE dispatch_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![dispatch_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_dispatch(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_dispatch_by_command_id(&self, command_id: &str) -> Result<Option<DispatchRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT dispatch_id, created_event_id, command_id, target_agent_id, title,
+                   body_hash, body_blob_ref, state, latest_fact_event_id,
+                   latest_report_status, created_at, updated_at
+            FROM dispatches
+            WHERE command_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![command_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_dispatch(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn cancel_dispatch(&self, dispatch_id: &str, updated_at: DateTime<Utc>) -> Result<()> {
+        self.conn.execute(
+            r#"
+            UPDATE dispatches
+            SET state = ?1, updated_at = ?2
+            WHERE dispatch_id = ?3
+            "#,
+            params![
+                DispatchState::Cancelled.as_str(),
+                updated_at.to_rfc3339(),
+                dispatch_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn cancel_dispatch_idempotent(
+        &self,
+        input: &CancelDispatchInput,
+    ) -> Result<IdempotencyResolution<DispatchRecord>> {
+        if let Some(existing) = self.get_dispatch_cancellation_by_command_id(&input.command_id)? {
+            let (_event_id, dispatch_id, reason_hash) = existing;
+            let dispatch = self
+                .get_dispatch(&dispatch_id)?
+                .ok_or_else(|| anyhow::anyhow!("dispatch not found: {dispatch_id}"))?;
+            if dispatch_id == input.dispatch_id && reason_hash == input.reason_hash {
+                return Ok(IdempotencyResolution::Replayed(dispatch));
+            }
+            return Ok(IdempotencyResolution::Conflict(dispatch));
+        }
+
+        let dispatch = self
+            .get_dispatch(&input.dispatch_id)?
+            .ok_or_else(|| anyhow::anyhow!("dispatch not found: {}", input.dispatch_id))?;
+        if !matches!(dispatch.state, DispatchState::Open | DispatchState::Blocked) {
+            return Err(anyhow::anyhow!(
+                "dispatch closed: {} is {}",
+                input.dispatch_id,
+                dispatch.state.as_str()
+            ));
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO events (event_id, event_type, created_at, payload_json) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                input.event.event_id,
+                input.event.event_type,
+                input.event.created_at.to_rfc3339(),
+                serde_json::to_string(&input.event.payload)?,
+            ],
+        )?;
+        tx.execute(
+            r#"
+            INSERT INTO dispatch_cancellations (command_id, event_id, dispatch_id, reason_hash)
+            VALUES (?1, ?2, ?3, ?4)
+            "#,
+            params![
+                input.command_id,
+                input.event.event_id,
+                input.dispatch_id,
+                input.reason_hash,
+            ],
+        )?;
+        tx.execute(
+            r#"
+            UPDATE dispatches
+            SET state = ?1,
+                updated_at = ?2
+            WHERE dispatch_id = ?3
+            "#,
+            params![
+                DispatchState::Cancelled.as_str(),
+                input.event.created_at.to_rfc3339(),
+                input.dispatch_id,
+            ],
+        )?;
+        tx.commit()?;
+
+        let dispatch = self
+            .get_dispatch(&input.dispatch_id)?
+            .ok_or_else(|| anyhow::anyhow!("dispatch not found: {}", input.dispatch_id))?;
+        Ok(IdempotencyResolution::Inserted(dispatch))
+    }
+
+    fn get_dispatch_cancellation_by_command_id(
+        &self,
+        command_id: &str,
+    ) -> Result<Option<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT event_id, dispatch_id, reason_hash
+            FROM dispatch_cancellations
+            WHERE command_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![command_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?)))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotRecord> {
@@ -368,6 +921,64 @@ fn row_to_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<FactRecord> {
         evidence_refs: serde_json::from_str(&evidence_refs_json).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(err))
         })?,
+    })
+}
+
+fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
+    let created_at: String = row.get(4)?;
+    let role: String = row.get(2)?;
+    let role = match role.as_str() {
+        "orchestrator" => AgentRole::Orchestrator,
+        "worker" => AgentRole::Worker,
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                format!("invalid role: {role}").into(),
+            ))
+        }
+    };
+    Ok(AgentRecord {
+        agent_id: row.get(0)?,
+        name: row.get(1)?,
+        role,
+        token_hash: row.get(3)?,
+        created_at: parse_time_for_sql(&created_at)?,
+        status: row.get(5)?,
+    })
+}
+
+fn row_to_dispatch(row: &rusqlite::Row<'_>) -> rusqlite::Result<DispatchRecord> {
+    let state: String = row.get(7)?;
+    let state = match state.as_str() {
+        "open" => DispatchState::Open,
+        "reported" => DispatchState::Reported,
+        "blocked" => DispatchState::Blocked,
+        "failed" => DispatchState::Failed,
+        "cancelled" => DispatchState::Cancelled,
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Text,
+                format!("invalid dispatch state: {state}").into(),
+            ))
+        }
+    };
+    let created_at: String = row.get(10)?;
+    let updated_at: String = row.get(11)?;
+    Ok(DispatchRecord {
+        dispatch_id: row.get(0)?,
+        created_event_id: row.get(1)?,
+        command_id: row.get(2)?,
+        target_agent_id: row.get(3)?,
+        title: row.get(4)?,
+        body_hash: row.get(5)?,
+        body_blob_ref: row.get(6)?,
+        state,
+        latest_fact_event_id: row.get(8)?,
+        latest_report_status: row.get(9)?,
+        created_at: parse_time_for_sql(&created_at)?,
+        updated_at: parse_time_for_sql(&updated_at)?,
     })
 }
 
