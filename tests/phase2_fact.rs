@@ -73,11 +73,29 @@ fn run_json_expect_error(command: &mut Command, stdin: Option<&str>) -> Value {
     serde_json::from_slice(&output.stdout).expect("stdout should be json")
 }
 
+fn add_worker_agent(temp: &TempDir) -> String {
+    run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("agent")
+            .arg("add")
+            .arg("agent-a")
+            .arg("--role")
+            .arg("worker")
+            .arg("--token")
+            .arg("token-a"),
+    )["protocol"]["agent"]["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 #[test]
 fn team_fact_record_binds_snapshot_and_is_queryable() {
     let temp = TempDir::new().unwrap();
     fs::write(temp.path().join("work.txt"), "ready\n").unwrap();
     run_json(rive_cmd().arg("init").arg(temp.path()));
+    let agent_id = add_worker_agent(&temp);
     let capture = run_json(
         rive_cmd()
             .arg("snapshot")
@@ -90,7 +108,7 @@ fn team_fact_record_binds_snapshot_and_is_queryable() {
     let fact = run_json_with_stdin(
         team_cmd()
             .env("RIVE_WORKSPACE", temp.path())
-            .env("RIVE_AGENT_ID", "agent-a")
+            .env("RIVE_AGENT_ID", &agent_id)
             .env("RIVE_AGENT_TOKEN", "token-a")
             .env("RIVE_RUN_ID", "run-a")
             .arg("fact")
@@ -146,6 +164,7 @@ fn duplicate_command_id_replays_same_fact_and_changed_body_conflicts() {
     let temp = TempDir::new().unwrap();
     fs::write(temp.path().join("work.txt"), "ready\n").unwrap();
     run_json(rive_cmd().arg("init").arg(temp.path()));
+    let agent_id = add_worker_agent(&temp);
     let capture = run_json(
         rive_cmd()
             .arg("snapshot")
@@ -159,7 +178,7 @@ fn duplicate_command_id_replays_same_fact_and_changed_body_conflicts() {
         run_json_with_stdin(
             team_cmd()
                 .env("RIVE_WORKSPACE", temp.path())
-                .env("RIVE_AGENT_ID", "agent-a")
+                .env("RIVE_AGENT_ID", &agent_id)
                 .env("RIVE_AGENT_TOKEN", "token-a")
                 .arg("fact")
                 .arg("record")
@@ -185,7 +204,7 @@ fn duplicate_command_id_replays_same_fact_and_changed_body_conflicts() {
     let error = run_json_expect_error(
         team_cmd()
             .env("RIVE_WORKSPACE", temp.path())
-            .env("RIVE_AGENT_ID", "agent-a")
+            .env("RIVE_AGENT_ID", &agent_id)
             .env("RIVE_AGENT_TOKEN", "token-a")
             .arg("fact")
             .arg("record")
@@ -205,11 +224,12 @@ fn duplicate_command_id_replays_same_fact_and_changed_body_conflicts() {
 fn invalid_snapshot_is_rejected() {
     let temp = TempDir::new().unwrap();
     run_json(rive_cmd().arg("init").arg(temp.path()));
+    let agent_id = add_worker_agent(&temp);
 
     let error = run_json_expect_error(
         team_cmd()
             .env("RIVE_WORKSPACE", temp.path())
-            .env("RIVE_AGENT_ID", "agent-a")
+            .env("RIVE_AGENT_ID", &agent_id)
             .env("RIVE_AGENT_TOKEN", "token-a")
             .arg("fact")
             .arg("record")
@@ -241,10 +261,11 @@ fn cross_workspace_snapshot_is_rejected() {
 
     let target = TempDir::new().unwrap();
     run_json(rive_cmd().arg("init").arg(target.path()));
+    let agent_id = add_worker_agent(&target);
     let error = run_json_expect_error(
         team_cmd()
             .env("RIVE_WORKSPACE", target.path())
-            .env("RIVE_AGENT_ID", "agent-a")
+            .env("RIVE_AGENT_ID", &agent_id)
             .env("RIVE_AGENT_TOKEN", "token-a")
             .arg("fact")
             .arg("record")
@@ -265,6 +286,7 @@ fn manifest_integrity_error_is_rejected() {
     let temp = TempDir::new().unwrap();
     fs::write(temp.path().join("work.txt"), "ready\n").unwrap();
     run_json(rive_cmd().arg("init").arg(temp.path()));
+    let agent_id = add_worker_agent(&temp);
     let capture = run_json(
         rive_cmd()
             .arg("snapshot")
@@ -287,7 +309,7 @@ fn manifest_integrity_error_is_rejected() {
     let error = run_json_expect_error(
         team_cmd()
             .env("RIVE_WORKSPACE", temp.path())
-            .env("RIVE_AGENT_ID", "agent-a")
+            .env("RIVE_AGENT_ID", &agent_id)
             .env("RIVE_AGENT_TOKEN", "token-a")
             .arg("fact")
             .arg("record")
