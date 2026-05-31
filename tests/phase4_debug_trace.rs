@@ -463,11 +463,11 @@ fn trace_errors_and_install_templates_are_stable() {
     let opencode_path = opencode["protocol"]["path"].as_str().unwrap();
     let opencode_plugin = fs::read_to_string(opencode_path).unwrap();
     assert!(opencode_plugin.contains("opencode-plugin"));
-    assert!(
-        opencode_plugin.contains(
-            r#"Bun.spawnSync(["rive", "debug", "trace", "ingest", "--adapter", "opencode-plugin", "--stdin"]"#
-        )
-    );
+    assert!(opencode_plugin.contains(
+        r#"const args = ["debug", "trace", "ingest", "--adapter", "opencode-plugin", "--stdin"]"#
+    ));
+    assert!(opencode_plugin.contains(r#"if (process.env.RIVE_RUN_ID)"#));
+    assert!(opencode_plugin.contains(r#"Bun.spawnSync(["rive", ...args]"#));
     assert!(opencode_plugin.contains("mkdtempSync"));
     assert!(opencode_plugin.contains("try {"));
     assert!(opencode_plugin.contains("Debug trace must never alter OpenCode behavior"));

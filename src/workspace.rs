@@ -49,6 +49,10 @@ impl Workspace {
     pub fn debug_trace_payloads_dir(&self) -> PathBuf {
         self.debug_trace_dir().join("payloads")
     }
+
+    pub fn debug_runs_dir(&self) -> PathBuf {
+        self.debug_dir().join("runs")
+    }
 }
 
 pub fn init_workspace(path: &Path) -> Result<Workspace> {
@@ -62,6 +66,7 @@ pub fn init_workspace(path: &Path) -> Result<Workspace> {
     fs::create_dir_all(workspace.blobs_dir())?;
     fs::create_dir_all(workspace.artifacts_dir())?;
     fs::create_dir_all(workspace.debug_trace_payloads_dir())?;
+    fs::create_dir_all(workspace.debug_runs_dir())?;
     fs::create_dir_all(workspace.rive_dir().join("run"))?;
 
     write_if_missing(&workspace.rive_dir().join("tasks.md"), "# Rive Tasks\n")?;

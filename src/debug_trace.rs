@@ -876,7 +876,11 @@ function ingest(payload: unknown) {
     dir = mkdtempSync(join(tmpdir(), "rive-opencode-trace-"))
     const payloadPath = join(dir, "payload.json")
     writeFileSync(payloadPath, JSON.stringify(payload))
-    Bun.spawnSync(["rive", "debug", "trace", "ingest", "--adapter", "opencode-plugin", "--stdin"], {
+    const args = ["debug", "trace", "ingest", "--adapter", "opencode-plugin", "--stdin"]
+    if (process.env.RIVE_AGENT_ID) args.push("--agent", process.env.RIVE_AGENT_ID)
+    if (process.env.RIVE_RUN_ID) args.push("--run", process.env.RIVE_RUN_ID)
+    if (process.env.RIVE_DISPATCH_ID) args.push("--dispatch", process.env.RIVE_DISPATCH_ID)
+    Bun.spawnSync(["rive", ...args], {
       stdin: Bun.file(payloadPath),
       stdout: "ignore",
       stderr: "ignore",
