@@ -239,6 +239,106 @@ fn opencode_and_unknown_events_are_preserved() {
         "opencode_s_1"
     );
 
+    let wrapped = run_json_with_stdin(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("debug")
+            .arg("trace")
+            .arg("ingest")
+            .arg("--adapter")
+            .arg("opencode-plugin")
+            .arg("--stdin"),
+        r#"{
+          "id": "evt_wrapped_1",
+          "type": "message.part.updated",
+          "properties": {
+            "sessionID": "opencode_s_2",
+            "time": 1780242657644,
+            "part": {
+              "id": "part_1",
+              "messageID": "msg_1",
+              "sessionID": "opencode_s_2",
+              "type": "text",
+              "text": "RIVE_TRACE_OK"
+            }
+          }
+        }"#,
+    );
+    assert_eq!(
+        wrapped["protocol"]["trace_event"]["external_session_id"],
+        "opencode_s_2"
+    );
+    assert_eq!(
+        wrapped["protocol"]["trace_event"]["external_turn_id"],
+        "msg_1"
+    );
+    assert_eq!(
+        wrapped["protocol"]["trace_event"]["summary"]["text_preview"],
+        "RIVE_TRACE_OK"
+    );
+    assert!(wrapped["protocol"]["trace_event"]["occurred_at"].is_string());
+    let wrapped_session_id = wrapped["protocol"]["trace_event"]["trace_session_id"]
+        .as_str()
+        .unwrap();
+    let wrapped_session = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("debug")
+            .arg("trace")
+            .arg("session")
+            .arg(wrapped_session_id),
+    );
+    assert_eq!(
+        wrapped_session["protocol"]["events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let wrapped_tool = run_json_with_stdin(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("debug")
+            .arg("trace")
+            .arg("ingest")
+            .arg("--adapter")
+            .arg("opencode-plugin")
+            .arg("--stdin"),
+        r#"{
+          "id": "evt_wrapped_tool_1",
+          "type": "message.part.updated",
+          "properties": {
+            "sessionID": "opencode_s_2",
+            "time": 1780242657650,
+            "part": {
+              "type": "tool",
+              "tool": "bash",
+              "callID": "call_1",
+              "sessionID": "opencode_s_2",
+              "messageID": "msg_1",
+              "state": {
+                "status": "completed",
+                "input": { "command": "pwd" },
+                "output": "/tmp/rive\n"
+              }
+            }
+          }
+        }"#,
+    );
+    assert_eq!(
+        wrapped_tool["protocol"]["trace_event"]["event_kind"],
+        "tool_call_completed"
+    );
+    assert_eq!(
+        wrapped_tool["protocol"]["trace_event"]["external_tool_id"],
+        "call_1"
+    );
+    assert_eq!(
+        wrapped_tool["protocol"]["trace_event"]["summary"]["tool_name"],
+        "bash"
+    );
+
     let unknown = run_json_with_stdin(
         rive_cmd()
             .current_dir(temp.path())
@@ -280,7 +380,7 @@ fn opencode_and_unknown_events_are_preserved() {
             .arg("--adapter")
             .arg("opencode-plugin"),
     );
-    assert_eq!(filtered["protocol"]["events"].as_array().unwrap().len(), 2);
+    assert_eq!(filtered["protocol"]["events"].as_array().unwrap().len(), 4);
 }
 
 #[test]
@@ -363,6 +463,12 @@ fn trace_errors_and_install_templates_are_stable() {
     let opencode_path = opencode["protocol"]["path"].as_str().unwrap();
     let opencode_plugin = fs::read_to_string(opencode_path).unwrap();
     assert!(opencode_plugin.contains("opencode-plugin"));
+    assert!(
+        opencode_plugin.contains(
+            r#"Bun.spawnSync(["rive", "debug", "trace", "ingest", "--adapter", "opencode-plugin", "--stdin"]"#
+        )
+    );
+    assert!(opencode_plugin.contains("mkdtempSync"));
     assert!(opencode_plugin.contains("try {"));
     assert!(opencode_plugin.contains("Debug trace must never alter OpenCode behavior"));
 

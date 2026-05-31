@@ -631,41 +631,193 @@ fn normalize_opencode(payload: &Value, input: &IngestTraceInput) -> NormalizedEv
     let external_event_type = string_at(payload, &["type"])
         .or_else(|| string_at(payload, &["event", "type"]))
         .unwrap_or_else(|| "unknown".to_string());
-    let event_kind = match external_event_type.as_str() {
-        "session.created" => "session_started",
-        "session.status" | "session.updated" => "session_status_changed",
-        "session.idle" => "session_idle",
-        "session.error" => "session_error",
-        "message.updated" => "assistant_output",
-        "message.part.updated" => "assistant_output_delta",
-        "tool.execute.before" => "tool_call_started",
-        "tool.execute.after" => "tool_call_completed",
-        "permission.asked" => "permission_requested",
-        "permission.replied" => "permission_resolved",
-        "command.executed" => "command_executed",
-        "session.diff" => "file_changed",
+    let part_type = first_string_at(
+        payload,
+        &[&["part", "type"], &["properties", "part", "type"]],
+    );
+    let tool_status = first_string_at(
+        payload,
+        &[
+            &["state", "status"],
+            &["part", "state", "status"],
+            &["properties", "state", "status"],
+            &["properties", "part", "state", "status"],
+        ],
+    );
+    let event_kind = match (
+        external_event_type.as_str(),
+        part_type.as_deref(),
+        tool_status.as_deref(),
+    ) {
+        ("message.part.updated", Some("tool"), Some("completed")) => "tool_call_completed",
+        ("message.part.updated", Some("tool"), _) => "tool_call_started",
+        ("session.created", _, _) => "session_started",
+        ("session.status" | "session.updated", _, _) => "session_status_changed",
+        ("session.idle", _, _) => "session_idle",
+        ("session.error", _, _) => "session_error",
+        ("message.updated", _, _) => "assistant_output",
+        ("message.part.updated", _, _) => "assistant_output_delta",
+        ("tool.execute.before", _, _) => "tool_call_started",
+        ("tool.execute.after", _, _) => "tool_call_completed",
+        ("permission.asked", _, _) => "permission_requested",
+        ("permission.replied", _, _) => "permission_resolved",
+        ("command.executed", _, _) => "command_executed",
+        ("session.diff", _, _) => "file_changed",
         _ => "unknown",
     };
-    let session_id =
-        string_at(payload, &["session", "id"]).or_else(|| string_at(payload, &["sessionID"]));
+    let session_id = first_string_at(
+        payload,
+        &[
+            &["session", "id"],
+            &["sessionID"],
+            &["properties", "session", "id"],
+            &["properties", "sessionID"],
+            &["properties", "info", "sessionID"],
+            &["properties", "part", "sessionID"],
+        ],
+    );
+    let text_preview = first_string_at(
+        payload,
+        &[
+            &["text"],
+            &["part", "text"],
+            &["message", "text"],
+            &["properties", "text"],
+            &["properties", "part", "text"],
+            &["properties", "message", "text"],
+        ],
+    )
+    .map(|text| truncate_for_summary(&text, 240));
     NormalizedEvent {
         external_event_type,
         external_event_id: string_at(payload, &["id"])
             .or_else(|| string_at(payload, &["event_id"])),
         event_kind: event_kind.to_string(),
-        occurred_at: parse_optional_time(payload),
-        agent_id: string_at(payload, &["agent_id"]).or_else(|| input.agent_id.clone()),
+        occurred_at: parse_time_from_paths(
+            payload,
+            &[
+                &["time"],
+                &["timestamp"],
+                &["properties", "time"],
+                &["properties", "timestamp"],
+                &["properties", "info", "time", "created"],
+            ],
+        ),
+        agent_id: first_string_at(
+            payload,
+            &[
+                &["agent_id"],
+                &["agent"],
+                &["properties", "agent"],
+                &["properties", "info", "agent"],
+            ],
+        )
+        .or_else(|| input.agent_id.clone()),
         run_id: string_at(payload, &["run_id"]).or_else(|| input.run_id.clone()),
         dispatch_id: string_at(payload, &["dispatch_id"]).or_else(|| input.dispatch_id.clone()),
         external_session_id: session_id,
-        external_turn_id: string_at(payload, &["message", "id"])
-            .or_else(|| string_at(payload, &["part", "id"])),
-        external_tool_id: string_at(payload, &["tool", "id"]),
-        cwd: string_at(payload, &["cwd"]),
+        external_turn_id: first_string_at(
+            payload,
+            &[
+                &["message", "id"],
+                &["part", "id"],
+                &["messageID"],
+                &["properties", "message", "id"],
+                &["properties", "part", "messageID"],
+                &["properties", "part", "id"],
+                &["properties", "info", "id"],
+            ],
+        ),
+        external_tool_id: first_string_at(
+            payload,
+            &[
+                &["tool", "id"],
+                &["toolID"],
+                &["callID"],
+                &["part", "callID"],
+                &["properties", "tool", "id"],
+                &["properties", "toolID"],
+                &["properties", "callID"],
+                &["properties", "part", "callID"],
+            ],
+        ),
+        cwd: first_string_at(
+            payload,
+            &[
+                &["cwd"],
+                &["properties", "cwd"],
+                &["properties", "info", "path", "cwd"],
+            ],
+        ),
         summary: json!({
             "type": value_at(payload, &["type"]),
-            "tool_name": value_at(payload, &["tool", "name"]),
-            "session_status": value_at(payload, &["session", "status"]),
+            "tool_name": first_value_at(
+                payload,
+                &[
+                    &["tool", "name"],
+                    &["tool"],
+                    &["part", "tool"],
+                    &["properties", "tool", "name"],
+                    &["properties", "tool"],
+                    &["properties", "part", "tool"],
+                ],
+            ),
+            "tool_status": first_value_at(
+                payload,
+                &[
+                    &["state", "status"],
+                    &["part", "state", "status"],
+                    &["properties", "state", "status"],
+                    &["properties", "part", "state", "status"],
+                ],
+            ),
+            "tool_input_preview": first_preview_at(
+                payload,
+                &[
+                    &["input"],
+                    &["state", "input"],
+                    &["part", "state", "input"],
+                    &["properties", "input"],
+                    &["properties", "part", "state", "input"],
+                ],
+                240,
+            ),
+            "tool_output_preview": first_preview_at(
+                payload,
+                &[
+                    &["output"],
+                    &["state", "output"],
+                    &["part", "state", "output"],
+                    &["properties", "output"],
+                    &["properties", "part", "state", "output"],
+                ],
+                240,
+            ),
+            "session_status": first_value_at(
+                payload,
+                &[
+                    &["session", "status"],
+                    &["status"],
+                    &["properties", "session", "status"],
+                    &["properties", "status"],
+                ],
+            ),
+            "message_role": first_value_at(
+                payload,
+                &[
+                    &["message", "role"],
+                    &["properties", "message", "role"],
+                    &["properties", "info", "role"],
+                ],
+            ),
+            "part_type": first_value_at(
+                payload,
+                &[
+                    &["part", "type"],
+                    &["properties", "part", "type"],
+                ],
+            ),
+            "text_preview": text_preview,
         }),
     }
 }
@@ -714,29 +866,38 @@ pub fn install_opencode_plugin(workspace: &Workspace) -> Result<TraceInstallProt
     fs::create_dir_all(&dir)?;
     let path = dir.join("rive-trace.ts");
     let content = r#"// RIVE-MANAGED-OPENCODE-TRACE-PLUGIN
-const encoder = new TextEncoder()
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
-async function ingest(payload: unknown) {
+function ingest(payload: unknown) {
+  let dir: string | undefined
   try {
-    const proc = new Deno.Command("rive", {
-      args: ["debug", "trace", "ingest", "--adapter", "opencode-plugin", "--stdin"],
-      stdin: "piped",
-      stdout: "null",
-      stderr: "null",
-    }).spawn()
-    const writer = proc.stdin.getWriter()
-    await writer.write(encoder.encode(JSON.stringify(payload)))
-    await writer.close()
-    await proc.status
+    dir = mkdtempSync(join(tmpdir(), "rive-opencode-trace-"))
+    const payloadPath = join(dir, "payload.json")
+    writeFileSync(payloadPath, JSON.stringify(payload))
+    Bun.spawnSync(["rive", "debug", "trace", "ingest", "--adapter", "opencode-plugin", "--stdin"], {
+      stdin: Bun.file(payloadPath),
+      stdout: "ignore",
+      stderr: "ignore",
+    })
   } catch (_) {
     // Debug trace must never alter OpenCode behavior.
+  } finally {
+    if (dir) {
+      try {
+        rmSync(dir, { recursive: true, force: true })
+      } catch (_) {
+        // Debug trace must never alter OpenCode behavior.
+      }
+    }
   }
 }
 
 export default async function RiveTracePlugin() {
   return {
-    event: async ({ event }: { event: unknown }) => {
-      await ingest(event)
+    event: ({ event }: { event: unknown }) => {
+      ingest(event)
     },
   }
 }
@@ -912,6 +1073,28 @@ fn parse_optional_time(payload: &Value) -> Option<DateTime<Utc>> {
         .map(|time| time.with_timezone(&Utc))
 }
 
+fn parse_time_from_paths(payload: &Value, paths: &[&[&str]]) -> Option<DateTime<Utc>> {
+    for path in paths {
+        let value = path.iter().try_fold(payload, |value, key| value.get(*key));
+        match value {
+            Some(Value::String(text)) => {
+                if let Ok(time) = DateTime::parse_from_rfc3339(text) {
+                    return Some(time.with_timezone(&Utc));
+                }
+            }
+            Some(Value::Number(number)) => {
+                if let Some(ms) = number.as_i64() {
+                    if let Some(time) = DateTime::<Utc>::from_timestamp_millis(ms) {
+                        return Some(time);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn parse_time_for_sql(value: &str) -> rusqlite::Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .map(|time| time.with_timezone(&Utc))
@@ -927,11 +1110,47 @@ fn value_at(payload: &Value, path: &[&str]) -> Value {
         .unwrap_or(Value::Null)
 }
 
+fn first_value_at(payload: &Value, paths: &[&[&str]]) -> Value {
+    paths
+        .iter()
+        .find_map(|path| {
+            path.iter()
+                .try_fold(payload, |value, key| value.get(*key))
+                .cloned()
+        })
+        .unwrap_or(Value::Null)
+}
+
+fn first_preview_at(payload: &Value, paths: &[&[&str]], max_chars: usize) -> Value {
+    let value = first_value_at(payload, paths);
+    match value {
+        Value::Null => Value::Null,
+        Value::String(text) => Value::String(truncate_for_summary(&text, max_chars)),
+        other => Value::String(truncate_for_summary(&other.to_string(), max_chars)),
+    }
+}
+
 fn string_at(payload: &Value, path: &[&str]) -> Option<String> {
     path.iter()
         .try_fold(payload, |value, key| value.get(*key))
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+fn first_string_at(payload: &Value, paths: &[&[&str]]) -> Option<String> {
+    paths.iter().find_map(|path| string_at(payload, path))
+}
+
+fn truncate_for_summary(value: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for (idx, ch) in value.chars().enumerate() {
+        if idx >= max_chars {
+            output.push_str("...");
+            return output;
+        }
+        output.push(ch);
+    }
+    output
 }
 
 fn int_at(payload: &Value, path: &[&str]) -> Option<i64> {
