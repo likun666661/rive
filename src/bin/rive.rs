@@ -3,6 +3,10 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
+use rive::debug_trace::{
+    install_codex_hook, install_opencode_plugin, uninstall_managed, DebugTraceStore,
+    IngestTraceInput, TraceAdapter, TraceListFilter, TraceListProtocol,
+};
 use rive::dispatch::{
     agent_protocol, dispatch_protocol, AddAgentInput, AddAgentProtocol, AgentListProtocol,
     CancelDispatchCommand, CancelDispatchOutcome, CreateDispatchInput, CreateDispatchOutcome,
@@ -51,6 +55,10 @@ enum Commands {
     Dispatch {
         #[command(subcommand)]
         command: DispatchCommands,
+    },
+    Debug {
+        #[command(subcommand)]
+        command: DebugCommands,
     },
 }
 
@@ -120,6 +128,59 @@ enum DispatchCommands {
         command_id: String,
         #[arg(long)]
         reason: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DebugCommands {
+    Trace {
+        #[command(subcommand)]
+        command: DebugTraceCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum DebugTraceCommands {
+    Ingest {
+        #[arg(long)]
+        adapter: String,
+        #[arg(long)]
+        stdin: bool,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        run: Option<String>,
+        #[arg(long)]
+        dispatch: Option<String>,
+    },
+    List {
+        #[arg(long)]
+        adapter: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        dispatch: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+    },
+    Show {
+        id: String,
+    },
+    Session {
+        trace_session_id: String,
+    },
+    Export {
+        trace_session_id: String,
+    },
+    Install {
+        target: String,
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+    Uninstall {
+        target: String,
+        #[arg(long)]
+        workspace: Option<PathBuf>,
     },
 }
 
@@ -437,6 +498,124 @@ fn run() -> Result<()> {
                 print_json(&Envelope::new(protocol, display))
             }
         },
+        Commands::Debug { command } => match command {
+            DebugCommands::Trace { command } => match command {
+                DebugTraceCommands::Ingest {
+                    adapter,
+                    stdin,
+                    agent,
+                    run,
+                    dispatch,
+                } => {
+                    if !stdin {
+                        return Err(anyhow!("debug trace ingest requires --stdin"));
+                    }
+                    let workspace = find_workspace(&std::env::current_dir()?)?;
+                    let trace_store = DebugTraceStore::open(&workspace.db_path())?;
+                    trace_store.init_schema()?;
+                    let mut payload = Vec::new();
+                    std::io::stdin().read_to_end(&mut payload)?;
+                    let protocol = trace_store.ingest(
+                        &workspace,
+                        IngestTraceInput {
+                            adapter: TraceAdapter::parse(&adapter)?,
+                            payload,
+                            agent_id: agent,
+                            run_id: run,
+                            dispatch_id: dispatch,
+                        },
+                    )?;
+                    let display = serde_json::json!({
+                        "summary": format!(
+                            "Ingested {} trace event {}",
+                            protocol.trace_event.adapter,
+                            protocol.trace_event.trace_event_id
+                        ),
+                    });
+                    print_json(&Envelope::new(protocol, display))
+                }
+                DebugTraceCommands::List {
+                    adapter,
+                    agent,
+                    dispatch,
+                    session,
+                } => {
+                    let workspace = find_workspace(&std::env::current_dir()?)?;
+                    let trace_store = DebugTraceStore::open(&workspace.db_path())?;
+                    let events = trace_store.list_events(TraceListFilter {
+                        adapter,
+                        agent_id: agent,
+                        dispatch_id: dispatch,
+                        trace_session_id: session,
+                    })?;
+                    let protocol = TraceListProtocol { events };
+                    let display = serde_json::json!({
+                        "summary": format!("{} debug trace events", protocol.events.len()),
+                    });
+                    print_json(&Envelope::new(protocol, display))
+                }
+                DebugTraceCommands::Show { id } => {
+                    let workspace = find_workspace(&std::env::current_dir()?)?;
+                    let trace_store = DebugTraceStore::open(&workspace.db_path())?;
+                    let protocol = trace_store.show_event(&id, true)?;
+                    let display = serde_json::json!({
+                        "summary": format!(
+                            "Debug trace {} ({})",
+                            protocol.trace_event.trace_event_id,
+                            protocol.trace_event.event_kind
+                        ),
+                    });
+                    print_json(&Envelope::new(protocol, display))
+                }
+                DebugTraceCommands::Session { trace_session_id }
+                | DebugTraceCommands::Export { trace_session_id } => {
+                    let workspace = find_workspace(&std::env::current_dir()?)?;
+                    let trace_store = DebugTraceStore::open(&workspace.db_path())?;
+                    let protocol = trace_store.session(&trace_session_id)?;
+                    let display = serde_json::json!({
+                        "summary": format!(
+                            "Debug trace session {} with {} events",
+                            protocol.session.trace_session_id,
+                            protocol.events.len()
+                        ),
+                    });
+                    print_json(&Envelope::new(protocol, display))
+                }
+                DebugTraceCommands::Install { target, workspace } => {
+                    let start = workspace.unwrap_or(std::env::current_dir()?);
+                    let workspace = find_workspace(&start)?;
+                    let protocol = match target.as_str() {
+                        "codex" => install_codex_hook(&workspace)?,
+                        "opencode" => install_opencode_plugin(&workspace)?,
+                        _ => return Err(anyhow!("unsupported trace install target: {target}")),
+                    };
+                    let display = serde_json::json!({
+                        "summary": format!(
+                            "Trace adapter {} install {} at {}",
+                            protocol.target,
+                            protocol.status,
+                            protocol.path
+                        ),
+                        "privacy_note": "This adapter records local agent CLI inputs, outputs, and tool events for Rive debug only.",
+                    });
+                    print_json(&Envelope::new(protocol, display))
+                }
+                DebugTraceCommands::Uninstall { target, workspace } => {
+                    let start = workspace.unwrap_or(std::env::current_dir()?);
+                    let workspace = find_workspace(&start)?;
+                    let protocol = uninstall_managed(&workspace, &target)?;
+                    let display = serde_json::json!({
+                        "summary": format!(
+                            "Trace adapter {} uninstall {} at {}",
+                            protocol.target,
+                            protocol.status,
+                            protocol.path
+                        ),
+                    });
+                    print_json(&Envelope::new(protocol, display))
+                }
+            },
+        },
     }
 }
 
@@ -450,6 +629,16 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
     let lower = message.to_lowercase();
     let (code, action) = if lower.contains("no .rive workspace") {
         ("workspace_not_found", "run_rive_init")
+    } else if lower.contains("invalid trace payload json") {
+        ("invalid_trace_payload", "fix_arguments")
+    } else if lower.contains("unsupported trace adapter") {
+        ("unsupported_trace_adapter", "fix_arguments")
+    } else if lower.contains("debug trace event not found") {
+        ("debug_trace_not_found", "fix_arguments")
+    } else if lower.contains("debug trace session not found") {
+        ("debug_trace_session_not_found", "fix_arguments")
+    } else if lower.contains("unsupported trace install target") {
+        ("unsupported_trace_install_target", "fix_arguments")
     } else if lower.contains("invalid agent role") {
         ("invalid_agent_role", "fix_arguments")
     } else if lower.contains("dispatch target must be worker") {
