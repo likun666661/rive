@@ -12,3 +12,4 @@ Rive 是本地优先 agent team runtime 的体系文档。
 6. [Phase 3 Dispatch Ledger 设计](./06-phase3-dispatch-ledger-design.md)
 7. [Phase 3 Dispatch Ledger 测试计划](./07-phase3-dispatch-ledger-test-plan.md)
 8. [Phase 4 Agent CLI Debug Trace 设计](./08-phase4-agent-cli-debug-trace-design.md)
+9. [Phase 4 Debug Trace 测试计划](./09-phase4-debug-trace-test-plan.md)
