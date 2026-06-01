@@ -2,6 +2,7 @@ use std::io::Read;
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
+use rive::debug_trace::DebugTraceStore;
 use rive::dispatch::{
     dispatch_fact_protocol, dispatch_protocol, DispatchFactInput, DispatchFactOutcome,
     DispatchListProtocol, DispatchService, ReportStatus,
@@ -11,6 +12,7 @@ use rive::facts::{
     RecordFactOutcome,
 };
 use rive::output::{Envelope, ErrorEnvelope};
+use rive::runner::{TeamSendInput, TeamSendService};
 use rive::snapshot::LocalSnapshotStore;
 use rive::store::{AgentRecord, EventStore};
 use rive::workspace::find_workspace;
@@ -49,6 +51,30 @@ enum Commands {
         snapshots: Vec<String>,
         #[arg(long = "command-id")]
         command_id: String,
+        #[arg(long)]
+        stdin: bool,
+    },
+    Send {
+        #[arg(long = "to")]
+        target: String,
+        #[arg(long)]
+        runner: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long = "command-id")]
+        command_id: String,
+        #[arg(long)]
+        wait: bool,
+        #[arg(long = "timeout-seconds", default_value_t = 300)]
+        timeout_seconds: u64,
+        #[arg(long = "snapshot-path")]
+        snapshot_paths: Vec<std::path::PathBuf>,
+        #[arg(long = "opencode-bin")]
+        opencode_bin: Option<std::path::PathBuf>,
+        #[arg(long = "codex-bin")]
+        codex_bin: Option<std::path::PathBuf>,
+        #[arg(long = "trust-project")]
+        trust_project: bool,
         #[arg(long)]
         stdin: bool,
     },
@@ -137,6 +163,31 @@ fn run() -> Result<()> {
             command_id,
             stdin,
         } => record_dispatch_report(dispatch, status, snapshots, command_id, stdin),
+        Commands::Send {
+            target,
+            runner,
+            title,
+            command_id,
+            wait,
+            timeout_seconds,
+            snapshot_paths,
+            opencode_bin,
+            codex_bin,
+            trust_project,
+            stdin,
+        } => send_delegation(
+            target,
+            runner,
+            title,
+            command_id,
+            wait,
+            timeout_seconds,
+            snapshot_paths,
+            opencode_bin,
+            codex_bin,
+            trust_project,
+            stdin,
+        ),
         Commands::Fact { command } => match command {
             FactCommands::Record {
                 fact_type,
@@ -146,6 +197,63 @@ fn run() -> Result<()> {
             } => record_fact(fact_type, snapshots, command_id, stdin),
         },
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_delegation(
+    target: String,
+    runner: String,
+    title: String,
+    command_id: String,
+    wait: bool,
+    timeout_seconds: u64,
+    snapshot_paths: Vec<std::path::PathBuf>,
+    opencode_bin: Option<std::path::PathBuf>,
+    codex_bin: Option<std::path::PathBuf>,
+    trust_project: bool,
+    stdin: bool,
+) -> Result<()> {
+    if !stdin {
+        return Err(anyhow!("team send requires --stdin"));
+    }
+    let actor = actor_from_env()?;
+    let workspace = find_workspace(std::path::Path::new(&actor.workspace))?;
+    let store = EventStore::open(&workspace.db_path())?;
+    store.init_schema()?;
+    let trace_store = DebugTraceStore::open(&workspace.db_path())?;
+    trace_store.init_schema()?;
+    let snapshot_store = LocalSnapshotStore::new(&workspace);
+    let service = TeamSendService::new(&workspace, &store, &trace_store, &snapshot_store);
+    let mut task_body = Vec::new();
+    std::io::stdin().read_to_end(&mut task_body)?;
+    let protocol = service.send(TeamSendInput {
+        actor,
+        target,
+        runner,
+        title,
+        command_id,
+        opencode_bin,
+        codex_bin,
+        timeout_seconds,
+        snapshot_paths,
+        task_body,
+        wait,
+        trust_project,
+    })?;
+    let display = serde_json::json!({
+        "summary": format!(
+            "Delegation {} completed with dispatch {} {}",
+            protocol.command_id,
+            protocol.dispatch.dispatch_id,
+            protocol.dispatch.state
+        ),
+        "trace_note": "Debug trace is for Rive diagnostics only; dispatch success is based on ledger projection.",
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&Envelope::new(protocol, display))?
+    );
+    Ok(())
 }
 
 fn list_team_dispatches() -> Result<()> {
@@ -318,7 +426,14 @@ fn authenticate_actor(store: &EventStore, actor: &ActorEnv) -> Result<AgentRecor
     let agent = store
         .get_agent(&actor.agent_id)?
         .ok_or_else(|| anyhow!("agent not found: {}", actor.agent_id))?;
-    if agent.token_hash != token_hash(&actor.agent_token) {
+    let presented_hash = token_hash(&actor.agent_token);
+    let run_token_matches = match actor.run_id.as_deref() {
+        Some(run_id) => store
+            .get_agent_run(run_id)?
+            .is_some_and(|run| run.agent_id == agent.agent_id && run.token_hash == presented_hash),
+        None => false,
+    };
+    if agent.token_hash != presented_hash && !run_token_matches {
         return Err(anyhow!("invalid agent token"));
     }
     Ok(agent)
@@ -335,6 +450,28 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
     let lower = message.to_lowercase();
     let (code, retryable, action) = if lower.contains("missing command id") {
         ("missing_command_id", false, "fix_arguments")
+    } else if lower.contains("wait required") {
+        ("wait_required", false, "fix_arguments")
+    } else if lower.contains("runner not supported") {
+        ("runner_not_supported", false, "fix_arguments")
+    } else if lower.contains("target agent not found") {
+        ("target_agent_not_found", false, "fix_arguments")
+    } else if lower.contains("target role invalid") {
+        ("target_role_invalid", false, "fix_arguments")
+    } else if lower.contains("opencode not found") {
+        ("opencode_not_found", false, "fix_installation")
+    } else if lower.contains("codex not found") {
+        ("codex_not_found", false, "fix_installation")
+    } else if lower.contains("opencode timeout") {
+        ("opencode_timeout", false, "inspect_projection")
+    } else if lower.contains("codex timeout") {
+        ("codex_timeout", false, "inspect_projection")
+    } else if lower.contains("opencode exit failed") {
+        ("opencode_exit_failed", false, "inspect_projection")
+    } else if lower.contains("codex exit failed") {
+        ("codex_exit_failed", false, "inspect_projection")
+    } else if lower.contains("dispatch not reported") {
+        ("dispatch_not_reported", false, "inspect_projection")
     } else if lower.contains("invalid report status") {
         ("invalid_report_status", false, "fix_arguments")
     } else if lower.contains("invalid fact type") {
@@ -351,6 +488,8 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
         ("dispatch_closed", false, "inspect_projection")
     } else if lower.contains("dispatch not found") {
         ("dispatch_not_found", false, "fix_arguments")
+    } else if lower.contains("agent role not allowed") {
+        ("agent_role_not_allowed", false, "stop_and_report")
     } else if lower.contains("actor role not allowed") {
         ("actor_role_not_allowed", false, "stop_and_report")
     } else if lower.contains("no .rive workspace") {

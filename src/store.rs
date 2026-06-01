@@ -81,6 +81,14 @@ pub struct AgentRecord {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRunRecord {
+    pub run_id: String,
+    pub agent_id: String,
+    pub token_hash: String,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DispatchState {
     Open,
@@ -151,6 +159,51 @@ pub struct CancelDispatchInput {
     pub command_id: String,
     pub dispatch_id: String,
     pub reason_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertAgentRunInput {
+    pub run_id: String,
+    pub agent_id: String,
+    pub token_hash: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegationRecord {
+    pub command_id: String,
+    pub source_agent_id: String,
+    pub source_run_id: Option<String>,
+    pub target_agent_id: String,
+    pub worker_run_id: String,
+    pub dispatch_id: String,
+    pub runner: String,
+    pub request_hash: String,
+    pub state: String,
+    pub child_executed: bool,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertDelegationInput {
+    pub command_id: String,
+    pub source_agent_id: String,
+    pub source_run_id: Option<String>,
+    pub target_agent_id: String,
+    pub worker_run_id: String,
+    pub dispatch_id: String,
+    pub runner: String,
+    pub request_hash: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompleteDelegationInput {
+    pub command_id: String,
+    pub state: String,
+    pub child_executed: bool,
+    pub completed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +301,31 @@ impl EventStore {
               dispatch_id TEXT NOT NULL,
               reason_hash TEXT NOT NULL,
               FOREIGN KEY(event_id) REFERENCES events(event_id),
+              FOREIGN KEY(dispatch_id) REFERENCES dispatches(dispatch_id)
+            );
+            CREATE TABLE IF NOT EXISTS agent_runs (
+              run_id TEXT PRIMARY KEY,
+              agent_id TEXT NOT NULL,
+              token_hash TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY(agent_id) REFERENCES agents(agent_id)
+            );
+            CREATE TABLE IF NOT EXISTS delegations (
+              command_id TEXT PRIMARY KEY,
+              source_agent_id TEXT NOT NULL,
+              source_run_id TEXT,
+              target_agent_id TEXT NOT NULL,
+              worker_run_id TEXT NOT NULL,
+              dispatch_id TEXT NOT NULL,
+              runner TEXT NOT NULL,
+              request_hash TEXT NOT NULL,
+              state TEXT NOT NULL,
+              child_executed INTEGER NOT NULL,
+              created_at TEXT NOT NULL,
+              completed_at TEXT,
+              FOREIGN KEY(source_agent_id) REFERENCES agents(agent_id),
+              FOREIGN KEY(target_agent_id) REFERENCES agents(agent_id),
+              FOREIGN KEY(worker_run_id) REFERENCES agent_runs(run_id),
               FOREIGN KEY(dispatch_id) REFERENCES dispatches(dispatch_id)
             );
             "#,
@@ -536,6 +614,43 @@ impl EventStore {
         let mut rows = stmt.query(params![name_or_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row_to_agent(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn insert_agent_run(&self, input: &InsertAgentRunInput) -> Result<AgentRunRecord> {
+        self.conn.execute(
+            r#"
+            INSERT INTO agent_runs (run_id, agent_id, token_hash, created_at)
+            VALUES (?1, ?2, ?3, ?4)
+            "#,
+            params![
+                input.run_id,
+                input.agent_id,
+                input.token_hash,
+                input.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(AgentRunRecord {
+            run_id: input.run_id.clone(),
+            agent_id: input.agent_id.clone(),
+            token_hash: input.token_hash.clone(),
+            created_at: input.created_at,
+        })
+    }
+
+    pub fn get_agent_run(&self, run_id: &str) -> Result<Option<AgentRunRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT run_id, agent_id, token_hash, created_at
+            FROM agent_runs
+            WHERE run_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![run_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_agent_run(row)?))
         } else {
             Ok(None)
         }
@@ -869,6 +984,91 @@ impl EventStore {
             Ok(None)
         }
     }
+
+    pub fn insert_delegation_idempotent(
+        &self,
+        input: &InsertDelegationInput,
+    ) -> Result<IdempotencyResolution<DelegationRecord>> {
+        if let Some(existing) = self.get_delegation_by_command_id(&input.command_id)? {
+            if existing.source_agent_id == input.source_agent_id
+                && existing.source_run_id == input.source_run_id
+                && existing.target_agent_id == input.target_agent_id
+                && existing.worker_run_id == input.worker_run_id
+                && existing.dispatch_id == input.dispatch_id
+                && existing.runner == input.runner
+                && existing.request_hash == input.request_hash
+            {
+                return Ok(IdempotencyResolution::Replayed(existing));
+            }
+            return Ok(IdempotencyResolution::Conflict(existing));
+        }
+
+        self.conn.execute(
+            r#"
+            INSERT INTO delegations (
+              command_id, source_agent_id, source_run_id, target_agent_id,
+              worker_run_id, dispatch_id, runner, request_hash, state,
+              child_executed, created_at, completed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'created', 0, ?9, NULL)
+            "#,
+            params![
+                input.command_id,
+                input.source_agent_id,
+                input.source_run_id,
+                input.target_agent_id,
+                input.worker_run_id,
+                input.dispatch_id,
+                input.runner,
+                input.request_hash,
+                input.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(IdempotencyResolution::Inserted(
+            self.get_delegation_by_command_id(&input.command_id)?
+                .expect("inserted delegation should be readable"),
+        ))
+    }
+
+    pub fn complete_delegation(&self, input: &CompleteDelegationInput) -> Result<DelegationRecord> {
+        self.conn.execute(
+            r#"
+            UPDATE delegations
+            SET state = ?1,
+                child_executed = ?2,
+                completed_at = ?3
+            WHERE command_id = ?4
+            "#,
+            params![
+                input.state,
+                if input.child_executed { 1_i64 } else { 0_i64 },
+                input.completed_at.to_rfc3339(),
+                input.command_id,
+            ],
+        )?;
+        self.get_delegation_by_command_id(&input.command_id)?
+            .ok_or_else(|| anyhow::anyhow!("delegation not found: {}", input.command_id))
+    }
+
+    pub fn get_delegation_by_command_id(
+        &self,
+        command_id: &str,
+    ) -> Result<Option<DelegationRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT command_id, source_agent_id, source_run_id, target_agent_id,
+                   worker_run_id, dispatch_id, runner, request_hash, state,
+                   child_executed, created_at, completed_at
+            FROM delegations
+            WHERE command_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![command_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_delegation(row)?))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotRecord> {
@@ -948,6 +1148,16 @@ fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
     })
 }
 
+fn row_to_agent_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRunRecord> {
+    let created_at: String = row.get(3)?;
+    Ok(AgentRunRecord {
+        run_id: row.get(0)?,
+        agent_id: row.get(1)?,
+        token_hash: row.get(2)?,
+        created_at: parse_time_for_sql(&created_at)?,
+    })
+}
+
 fn row_to_dispatch(row: &rusqlite::Row<'_>) -> rusqlite::Result<DispatchRecord> {
     let state: String = row.get(7)?;
     let state = match state.as_str() {
@@ -979,6 +1189,29 @@ fn row_to_dispatch(row: &rusqlite::Row<'_>) -> rusqlite::Result<DispatchRecord> 
         latest_report_status: row.get(9)?,
         created_at: parse_time_for_sql(&created_at)?,
         updated_at: parse_time_for_sql(&updated_at)?,
+    })
+}
+
+fn row_to_delegation(row: &rusqlite::Row<'_>) -> rusqlite::Result<DelegationRecord> {
+    let created_at: String = row.get(10)?;
+    let completed_at: Option<String> = row.get(11)?;
+    let child_executed: i64 = row.get(9)?;
+    Ok(DelegationRecord {
+        command_id: row.get(0)?,
+        source_agent_id: row.get(1)?,
+        source_run_id: row.get(2)?,
+        target_agent_id: row.get(3)?,
+        worker_run_id: row.get(4)?,
+        dispatch_id: row.get(5)?,
+        runner: row.get(6)?,
+        request_hash: row.get(7)?,
+        state: row.get(8)?,
+        child_executed: child_executed != 0,
+        created_at: parse_time_for_sql(&created_at)?,
+        completed_at: completed_at
+            .as_deref()
+            .map(parse_time_for_sql)
+            .transpose()?,
     })
 }
 
