@@ -563,6 +563,7 @@ impl<'a, S: SnapshotStore> WorkService<'a, S> {
         };
 
         if state == "reviewable"
+            && latest_dispatch.is_some()
             && latest_refs
                 .iter()
                 .all(|binding| binding.snapshot_id.is_none())

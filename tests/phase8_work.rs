@@ -316,6 +316,60 @@ fn dependency_unlock_and_cycle_rejection_are_projected() {
 }
 
 #[test]
+fn decomposed_parent_becomes_reviewable_without_own_snapshot_requirement() {
+    let temp = init_workspace();
+    add_agent(&temp, "orch", "orchestrator", "orch-token");
+    add_agent(&temp, "worker", "worker", "worker-token");
+    let root = create_work(&temp, "work-root", "root");
+    let child = create_work(&temp, "work-child", "child");
+    run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("work")
+            .arg("edge")
+            .arg("add")
+            .arg("--type")
+            .arg("decomposes-to")
+            .arg("--from")
+            .arg(&root)
+            .arg("--to")
+            .arg(&child)
+            .arg("--command-id")
+            .arg("edge-root-child"),
+    );
+
+    let fake = temp.path().join("fake-opencode-child");
+    write_phase8_worker(&fake, "phase8-child.txt");
+    let response = run_json_with_stdin(
+        &mut team_send_work_command(&temp, &fake, &child, "phase8-send-child"),
+        "Create phase8-child.txt and report done.\n",
+    );
+    assert_eq!(response["protocol"]["work"]["state"], "reviewable");
+    run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("work")
+            .arg("accept")
+            .arg(&child)
+            .arg("--command-id")
+            .arg("accept-child"),
+    );
+
+    let root_inspect = inspect_work(&temp, &root);
+    assert_eq!(
+        root_inspect["protocol"]["projection"]["state"],
+        "reviewable"
+    );
+    assert_eq!(
+        root_inspect["protocol"]["projection"]["missing_requirements"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
 fn team_send_work_replay_does_not_reexecute_worker() {
     let temp = init_workspace();
     add_agent(&temp, "orch", "orchestrator", "orch-token");
