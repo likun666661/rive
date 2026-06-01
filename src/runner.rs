@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -24,7 +25,9 @@ use crate::store::{
     AgentRecord, AgentRole, CompleteDelegationInput, DelegationRecord, DispatchRecord,
     DispatchState, EventStore, IdempotencyResolution, InsertAgentRunInput, InsertDelegationInput,
 };
-use crate::work::{BindWorkDispatchCommand, WorkProjectionProtocol, WorkService};
+use crate::work::{
+    BindWorkDispatchCommand, CreateWorkNodeInput, WorkNodeKind, WorkProjectionProtocol, WorkService,
+};
 use crate::workspace::Workspace;
 
 #[derive(Debug)]
@@ -50,6 +53,19 @@ pub struct CodexRunnerInput {
     pub snapshot_paths: Vec<PathBuf>,
     pub task_body: Vec<u8>,
     pub trust_project: bool,
+}
+
+#[derive(Debug)]
+pub struct OrchestratorRunnerInput {
+    pub runner: String,
+    pub agent: String,
+    pub command_id: String,
+    pub agent_token: Option<String>,
+    pub opencode_bin: Option<PathBuf>,
+    pub timeout_seconds: u64,
+    pub workers: Vec<String>,
+    pub acceptance_command: Option<String>,
+    pub objective: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -156,6 +172,31 @@ pub struct TeamSendResponseProtocol {
 }
 
 #[derive(Debug, Serialize)]
+pub struct OrchestratorRunnerResponseProtocol {
+    pub runner: OrchestratorRunnerProtocol,
+    pub agent: crate::dispatch::AgentProtocol,
+    pub root_work: WorkProjectionProtocol,
+    pub workers: Vec<crate::dispatch::AgentProtocol>,
+    pub trace: RunnerTraceProtocol,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OrchestratorRunnerProtocol {
+    pub kind: &'static str,
+    pub adapter: &'static str,
+    pub run_id: String,
+    pub command_id: String,
+    pub root_work_node_id: String,
+    pub binary: String,
+    pub opencode_bin: Option<String>,
+    pub exit_code: Option<i32>,
+    pub stdout_ref: String,
+    pub stderr_ref: String,
+    pub child_executed: bool,
+    pub idempotency_status: &'static str,
+}
+
+#[derive(Debug, Serialize)]
 pub struct DelegationProtocol {
     pub command_id: String,
     pub source_agent_id: String,
@@ -222,6 +263,226 @@ impl<'a> CodexRunner<'a> {
 
     pub fn run(&self, input: CodexRunnerInput) -> Result<RunnerResponseProtocol> {
         self.core.run(input.into())
+    }
+}
+
+pub struct OrchestratorRunner<'a> {
+    workspace: &'a Workspace,
+    event_store: &'a EventStore,
+    trace_store: &'a DebugTraceStore,
+    blob_store: &'a crate::snapshot::LocalSnapshotStore<'a>,
+}
+
+impl<'a> OrchestratorRunner<'a> {
+    pub fn new(
+        workspace: &'a Workspace,
+        event_store: &'a EventStore,
+        trace_store: &'a DebugTraceStore,
+        blob_store: &'a crate::snapshot::LocalSnapshotStore<'a>,
+    ) -> Self {
+        Self {
+            workspace,
+            event_store,
+            trace_store,
+            blob_store,
+        }
+    }
+
+    pub fn run(
+        &self,
+        input: OrchestratorRunnerInput,
+    ) -> Result<OrchestratorRunnerResponseProtocol> {
+        if input.runner != "opencode" {
+            return Err(anyhow!("runner not supported: {}", input.runner));
+        }
+        if input.timeout_seconds == 0 {
+            return Err(anyhow!("opencode timeout must be greater than zero"));
+        }
+        if input.command_id.trim().is_empty() {
+            return Err(anyhow!("missing command id"));
+        }
+        if input.objective.is_empty() {
+            return Err(anyhow!("orchestrator objective is required"));
+        }
+        if input.workers.is_empty() {
+            return Err(anyhow!("orchestrator worker is required"));
+        }
+
+        install_opencode_plugin(self.workspace)?;
+        let (orchestrator, token) = self.resolve_orchestrator(&input)?;
+        let workers = self.resolve_workers(&input.workers)?;
+        let root_body =
+            orchestrator_root_body(&input.objective, &workers, &input.acceptance_command);
+        let work_service = WorkService::new(self.workspace, self.event_store, self.blob_store);
+        let root_command_id = format!("orchestrator:{}:root", input.command_id);
+        let (root, root_idempotency) = work_service.create_node(CreateWorkNodeInput {
+            command_id: root_command_id,
+            kind: WorkNodeKind::Objective,
+            title: format!("orchestrator objective {}", input.command_id),
+            body: root_body,
+        })?;
+
+        let should_execute = root_idempotency == "inserted";
+        let run_id = if should_execute {
+            prefixed_id("run")
+        } else {
+            format!("replay-{}", root.work_node_id)
+        };
+        let run_dir = self.workspace.debug_runs_dir().join(&run_id);
+        fs::create_dir_all(&run_dir)?;
+        let stdout_path = run_dir.join("stdout.jsonl");
+        let stderr_path = run_dir.join("stderr.log");
+        let binary = OpenCodeAdapter.resolve_binary(input.opencode_bin.as_deref())?;
+        let prompt = build_orchestrator_prompt(
+            self.workspace,
+            &input.objective,
+            &root.work_node_id,
+            &workers,
+            input.acceptance_command.as_deref(),
+        );
+        fs::write(run_dir.join("prompt.txt"), &prompt)?;
+
+        let mut exit_code = None;
+        if should_execute {
+            self.event_store.insert_agent_run(&InsertAgentRunInput {
+                run_id: run_id.clone(),
+                agent_id: orchestrator.agent_id.clone(),
+                token_hash: token_hash(&token),
+                created_at: Utc::now(),
+            })?;
+            let mut command = Command::new(&binary);
+            command
+                .current_dir(&self.workspace.root)
+                .arg("run")
+                .arg("--format")
+                .arg("json")
+                .arg("--dangerously-skip-permissions")
+                .arg(&prompt);
+            apply_orchestrator_env(
+                &mut command,
+                self.workspace,
+                &orchestrator,
+                &token,
+                &run_id,
+                &root.work_node_id,
+                &workers,
+            );
+            let output = run_child_process(&mut command, input.timeout_seconds)?;
+            exit_code = output.exit_code;
+            fs::write(&stdout_path, &output.stdout)?;
+            fs::write(&stderr_path, &output.stderr)?;
+            if output.timed_out {
+                return Err(anyhow!("opencode timeout"));
+            }
+            if output.exit_code.unwrap_or(1) != 0 {
+                return Err(anyhow!("opencode exit failed: {:?}", output.exit_code));
+            }
+        } else {
+            fs::write(&stdout_path, b"")?;
+            fs::write(&stderr_path, b"")?;
+        }
+
+        let root_projection = work_service.inspect_projection(&root.work_node_id)?;
+        if root_projection.state != "done" {
+            return Err(anyhow!(
+                "work not done: root {} is {}",
+                root.work_node_id,
+                root_projection.state
+            ));
+        }
+        let trace = self.trace_summary(&run_id)?;
+        let binary = binary.display().to_string();
+        Ok(OrchestratorRunnerResponseProtocol {
+            runner: OrchestratorRunnerProtocol {
+                kind: "orchestrator",
+                adapter: "opencode",
+                run_id,
+                command_id: input.command_id,
+                root_work_node_id: root.work_node_id,
+                binary: binary.clone(),
+                opencode_bin: Some(binary),
+                exit_code,
+                stdout_ref: path_relative_to(&stdout_path, &self.workspace.root)?,
+                stderr_ref: path_relative_to(&stderr_path, &self.workspace.root)?,
+                child_executed: should_execute,
+                idempotency_status: root_idempotency,
+            },
+            agent: agent_protocol(&orchestrator),
+            root_work: root_projection,
+            workers: workers.iter().map(agent_protocol).collect(),
+            trace,
+        })
+    }
+
+    fn resolve_orchestrator(
+        &self,
+        input: &OrchestratorRunnerInput,
+    ) -> Result<(AgentRecord, String)> {
+        if let Some(agent) = self.event_store.get_agent(&input.agent)? {
+            let token = input
+                .agent_token
+                .clone()
+                .ok_or_else(|| anyhow!("runner agent token required"))?;
+            if agent.token_hash != token_hash(&token) {
+                return Err(anyhow!("invalid agent token"));
+            }
+            if agent.role != AgentRole::Orchestrator {
+                return Err(anyhow!("runner agent must be orchestrator"));
+            }
+            return Ok((agent, token));
+        }
+        let service = DispatchService::new(self.workspace, self.event_store, self.blob_store);
+        let outcome = service.add_agent(AddAgentInput {
+            name: input.agent.clone(),
+            role: AgentRole::Orchestrator,
+            token: None,
+        })?;
+        Ok((outcome.agent, outcome.token))
+    }
+
+    fn resolve_workers(&self, workers: &[String]) -> Result<Vec<AgentRecord>> {
+        let service = DispatchService::new(self.workspace, self.event_store, self.blob_store);
+        let mut records = Vec::new();
+        for worker in workers {
+            if let Some(agent) = self.event_store.get_agent(worker)? {
+                if agent.role != AgentRole::Worker {
+                    return Err(anyhow!("runner worker must be worker: {}", worker));
+                }
+                records.push(agent);
+            } else {
+                records.push(
+                    service
+                        .add_agent(AddAgentInput {
+                            name: worker.clone(),
+                            role: AgentRole::Worker,
+                            token: None,
+                        })?
+                        .agent,
+                );
+            }
+        }
+        Ok(records)
+    }
+
+    fn trace_summary(&self, run_id: &str) -> Result<RunnerTraceProtocol> {
+        let mut events = self.trace_store.list_events(TraceListFilter {
+            adapter: Some("opencode-plugin".to_string()),
+            agent_id: None,
+            dispatch_id: None,
+            trace_session_id: None,
+        })?;
+        events.retain(|event| event.run_id.as_deref() == Some(run_id));
+        let session_ids = events
+            .iter()
+            .filter_map(|event| event.trace_session_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Ok(RunnerTraceProtocol {
+            adapter: "opencode-plugin",
+            event_count: events.len(),
+            session_ids,
+        })
     }
 }
 
@@ -1021,6 +1282,8 @@ fn apply_common_env(command: &mut Command, input: &RunnerProcessInput<'_>) {
     let old_path = std::env::var_os("PATH").unwrap_or_default();
     let path = format!("{}:{}", bin_dir.display(), old_path.to_string_lossy());
     command
+        .env_remove("RIVE_ORCHESTRATOR_ROOT_WORK_ID")
+        .env_remove("RIVE_AVAILABLE_WORKERS")
         .env("RIVE_WORKSPACE", &input.workspace.root)
         .env("RIVE_AGENT_ID", &input.agent.agent_id)
         .env("RIVE_AGENT_TOKEN", input.token)
@@ -1125,6 +1388,120 @@ Task:
         adapter_hints = adapter_hints,
         body = body,
     )
+}
+
+fn orchestrator_root_body(
+    objective: &[u8],
+    workers: &[AgentRecord],
+    acceptance_command: &Option<String>,
+) -> Vec<u8> {
+    let payload = json!({
+        "objective_sha256": format!("sha256:{}", sha256_hex(objective)),
+        "objective": String::from_utf8_lossy(objective),
+        "workers": workers
+            .iter()
+            .map(|worker| json!({
+                "agent_id": worker.agent_id,
+                "name": worker.name,
+                "role": worker.role.as_str(),
+            }))
+            .collect::<Vec<_>>(),
+        "acceptance_command": acceptance_command,
+    });
+    serde_json::to_vec_pretty(&payload).expect("orchestrator root payload should serialize")
+}
+
+fn build_orchestrator_prompt(
+    workspace: &Workspace,
+    objective: &[u8],
+    root_work_node_id: &str,
+    workers: &[AgentRecord],
+    acceptance_command: Option<&str>,
+) -> String {
+    let objective = String::from_utf8_lossy(objective);
+    let mut worker_lines = String::new();
+    for worker in workers {
+        let _ = writeln!(
+            worker_lines,
+            "- {} ({}) use `--to {}` and `--runner opencode`",
+            worker.name, worker.agent_id, worker.name
+        );
+    }
+    let acceptance = acceptance_command.unwrap_or("(none provided)");
+    format!(
+        r#"You are the Rive Orchestrator for this workspace.
+
+Workspace:
+- root: {workspace}
+
+Root work node:
+- id: {root_work_node_id}
+
+Available workers:
+{worker_lines}
+All worker delegations in this phase must use `--runner opencode`.
+
+Acceptance command:
+{acceptance}
+
+Goal:
+{objective}
+
+Rules:
+1. Use `team work` to create and maintain a Work DAG under the root node.
+2. For a simple objective, create exactly one child implementation node with `team work create`, then connect it to the root with `team work edge add --type decomposes-to --from {root_work_node_id} --to <child>`.
+3. Do not add `depends-on`, `validates`, or extra validation nodes unless the acceptance command requires them. Any unfinished dependency will block the root.
+4. Use `team work inspect <node>` before delegating and after each worker report.
+5. Delegate work with `team send --work <node> --runner opencode --wait --stdin`.
+6. Workers must use `rive snapshot capture` and `team report`; natural language completion is not enough.
+7. A reported node is only `reviewable`. Use `team work accept` only after checking artifacts, snapshots, or test output.
+8. If tests fail or evidence is incomplete, use `team work reopen` or create a follow-up node. Do not rewrite history.
+9. Final success requires the root objective projection to be `done`.
+10. stdout/final answer/debug trace do not count as completion.
+
+Required final action:
+- Inspect the root node.
+- Accept the root with `team work accept {root_work_node_id} --command-id <unique-id> --stdin` only when the Work DAG proves the objective is complete.
+"#,
+        workspace = workspace.root.display(),
+        root_work_node_id = root_work_node_id,
+        worker_lines = worker_lines,
+        acceptance = acceptance,
+        objective = objective,
+    )
+}
+
+fn apply_orchestrator_env(
+    command: &mut Command,
+    workspace: &Workspace,
+    agent: &AgentRecord,
+    token: &str,
+    run_id: &str,
+    root_work_node_id: &str,
+    workers: &[AgentRecord],
+) {
+    let bin_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_default();
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = format!("{}:{}", bin_dir.display(), old_path.to_string_lossy());
+    let available_workers = workers
+        .iter()
+        .map(|worker| worker.name.clone())
+        .collect::<Vec<_>>()
+        .join(",");
+    command
+        .env_remove("RIVE_DISPATCH_ID")
+        .env("RIVE_WORKSPACE", &workspace.root)
+        .env("RIVE_AGENT_ID", &agent.agent_id)
+        .env("RIVE_AGENT_TOKEN", token)
+        .env("RIVE_RUN_ID", run_id)
+        .env("RIVE_ORCHESTRATOR_ROOT_WORK_ID", root_work_node_id)
+        .env("RIVE_AVAILABLE_WORKERS", available_workers)
+        .env("PATH", path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 }
 
 pub fn build_prompt(

@@ -182,14 +182,15 @@ Acceptance command, if provided:
 
 Rules:
 1. Use `team work` to create and maintain a Work DAG under the root node.
-2. Start with at least investigation, implementation, and validation/review nodes.
-3. Use `team work inspect <node>` before delegating and after each worker report.
-4. Delegate work with `team send --work <node> --runner opencode --wait --stdin`.
-5. Workers must use `rive snapshot capture` and `team report`; natural language completion is not enough.
-6. A reported node is only `reviewable`. Use `team work accept` only after checking artifacts, snapshots, or test output.
-7. If tests fail or evidence is incomplete, use `team work reopen` or create a follow-up node. Do not rewrite history.
-8. Final success requires the root objective projection to be `done`.
-9. stdout/final answer/debug trace do not count as completion.
+2. For a simple objective, create exactly one child implementation node and connect it to the root with `decomposes-to`.
+3. Do not add `depends-on`, `validates`, or extra validation nodes unless the acceptance command requires them. Any unfinished dependency will block the root.
+4. Use `team work inspect <node>` before delegating and after each worker report.
+5. Delegate work with `team send --work <node> --runner opencode --wait --stdin`.
+6. Workers must use `rive snapshot capture` and `team report`; natural language completion is not enough.
+7. A reported node is only `reviewable`. Use `team work accept` only after checking artifacts, snapshots, or test output.
+8. If tests fail or evidence is incomplete, use `team work reopen` or create a follow-up node. Do not rewrite history.
+9. Final success requires the root objective projection to be `done`.
+10. stdout/final answer/debug trace do not count as completion.
 ```
 
 The prompt can include command examples, but it must not include the SWE-bench gold patch.

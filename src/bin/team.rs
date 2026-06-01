@@ -14,8 +14,11 @@ use rive::facts::{
 use rive::output::{Envelope, ErrorEnvelope};
 use rive::runner::{TeamSendInput, TeamSendService};
 use rive::snapshot::LocalSnapshotStore;
-use rive::store::{AgentRecord, EventStore};
-use rive::work::{BindWorkRefsCommand, WorkService};
+use rive::store::{AgentRecord, AgentRole, EventStore};
+use rive::work::{
+    work_edge_protocol, work_node_protocol, AddWorkEdgeInput, BindWorkRefsCommand,
+    CreateWorkNodeInput, WorkEdgeType, WorkNodeKind, WorkService, WorkStatusInput,
+};
 use rive::workspace::find_workspace;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -91,6 +94,10 @@ enum Commands {
         #[command(subcommand)]
         command: FactCommands,
     },
+    Work {
+        #[command(subcommand)]
+        command: WorkCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -104,6 +111,59 @@ enum FactCommands {
         command_id: String,
         #[arg(long)]
         stdin: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkCommands {
+    Create {
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long = "command-id")]
+        command_id: String,
+        #[arg(long)]
+        stdin: bool,
+    },
+    Edge {
+        #[command(subcommand)]
+        command: WorkEdgeCommands,
+    },
+    List,
+    Show {
+        work_node_id: String,
+    },
+    Inspect {
+        work_node_id: String,
+    },
+    Accept {
+        work_node_id: String,
+        #[arg(long = "command-id")]
+        command_id: String,
+        #[arg(long)]
+        stdin: bool,
+    },
+    Reopen {
+        work_node_id: String,
+        #[arg(long = "command-id")]
+        command_id: String,
+        #[arg(long)]
+        stdin: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkEdgeCommands {
+    Add {
+        #[arg(long = "type")]
+        edge_type: String,
+        #[arg(long = "from")]
+        from_node_id: String,
+        #[arg(long = "to")]
+        to_node_id: String,
+        #[arg(long = "command-id")]
+        command_id: String,
     },
 }
 
@@ -219,6 +279,167 @@ fn run() -> Result<()> {
                 stdin,
             } => record_fact(fact_type, snapshots, command_id, stdin),
         },
+        Commands::Work { command } => handle_work(command),
+    }
+}
+
+fn handle_work(command: WorkCommands) -> Result<()> {
+    let actor = actor_from_env()?;
+    let workspace = find_workspace(std::path::Path::new(&actor.workspace))?;
+    let store = EventStore::open(&workspace.db_path())?;
+    store.init_schema()?;
+    let agent = authenticate_actor(&store, &actor)?;
+    let snapshot_store = LocalSnapshotStore::new(&workspace);
+    let service = WorkService::new(&workspace, &store, &snapshot_store);
+    match command {
+        WorkCommands::Create {
+            kind,
+            title,
+            command_id,
+            stdin,
+        } => {
+            require_orchestrator(&agent)?;
+            let mut body = Vec::new();
+            if stdin {
+                std::io::stdin().read_to_end(&mut body)?;
+            }
+            let (node, idempotency_status) = service.create_node(CreateWorkNodeInput {
+                command_id,
+                kind: WorkNodeKind::parse(&kind)?,
+                title,
+                body,
+            })?;
+            let projection = service.inspect_projection(&node.work_node_id)?;
+            let protocol = serde_json::json!({
+                "node": work_node_protocol(&node, service.graph_version()?, idempotency_status),
+                "projection": projection,
+            });
+            let display = serde_json::json!({
+                "summary": format!("Created work node {}", node.work_node_id),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&Envelope::new(protocol, display))?
+            );
+            Ok(())
+        }
+        WorkCommands::Edge { command } => match command {
+            WorkEdgeCommands::Add {
+                edge_type,
+                from_node_id,
+                to_node_id,
+                command_id,
+            } => {
+                require_orchestrator(&agent)?;
+                let (edge, idempotency_status) = service.add_edge(AddWorkEdgeInput {
+                    command_id,
+                    edge_type: WorkEdgeType::parse(&edge_type)?,
+                    from_node_id,
+                    to_node_id,
+                })?;
+                let protocol = work_edge_protocol(&edge, idempotency_status);
+                let display = serde_json::json!({
+                    "summary": format!("Created work edge {}", protocol.work_edge_id),
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&Envelope::new(protocol, display))?
+                );
+                Ok(())
+            }
+        },
+        WorkCommands::List => {
+            let protocol = service.list_nodes()?;
+            let display = serde_json::json!({
+                "summary": format!("{} work nodes", protocol.nodes.len()),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&Envelope::new(protocol, display))?
+            );
+            Ok(())
+        }
+        WorkCommands::Show { work_node_id } => {
+            let protocol = service.show_node(&work_node_id)?;
+            let display = serde_json::json!({
+                "summary": format!("Work node {} {}", protocol.work_node_id, protocol.title),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&Envelope::new(protocol, display))?
+            );
+            Ok(())
+        }
+        WorkCommands::Inspect { work_node_id } => {
+            let protocol = service.inspect(&work_node_id)?;
+            let display = serde_json::json!({
+                "summary": format!("Work node {} is {}", protocol.node.work_node_id, protocol.projection.state),
+                "explanation": format!("{} missing requirements", protocol.projection.missing_requirements.len()),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&Envelope::new(protocol, display))?
+            );
+            Ok(())
+        }
+        WorkCommands::Accept {
+            work_node_id,
+            command_id,
+            stdin,
+        } => {
+            require_orchestrator(&agent)?;
+            let mut reason = Vec::new();
+            if stdin {
+                std::io::stdin().read_to_end(&mut reason)?;
+            }
+            let (node, idempotency_status) = service.accept_node(WorkStatusInput {
+                command_id,
+                work_node_id,
+                reason,
+            })?;
+            let projection = service.inspect_projection(&node.work_node_id)?;
+            let protocol = serde_json::json!({
+                "node": work_node_protocol(&node, service.graph_version()?, idempotency_status),
+                "projection": projection,
+            });
+            let display = serde_json::json!({
+                "summary": format!("Accepted work node {}", node.work_node_id),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&Envelope::new(protocol, display))?
+            );
+            Ok(())
+        }
+        WorkCommands::Reopen {
+            work_node_id,
+            command_id,
+            stdin,
+        } => {
+            require_orchestrator(&agent)?;
+            let mut reason = Vec::new();
+            if stdin {
+                std::io::stdin().read_to_end(&mut reason)?;
+            }
+            let (node, idempotency_status) = service.reopen_node(WorkStatusInput {
+                command_id,
+                work_node_id,
+                reason,
+            })?;
+            let projection = service.inspect_projection(&node.work_node_id)?;
+            let protocol = serde_json::json!({
+                "node": work_node_protocol(&node, service.graph_version()?, idempotency_status),
+                "projection": projection,
+            });
+            let display = serde_json::json!({
+                "summary": format!("Reopened work node {}", node.work_node_id),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&Envelope::new(protocol, display))?
+            );
+            Ok(())
+        }
     }
 }
 
@@ -481,6 +702,13 @@ fn authenticate_actor(store: &EventStore, actor: &ActorEnv) -> Result<AgentRecor
         return Err(anyhow!("invalid agent token"));
     }
     Ok(agent)
+}
+
+fn require_orchestrator(agent: &AgentRecord) -> Result<()> {
+    if agent.role != AgentRole::Orchestrator {
+        return Err(anyhow!("agent role not allowed"));
+    }
+    Ok(())
 }
 
 fn token_hash(token: &str) -> String {

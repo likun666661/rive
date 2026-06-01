@@ -14,7 +14,10 @@ use rive::dispatch::{
 };
 use rive::facts::{protocol_from_fact, FactDisplay, FactListDisplay, FactListProtocol};
 use rive::output::{Envelope, ErrorEnvelope};
-use rive::runner::{CodexRunner, CodexRunnerInput, OpenCodeRunner, OpenCodeRunnerInput};
+use rive::runner::{
+    CodexRunner, CodexRunnerInput, OpenCodeRunner, OpenCodeRunnerInput, OrchestratorRunner,
+    OrchestratorRunnerInput,
+};
 use rive::snapshot::{
     read_manifest, CaptureDisplay, CaptureOptions, CaptureProtocol, LocalFsEvidenceWorkspace,
     LocalSnapshotStore, SnapshotCapture, SnapshotListDisplay, SnapshotListProtocol,
@@ -254,6 +257,26 @@ enum DebugTraceCommands {
 
 #[derive(Subcommand)]
 enum RunnerCommands {
+    Orchestrator {
+        #[arg(long)]
+        runner: String,
+        #[arg(long)]
+        agent: String,
+        #[arg(long = "command-id")]
+        command_id: String,
+        #[arg(long = "agent-token")]
+        agent_token: Option<String>,
+        #[arg(long = "worker")]
+        workers: Vec<String>,
+        #[arg(long = "acceptance-command")]
+        acceptance_command: Option<String>,
+        #[arg(long = "opencode-bin")]
+        opencode_bin: Option<PathBuf>,
+        #[arg(long = "timeout-seconds", default_value_t = 600)]
+        timeout_seconds: u64,
+        #[arg(long)]
+        stdin: bool,
+    },
     Opencode {
         #[arg(long)]
         agent: String,
@@ -874,6 +897,53 @@ fn run() -> Result<()> {
             },
         },
         Commands::Runner { command } => match command {
+            RunnerCommands::Orchestrator {
+                runner,
+                agent,
+                command_id,
+                agent_token,
+                workers,
+                acceptance_command,
+                opencode_bin,
+                timeout_seconds,
+                stdin,
+            } => {
+                if !stdin {
+                    return Err(anyhow!("runner orchestrator requires --stdin"));
+                }
+                let workspace = find_workspace(&std::env::current_dir()?)
+                    .map_err(|_| anyhow!("workspace not initialized"))?;
+                let store = EventStore::open(&workspace.db_path())?;
+                store.init_schema()?;
+                let trace_store = DebugTraceStore::open(&workspace.db_path())?;
+                trace_store.init_schema()?;
+                let snapshot_store = LocalSnapshotStore::new(&workspace);
+                let orchestrator =
+                    OrchestratorRunner::new(&workspace, &store, &trace_store, &snapshot_store);
+                let mut objective = Vec::new();
+                std::io::stdin().read_to_end(&mut objective)?;
+                let protocol = orchestrator.run(OrchestratorRunnerInput {
+                    runner,
+                    agent,
+                    command_id,
+                    agent_token,
+                    opencode_bin,
+                    timeout_seconds,
+                    workers,
+                    acceptance_command,
+                    objective,
+                })?;
+                let display = serde_json::json!({
+                    "summary": format!(
+                        "Orchestrator runner {} ended with root {} {}",
+                        protocol.runner.run_id,
+                        protocol.runner.root_work_node_id,
+                        protocol.root_work.state
+                    ),
+                    "trace_note": "Debug trace is for Rive diagnostics only; orchestrator success is based on root work projection.",
+                });
+                print_json(&Envelope::new(protocol, display))
+            }
             RunnerCommands::Opencode {
                 agent,
                 title,
@@ -984,8 +1054,18 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
         ("runner_agent_token_required", "fix_arguments")
     } else if lower.contains("invalid agent token") {
         ("agent_token_invalid", "stop_and_report")
-    } else if lower.contains("runner agent must be worker") {
+    } else if lower.contains("runner agent must be worker")
+        || lower.contains("runner agent must be orchestrator")
+    {
         ("runner_agent_role_invalid", "fix_arguments")
+    } else if lower.contains("runner worker must be worker") {
+        ("runner_worker_role_invalid", "fix_arguments")
+    } else if lower.contains("orchestrator worker is required") {
+        ("orchestrator_worker_required", "fix_arguments")
+    } else if lower.contains("orchestrator objective is required") {
+        ("orchestrator_objective_required", "fix_arguments")
+    } else if lower.contains("work not done") {
+        ("work_not_done", "inspect_projection")
     } else if lower.contains("opencode not found") {
         ("opencode_not_found", "fix_installation")
     } else if lower.contains("codex not found") {

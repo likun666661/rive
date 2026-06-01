@@ -494,6 +494,14 @@ impl<'a, S: SnapshotStore> WorkService<'a, S> {
             }
             derived_from.push(dependency_id.clone());
         }
+        let children = children_for(work_node_id, &edges);
+        for child_id in &children {
+            let child_projection = self.inspect_projection(child_id)?;
+            if child_projection.state != "done" {
+                missing_requirements.push(format!("child:{child_id}"));
+            }
+            derived_from.push(child_id.clone());
+        }
 
         let node_bindings = bindings
             .iter()
@@ -548,6 +556,8 @@ impl<'a, S: SnapshotStore> WorkService<'a, S> {
                 DispatchState::Blocked => "blocked",
                 DispatchState::Failed | DispatchState::Cancelled => "needs_attention",
             }
+        } else if !children.is_empty() {
+            "reviewable"
         } else {
             "ready"
         };
@@ -716,6 +726,14 @@ fn dependencies_for(work_node_id: &str, edges: &[WorkEdgeRecord]) -> Vec<String>
     edges
         .iter()
         .filter(|edge| edge.from_node_id == work_node_id && edge.edge_type == "depends_on")
+        .map(|edge| edge.to_node_id.clone())
+        .collect()
+}
+
+fn children_for(work_node_id: &str, edges: &[WorkEdgeRecord]) -> Vec<String> {
+    edges
+        .iter()
+        .filter(|edge| edge.from_node_id == work_node_id && edge.edge_type == "decomposes_to")
         .map(|edge| edge.to_node_id.clone())
         .collect()
 }
