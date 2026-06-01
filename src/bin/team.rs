@@ -680,6 +680,10 @@ fn record_dispatch_report(
     store.init_schema()?;
     let snapshot_store = LocalSnapshotStore::new(&workspace);
     let service = DispatchService::new(&workspace, &store, &snapshot_store);
+    if let Some(branch_ref) = workspace_ref.as_deref() {
+        BranchService::new(&workspace, &store)
+            .validate_workspace_ref_for_report(&dispatch, branch_ref)?;
+    }
     let mut body = Vec::new();
     std::io::stdin().read_to_end(&mut body)?;
     let outcome = service.record_report(

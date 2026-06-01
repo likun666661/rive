@@ -925,12 +925,18 @@ impl<'a, S: SnapshotStore> WorkService<'a, S> {
     }
 
     fn has_uncommitted_branch_ref(&self, work_node_id: &str) -> Result<bool> {
-        for integration in self.store.list_branch_integrations()? {
-            if integration.work_node_id == work_node_id && integration.state != "committed" {
-                return Ok(true);
-            }
+        let integrations = self
+            .store
+            .list_branch_integrations()?
+            .into_iter()
+            .filter(|integration| integration.work_node_id == work_node_id)
+            .collect::<Vec<_>>();
+        if integrations.is_empty() {
+            return Ok(false);
         }
-        Ok(false)
+        Ok(!integrations
+            .iter()
+            .any(|integration| integration.state == "committed"))
     }
 
     fn ensure_schema(&self) -> Result<()> {

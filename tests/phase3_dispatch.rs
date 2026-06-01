@@ -181,6 +181,48 @@ fn worker_can_report_assigned_dispatch_with_evidence() {
 }
 
 #[test]
+fn invalid_branch_workspace_ref_is_rejected_before_fact_write() {
+    let fixture = fixture();
+    let dispatch_id = create_dispatch(&fixture.temp, "create-invalid-branch-ref");
+    let snapshot_id = capture_snapshot(&fixture.temp);
+
+    let error = run_json_expect_error(
+        team_cmd()
+            .env("RIVE_WORKSPACE", fixture.temp.path())
+            .env("RIVE_AGENT_ID", &fixture.worker_id)
+            .env("RIVE_AGENT_TOKEN", &fixture.worker_token)
+            .arg("report")
+            .arg("--dispatch")
+            .arg(&dispatch_id)
+            .arg("--status")
+            .arg("done")
+            .arg("--snapshot")
+            .arg(&snapshot_id)
+            .arg("--workspace-ref")
+            .arg("branchfs:missing:branch")
+            .arg("--command-id")
+            .arg("report-invalid-branch-ref")
+            .arg("--stdin"),
+        Some("Done with invalid branch ref.\n"),
+    );
+    assert_eq!(error["protocol"]["code"], "branch_not_found");
+
+    let show = run_json(
+        rive_cmd()
+            .current_dir(fixture.temp.path())
+            .arg("dispatch")
+            .arg("show")
+            .arg(&dispatch_id),
+    );
+    assert_eq!(show["protocol"]["state"], "open");
+    let conn = Connection::open(fixture.temp.path().join(".rive/rive.db")).unwrap();
+    let facts: i64 = conn
+        .query_row("select count(*) from facts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(facts, 0);
+}
+
+#[test]
 fn status_update_does_not_close_dispatch() {
     let fixture = fixture();
     let dispatch_id = create_dispatch(&fixture.temp, "create-status");

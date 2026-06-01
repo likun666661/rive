@@ -112,6 +112,7 @@ impl BranchWorkspaceBackend for LocalFakeBranchBackend {
             return Err(anyhow!("branch not found: {}", branch.branch_id));
         }
         let changed_files = changed_files(&workspace.root, &branch_path)?;
+        apply_deletions(&workspace.root, &branch_path)?;
         copy_tree(&branch_path, &workspace.root, CopyMode::BranchToParent)?;
         Ok(BranchCommitResult {
             commit_ref: format!("local-fake-commit:{}", branch.branch_name),
@@ -144,11 +145,11 @@ impl Default for BranchFsBackend {
 
 impl BranchFsBackend {
     fn mount_root(workspace: &Workspace) -> PathBuf {
-        workspace.rive_dir().join("branchfs").join("mount")
+        branchfs_runtime_root(workspace).join("mount")
     }
 
     fn storage_root(workspace: &Workspace) -> PathBuf {
-        workspace.rive_dir().join("branchfs").join("storage")
+        branchfs_runtime_root(workspace).join("storage")
     }
 
     fn run_branchfs(&self, args: &[String]) -> Result<()> {
@@ -245,14 +246,18 @@ impl BranchWorkspaceBackend for BranchFsBackend {
     ) -> Result<BranchCommitResult> {
         self.ensure_available(workspace)?;
         let branch_path = PathBuf::from(&branch.branch_path);
-        let before = file_set(&workspace.root)?;
+        let before = file_digest_map(&workspace.root)?;
         fs::write(branch_path.join(".branchfs_ctl"), b"commit")
             .map_err(|err| anyhow!("branch commit failed: {err}"))?;
-        let after = file_set(&workspace.root)?;
-        let changed_files = before
-            .symmetric_difference(&after)
+        let after = file_digest_map(&workspace.root)?;
+        let mut changed_files = before
+            .keys()
+            .chain(after.keys())
+            .filter(|path| before.get(*path) != after.get(*path))
             .cloned()
             .collect::<Vec<_>>();
+        changed_files.sort();
+        changed_files.dedup();
         Ok(BranchCommitResult {
             commit_ref: format!("branchfs-commit:{}", branch.branch_name),
             changed_files,
@@ -325,14 +330,8 @@ impl<'a> BranchService<'a> {
         fact_event_id: &str,
         workspace_ref: &str,
     ) -> Result<Option<BranchIntegrationRecord>> {
+        self.validate_workspace_ref_for_report(dispatch_id, workspace_ref)?;
         if let Some(branch) = self.store.get_branch_workspace_by_ref(workspace_ref)? {
-            if branch.dispatch_id != dispatch_id {
-                return Err(anyhow!(
-                    "branch integration conflict: {} belongs to dispatch {}",
-                    workspace_ref,
-                    branch.dispatch_id
-                ));
-            }
             let existing = self
                 .store
                 .get_branch_integration_by_branch_id(&branch.branch_id)?;
@@ -373,6 +372,29 @@ impl<'a> BranchService<'a> {
             return Err(anyhow!("branch not found: {workspace_ref}"));
         }
         Ok(None)
+    }
+
+    pub fn validate_workspace_ref_for_report(
+        &self,
+        dispatch_id: &str,
+        workspace_ref: &str,
+    ) -> Result<()> {
+        if !workspace_ref.starts_with("branchfs:") {
+            return Ok(());
+        }
+        self.store.init_work_schema()?;
+        let branch = self
+            .store
+            .get_branch_workspace_by_ref(workspace_ref)?
+            .ok_or_else(|| anyhow!("branch not found: {workspace_ref}"))?;
+        if branch.dispatch_id != dispatch_id {
+            return Err(anyhow!(
+                "branch integration conflict: {} belongs to dispatch {}",
+                workspace_ref,
+                branch.dispatch_id
+            ));
+        }
+        Ok(())
     }
 
     pub fn list(&self) -> Result<Vec<BranchIntegrationRecord>> {
@@ -615,28 +637,50 @@ fn should_skip(rel: &str, mode: &CopyMode) -> bool {
 }
 
 fn changed_files(parent: &Path, branch: &Path) -> Result<Vec<String>> {
-    let mut changed = Vec::new();
-    for entry in WalkDir::new(branch).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let rel = path_relative_to(entry.path(), branch)?;
-        if should_skip(&rel, &CopyMode::BranchToParent) {
-            continue;
-        }
-        let parent_path = parent.join(&rel);
-        let branch_bytes = fs::read(entry.path())?;
-        let parent_bytes = fs::read(&parent_path).unwrap_or_default();
-        if branch_bytes != parent_bytes {
-            changed.push(rel);
-        }
-    }
+    let parent = file_digest_map(parent)?;
+    let branch = file_digest_map(branch)?;
+    let mut changed = parent
+        .keys()
+        .chain(branch.keys())
+        .filter(|path| parent.get(*path) != branch.get(*path))
+        .cloned()
+        .collect::<Vec<_>>();
     changed.sort();
+    changed.dedup();
     Ok(changed)
 }
 
-fn file_set(root: &Path) -> Result<BTreeSet<String>> {
-    let mut files = BTreeSet::new();
+fn apply_deletions(parent: &Path, branch: &Path) -> Result<()> {
+    let parent_files = file_set(parent)?;
+    let branch_files = file_set(branch)?;
+    for rel in parent_files.difference(&branch_files) {
+        let path = parent.join(rel);
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("remove deleted branch file {}", path.display()))?;
+            prune_empty_parents(parent, path.parent())?;
+        }
+    }
+    Ok(())
+}
+
+fn prune_empty_parents(root: &Path, mut current: Option<&Path>) -> Result<()> {
+    while let Some(path) = current {
+        if path == root {
+            break;
+        }
+        match fs::remove_dir(path) {
+            Ok(()) => current = path.parent(),
+            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) => return Err(err).with_context(|| format!("remove dir {}", path.display())),
+        }
+    }
+    Ok(())
+}
+
+fn file_digest_map(root: &Path) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut files = std::collections::BTreeMap::new();
     if !root.exists() {
         return Ok(files);
     }
@@ -644,11 +688,15 @@ fn file_set(root: &Path) -> Result<BTreeSet<String>> {
         if entry.file_type().is_file() {
             let rel = path_relative_to(entry.path(), root)?;
             if !should_skip(&rel, &CopyMode::BranchToParent) {
-                files.insert(rel);
+                files.insert(rel, sha256_hex(&fs::read(entry.path())?));
             }
         }
     }
     Ok(files)
+}
+
+fn file_set(root: &Path) -> Result<BTreeSet<String>> {
+    Ok(file_digest_map(root)?.into_keys().collect())
 }
 
 fn path_relative_to(path: &Path, root: &Path) -> Result<String> {
@@ -674,6 +722,12 @@ fn short_id(value: &str) -> String {
 
 fn workspace_id(workspace: &Workspace) -> String {
     format!("workspace:{}", workspace.root.display())
+}
+
+fn branchfs_runtime_root(workspace: &Workspace) -> PathBuf {
+    std::env::temp_dir()
+        .join("rive-branchfs")
+        .join(sha256_hex(workspace.root.to_string_lossy().as_bytes()))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

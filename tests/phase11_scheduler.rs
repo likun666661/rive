@@ -348,6 +348,25 @@ printf '{{"type":"step_finish","tokens":{{"input":5,"output":3,"reasoning":0,"ca
     );
 }
 
+fn write_branch_modify_delete_worker(path: &Path) {
+    let rive_bin = env!("CARGO_BIN_EXE_rive");
+    let team_bin = env!("CARGO_BIN_EXE_team");
+    write_executable(
+        path,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+test -n "$RIVE_BRANCH_REF"
+test -n "$RIVE_STATE_WORKSPACE"
+printf 'modified in branch\n' > "$RIVE_WORKSPACE/modify-me.txt"
+rm "$RIVE_WORKSPACE/delete-me.txt"
+SNAPSHOT_ID=$("{rive_bin}" snapshot capture --path "$RIVE_WORKSPACE/modify-me.txt" --label phase12-branch-modify-delete --agent "$RIVE_AGENT_ID" --dispatch "$RIVE_DISPATCH_ID" | sed -n 's/.*"snapshot_id": "\([^"]*\)".*/\1/p' | head -n 1)
+printf 'branch worker modified and deleted\n' | "{team_bin}" report --dispatch "$RIVE_DISPATCH_ID" --status done --snapshot "$SNAPSHOT_ID" --workspace-ref "$RIVE_BRANCH_REF" --command-id "phase12-moddel-report-$RIVE_RUN_ID" --stdin >/dev/null
+"#
+        ),
+    );
+}
+
 fn setup_graph(temp: &TempDir) -> (String, String, String, String) {
     let root = create_work(temp, "phase11-root", "root");
     let a = create_work(temp, "phase11-a", "A");
@@ -727,6 +746,47 @@ fn branch_commit_is_required_before_guarded_accept() {
         inspect_work(&temp, &a)["protocol"]["projection"]["state"],
         "done"
     );
+}
+
+#[test]
+fn branch_commit_applies_modified_and_deleted_files() {
+    let temp = init_workspace();
+    fs::write(temp.path().join("modify-me.txt"), "original\n").unwrap();
+    fs::write(temp.path().join("delete-me.txt"), "delete\n").unwrap();
+    add_worker(&temp, "worker-a");
+    add_worker(&temp, "worker-b");
+    let root = create_work(&temp, "phase12-moddel-root", "root");
+    let a = create_work(&temp, "phase12-moddel-a", "A");
+    add_edge(
+        &temp,
+        "decomposes-to",
+        &root,
+        &a,
+        "edge-phase12-moddel-root-a",
+    );
+    let fake = temp.path().join("fake-opencode-branch-moddel");
+    write_branch_modify_delete_worker(&fake);
+
+    run_json(&mut branch_scheduler_command(
+        &temp,
+        &fake,
+        &root,
+        "phase12-branch-moddel-manual",
+        "manual",
+    ));
+    assert_eq!(
+        fs::read_to_string(temp.path().join("modify-me.txt")).unwrap(),
+        "original\n"
+    );
+    assert!(temp.path().join("delete-me.txt").exists());
+
+    let integration_id = first_branch_integration_id(&temp);
+    branch_commit(&temp, &integration_id, "phase12-branch-moddel-commit");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("modify-me.txt")).unwrap(),
+        "modified in branch\n"
+    );
+    assert!(!temp.path().join("delete-me.txt").exists());
 }
 
 #[test]
