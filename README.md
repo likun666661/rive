@@ -21,3 +21,5 @@ Rive 是本地优先 agent team runtime 的体系文档。
 15. [Phase 7 Agent-to-Agent Delegation 测试计划](./docs/15-phase7-agent-to-agent-delegation-test-plan.md)
 16. [Phase 8 Work DAG / Dispatch Binding 设计](./docs/16-phase8-work-dag-dispatch-binding-design.md)
 17. [Phase 8 Work DAG / Dispatch Binding 测试计划](./docs/17-phase8-work-dag-dispatch-binding-test-plan.md)
+18. [Phase 9 OpenCode Orchestrator Control 设计](./docs/18-phase9-opencode-orchestrator-control-design.md)
+19. [Phase 9 OpenCode Orchestrator Control 测试计划](./docs/19-phase9-opencode-orchestrator-control-test-plan.md)
