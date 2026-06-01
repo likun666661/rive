@@ -17,3 +17,5 @@ Rive 是本地优先 agent team runtime 的体系文档。
 11. [Phase 5 OpenCode Runner 测试计划](./docs/11-phase5-opencode-runner-test-plan.md)
 12. [Phase 6 Codex Runner 设计](./docs/12-phase6-codex-runner-design.md)
 13. [Phase 6 Codex Runner 测试计划](./docs/13-phase6-codex-runner-test-plan.md)
+14. [Phase 7 Agent-to-Agent Delegation 设计](./docs/14-phase7-agent-to-agent-delegation-design.md)
+15. [Phase 7 Agent-to-Agent Delegation 测试计划](./docs/15-phase7-agent-to-agent-delegation-test-plan.md)

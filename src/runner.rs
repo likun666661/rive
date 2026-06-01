@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -18,7 +19,11 @@ use crate::dispatch::{
     agent_protocol, dispatch_protocol, AddAgentInput, CreateDispatchInput, CreateDispatchOutcome,
     DispatchService,
 };
-use crate::store::{AgentRecord, AgentRole, DispatchRecord, DispatchState, EventStore};
+use crate::facts::ActorEnv;
+use crate::store::{
+    AgentRecord, AgentRole, CompleteDelegationInput, DelegationRecord, DispatchRecord,
+    DispatchState, EventStore, IdempotencyResolution, InsertAgentRunInput, InsertDelegationInput,
+};
 use crate::workspace::Workspace;
 
 #[derive(Debug)]
@@ -117,6 +122,50 @@ pub struct RunnerTraceProtocol {
     pub adapter: &'static str,
     pub event_count: usize,
     pub session_ids: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct TeamSendInput {
+    pub actor: ActorEnv,
+    pub target: String,
+    pub runner: String,
+    pub title: String,
+    pub command_id: String,
+    pub opencode_bin: Option<PathBuf>,
+    pub codex_bin: Option<PathBuf>,
+    pub timeout_seconds: u64,
+    pub snapshot_paths: Vec<PathBuf>,
+    pub task_body: Vec<u8>,
+    pub wait: bool,
+    pub trust_project: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TeamSendResponseProtocol {
+    pub ok: bool,
+    pub action: &'static str,
+    pub command_id: String,
+    pub child_executed: bool,
+    pub expected_next_action: &'static str,
+    pub delegation: DelegationProtocol,
+    pub dispatch: crate::dispatch::DispatchProtocol,
+    pub trace: RunnerTraceProtocol,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DelegationProtocol {
+    pub command_id: String,
+    pub source_agent_id: String,
+    pub source_run_id: Option<String>,
+    pub target_agent_id: String,
+    pub worker_run_id: String,
+    pub dispatch_id: String,
+    pub runner: String,
+    pub state: String,
+    pub child_executed: bool,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub idempotency_status: &'static str,
 }
 
 pub struct OpenCodeRunner<'a> {
@@ -304,6 +353,80 @@ impl<'a, A: RunnerAdapter> RunnerCore<'a, A> {
         })
     }
 
+    fn run_existing(
+        &self,
+        input: ExistingRunnerInput<'_>,
+    ) -> Result<(DispatchRecord, RunnerProtocol, RunnerTraceProtocol)> {
+        self.adapter.install_trace(self.workspace)?;
+        let run_dir = self.workspace.debug_runs_dir().join(input.run_id);
+        fs::create_dir_all(&run_dir)?;
+        let stdout_path = run_dir.join(self.adapter.stdout_file_name());
+        let stderr_path = run_dir.join("stderr.log");
+        let binary = self.adapter.resolve_binary(input.binary)?;
+        let prompt = self.adapter.build_prompt(RunnerPromptContext {
+            workspace: self.workspace,
+            agent: input.agent,
+            dispatch: input.dispatch,
+            title: input.title,
+            body: input.task_body,
+            snapshot_paths: input.snapshot_paths,
+        });
+        fs::write(run_dir.join("prompt.txt"), &prompt)?;
+
+        let mut command = self.adapter.build_command(RunnerProcessInput {
+            binary: &binary,
+            workspace: self.workspace,
+            run_dir: &run_dir,
+            agent: input.agent,
+            token: input.token,
+            dispatch: input.dispatch,
+            run_id: input.run_id,
+            prompt: &prompt,
+            trust_project: input.trust_project,
+        })?;
+        let output = run_child_process(&mut command, input.timeout_seconds)?;
+        fs::write(&stdout_path, &output.stdout)?;
+        fs::write(&stderr_path, &output.stderr)?;
+        if output.timed_out {
+            return Err(anyhow!("{} timeout", self.adapter.kind()));
+        }
+        if output.exit_code.unwrap_or(1) != 0 {
+            return Err(anyhow!(
+                "{} exit failed: {:?}",
+                self.adapter.kind(),
+                output.exit_code
+            ));
+        }
+
+        let dispatch = self
+            .event_store
+            .get_dispatch(&input.dispatch.dispatch_id)?
+            .ok_or_else(|| anyhow!("dispatch not found: {}", input.dispatch.dispatch_id))?;
+        if matches!(
+            dispatch.state,
+            DispatchState::Open | DispatchState::Cancelled
+        ) {
+            return Err(anyhow!("dispatch not reported: {}", dispatch.dispatch_id));
+        }
+        let trace = self.trace_summary(input.run_id, &dispatch.dispatch_id)?;
+        let binary = binary.display().to_string();
+        Ok((
+            dispatch,
+            RunnerProtocol {
+                kind: self.adapter.kind(),
+                run_id: input.run_id.to_string(),
+                binary: binary.clone(),
+                opencode_bin: (self.adapter.kind() == "opencode").then(|| binary.clone()),
+                codex_bin: (self.adapter.kind() == "codex").then(|| binary.clone()),
+                exit_code: output.exit_code,
+                stdout_ref: path_relative_to(&stdout_path, &self.workspace.root)?,
+                stderr_ref: path_relative_to(&stderr_path, &self.workspace.root)?,
+                child_executed: true,
+            },
+            trace,
+        ))
+    }
+
     fn resolve_agent(&self, input: &RunnerInput) -> Result<(AgentRecord, String)> {
         if let Some(agent) = self.event_store.get_agent(&input.agent)? {
             let token = input
@@ -347,6 +470,308 @@ impl<'a, A: RunnerAdapter> RunnerCore<'a, A> {
             event_count: events.len(),
             session_ids,
         })
+    }
+}
+
+struct ExistingRunnerInput<'a> {
+    agent: &'a AgentRecord,
+    token: &'a str,
+    dispatch: &'a DispatchRecord,
+    run_id: &'a str,
+    title: &'a str,
+    task_body: &'a [u8],
+    snapshot_paths: &'a [PathBuf],
+    binary: Option<&'a Path>,
+    timeout_seconds: u64,
+    trust_project: bool,
+}
+
+pub struct TeamSendService<'a> {
+    workspace: &'a Workspace,
+    event_store: &'a EventStore,
+    trace_store: &'a DebugTraceStore,
+    blob_store: &'a crate::snapshot::LocalSnapshotStore<'a>,
+}
+
+impl<'a> TeamSendService<'a> {
+    pub fn new(
+        workspace: &'a Workspace,
+        event_store: &'a EventStore,
+        trace_store: &'a DebugTraceStore,
+        blob_store: &'a crate::snapshot::LocalSnapshotStore<'a>,
+    ) -> Self {
+        Self {
+            workspace,
+            event_store,
+            trace_store,
+            blob_store,
+        }
+    }
+
+    pub fn send(&self, input: TeamSendInput) -> Result<TeamSendResponseProtocol> {
+        if !input.wait {
+            return Err(anyhow!("wait required"));
+        }
+        if input.command_id.trim().is_empty() {
+            return Err(anyhow!("missing command id"));
+        }
+        if input.title.trim().is_empty() {
+            return Err(anyhow!("missing dispatch title"));
+        }
+        if input.task_body.is_empty() {
+            return Err(anyhow!("dispatch body is required"));
+        }
+        if input.timeout_seconds == 0 {
+            return Err(anyhow!("runner timeout must be greater than zero"));
+        }
+
+        let source = self.authenticate_actor(&input.actor)?;
+        if source.role != AgentRole::Orchestrator {
+            return Err(anyhow!("agent role not allowed"));
+        }
+        let target = self
+            .event_store
+            .get_agent(&input.target)?
+            .ok_or_else(|| anyhow!("target agent not found: {}", input.target))?;
+        if target.role != AgentRole::Worker {
+            return Err(anyhow!("target role invalid"));
+        }
+        let runner = RunnerKind::parse(&input.runner)?;
+        let request_hash = team_send_request_hash(&input, &source, &target, runner.as_str());
+
+        if let Some(existing) = self
+            .event_store
+            .get_delegation_by_command_id(&input.command_id)?
+        {
+            if existing.source_agent_id != source.agent_id
+                || existing.source_run_id != input.actor.run_id
+                || existing.target_agent_id != target.agent_id
+                || existing.runner != runner.as_str()
+                || existing.request_hash != request_hash
+            {
+                return Err(anyhow!("idempotency conflict"));
+            }
+            let dispatch = self
+                .event_store
+                .get_dispatch(&existing.dispatch_id)?
+                .ok_or_else(|| anyhow!("dispatch not found: {}", existing.dispatch_id))?;
+            if matches!(
+                dispatch.state,
+                DispatchState::Open | DispatchState::Cancelled
+            ) {
+                return Err(anyhow!("dispatch not reported: {}", dispatch.dispatch_id));
+            }
+            let trace =
+                self.trace_summary_for(runner, &existing.worker_run_id, &dispatch.dispatch_id)?;
+            return Ok(self.response(existing, dispatch, "replayed", false, trace));
+        }
+
+        let worker_run_id = prefixed_id("run");
+        let worker_token = prefixed_id("tok");
+        self.event_store.insert_agent_run(&InsertAgentRunInput {
+            run_id: worker_run_id.clone(),
+            agent_id: target.agent_id.clone(),
+            token_hash: token_hash(&worker_token),
+            created_at: Utc::now(),
+        })?;
+
+        let service = DispatchService::new(self.workspace, self.event_store, self.blob_store);
+        let dispatch_command_id = format!("team-send:{}:dispatch", input.command_id);
+        let dispatch = match service.create_dispatch(CreateDispatchInput {
+            command_id: dispatch_command_id,
+            target_agent: target.agent_id.clone(),
+            title: input.title.clone(),
+            body: input.task_body.clone(),
+        })? {
+            CreateDispatchOutcome::Inserted(dispatch)
+            | CreateDispatchOutcome::Replayed(dispatch) => dispatch,
+        };
+
+        let delegation =
+            match self
+                .event_store
+                .insert_delegation_idempotent(&InsertDelegationInput {
+                    command_id: input.command_id.clone(),
+                    source_agent_id: source.agent_id,
+                    source_run_id: input.actor.run_id.clone(),
+                    target_agent_id: target.agent_id.clone(),
+                    worker_run_id: worker_run_id.clone(),
+                    dispatch_id: dispatch.dispatch_id.clone(),
+                    runner: runner.as_str().to_string(),
+                    request_hash,
+                    created_at: Utc::now(),
+                })? {
+                IdempotencyResolution::Inserted(delegation) => delegation,
+                IdempotencyResolution::Replayed(delegation) => delegation,
+                IdempotencyResolution::Conflict(_) => return Err(anyhow!("idempotency conflict")),
+            };
+
+        let (dispatch, trace) = match runner {
+            RunnerKind::OpenCode => {
+                let core = RunnerCore::new(
+                    self.workspace,
+                    self.event_store,
+                    self.trace_store,
+                    self.blob_store,
+                    OpenCodeAdapter,
+                );
+                let (dispatch, _, trace) = core.run_existing(ExistingRunnerInput {
+                    agent: &target,
+                    token: &worker_token,
+                    dispatch: &dispatch,
+                    run_id: &worker_run_id,
+                    title: &input.title,
+                    task_body: &input.task_body,
+                    snapshot_paths: &input.snapshot_paths,
+                    binary: input.opencode_bin.as_deref(),
+                    timeout_seconds: input.timeout_seconds,
+                    trust_project: false,
+                })?;
+                (dispatch, trace)
+            }
+            RunnerKind::Codex => {
+                let core = RunnerCore::new(
+                    self.workspace,
+                    self.event_store,
+                    self.trace_store,
+                    self.blob_store,
+                    CodexAdapter,
+                );
+                let (dispatch, _, trace) = core.run_existing(ExistingRunnerInput {
+                    agent: &target,
+                    token: &worker_token,
+                    dispatch: &dispatch,
+                    run_id: &worker_run_id,
+                    title: &input.title,
+                    task_body: &input.task_body,
+                    snapshot_paths: &input.snapshot_paths,
+                    binary: input.codex_bin.as_deref(),
+                    timeout_seconds: input.timeout_seconds,
+                    trust_project: input.trust_project,
+                })?;
+                (dispatch, trace)
+            }
+        };
+        let delegation = self
+            .event_store
+            .complete_delegation(&CompleteDelegationInput {
+                command_id: delegation.command_id,
+                state: "completed".to_string(),
+                child_executed: true,
+                completed_at: Utc::now(),
+            })?;
+        Ok(self.response(delegation, dispatch, "inserted", true, trace))
+    }
+
+    fn authenticate_actor(&self, actor: &ActorEnv) -> Result<AgentRecord> {
+        let agent = self
+            .event_store
+            .get_agent(&actor.agent_id)?
+            .ok_or_else(|| anyhow!("agent not found: {}", actor.agent_id))?;
+        let presented_hash = token_hash(&actor.agent_token);
+        let run_token_matches = match actor.run_id.as_deref() {
+            Some(run_id) => self.event_store.get_agent_run(run_id)?.is_some_and(|run| {
+                run.agent_id == agent.agent_id && run.token_hash == presented_hash
+            }),
+            None => false,
+        };
+        if agent.token_hash != presented_hash && !run_token_matches {
+            return Err(anyhow!("invalid agent token"));
+        }
+        Ok(agent)
+    }
+
+    fn trace_summary_for(
+        &self,
+        runner: RunnerKind,
+        run_id: &str,
+        dispatch_id: &str,
+    ) -> Result<RunnerTraceProtocol> {
+        let adapter = match runner {
+            RunnerKind::OpenCode => "opencode-plugin",
+            RunnerKind::Codex => "codex-hook",
+        };
+        let mut events = self.trace_store.list_events(TraceListFilter {
+            adapter: Some(adapter.to_string()),
+            agent_id: None,
+            dispatch_id: Some(dispatch_id.to_string()),
+            trace_session_id: None,
+        })?;
+        events.retain(|event| event.run_id.as_deref() == Some(run_id));
+        let session_ids = events
+            .iter()
+            .filter_map(|event| event.trace_session_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Ok(RunnerTraceProtocol {
+            adapter,
+            event_count: events.len(),
+            session_ids,
+        })
+    }
+
+    fn response(
+        &self,
+        delegation: DelegationRecord,
+        dispatch: DispatchRecord,
+        idempotency_status: &'static str,
+        child_executed: bool,
+        trace: RunnerTraceProtocol,
+    ) -> TeamSendResponseProtocol {
+        TeamSendResponseProtocol {
+            ok: true,
+            action: "team.send",
+            command_id: delegation.command_id.clone(),
+            child_executed,
+            expected_next_action: "inspect_dispatch",
+            delegation: delegation_protocol(&delegation, idempotency_status),
+            dispatch: crate::dispatch::dispatch_protocol(&dispatch, idempotency_status),
+            trace,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunnerKind {
+    OpenCode,
+    Codex,
+}
+
+impl RunnerKind {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "opencode" => Ok(Self::OpenCode),
+            "codex" => Ok(Self::Codex),
+            _ => Err(anyhow!("runner not supported: {value}")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenCode => "opencode",
+            Self::Codex => "codex",
+        }
+    }
+}
+
+fn delegation_protocol(
+    delegation: &DelegationRecord,
+    idempotency_status: &'static str,
+) -> DelegationProtocol {
+    DelegationProtocol {
+        command_id: delegation.command_id.clone(),
+        source_agent_id: delegation.source_agent_id.clone(),
+        source_run_id: delegation.source_run_id.clone(),
+        target_agent_id: delegation.target_agent_id.clone(),
+        worker_run_id: delegation.worker_run_id.clone(),
+        dispatch_id: delegation.dispatch_id.clone(),
+        runner: delegation.runner.clone(),
+        state: delegation.state.clone(),
+        child_executed: delegation.child_executed,
+        created_at: delegation.created_at,
+        completed_at: delegation.completed_at,
+        idempotency_status,
     }
 }
 
@@ -516,6 +941,33 @@ fn prepare_isolated_codex_home(run_dir: &Path) -> Result<PathBuf> {
         }
     }
     Ok(codex_home)
+}
+
+fn team_send_request_hash(
+    input: &TeamSendInput,
+    source: &AgentRecord,
+    target: &AgentRecord,
+    runner: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(source.agent_id.as_bytes());
+    hasher.update(b"\0");
+    if let Some(run_id) = &input.actor.run_id {
+        hasher.update(run_id.as_bytes());
+    }
+    hasher.update(b"\0");
+    hasher.update(target.agent_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(runner.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(input.title.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(&input.task_body);
+    for path in &input.snapshot_paths {
+        hasher.update(b"\0");
+        hasher.update(path.to_string_lossy().as_bytes());
+    }
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 #[derive(Debug)]

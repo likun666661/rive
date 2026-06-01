@@ -468,7 +468,14 @@ impl<'a, S: SnapshotStore> DispatchService<'a, S> {
             .store
             .get_agent(&actor.agent_id)?
             .ok_or_else(|| anyhow!("agent not found: {}", actor.agent_id))?;
-        if agent.token_hash != token_hash(&actor.agent_token) {
+        let presented_hash = token_hash(&actor.agent_token);
+        let run_token_matches = match actor.run_id.as_deref() {
+            Some(run_id) => self.store.get_agent_run(run_id)?.is_some_and(|run| {
+                run.agent_id == agent.agent_id && run.token_hash == presented_hash
+            }),
+            None => false,
+        };
+        if agent.token_hash != presented_hash && !run_token_matches {
             return Err(anyhow!("invalid agent token"));
         }
         Ok(agent)
