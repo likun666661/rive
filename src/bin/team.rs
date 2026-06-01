@@ -2,6 +2,7 @@ use std::io::Read;
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
+use rive::branch::BranchService;
 use rive::debug_trace::DebugTraceStore;
 use rive::dispatch::{
     dispatch_fact_protocol, dispatch_protocol, DispatchFactInput, DispatchFactOutcome,
@@ -436,6 +437,7 @@ fn handle_work(command: WorkCommands) -> Result<()> {
                 command_id,
                 work_node_id,
                 reason,
+                require_committed_branch: false,
             })?;
             let projection = service.inspect_projection(&node.work_node_id)?;
             let protocol = serde_json::json!({
@@ -465,6 +467,7 @@ fn handle_work(command: WorkCommands) -> Result<()> {
                 command_id,
                 work_node_id,
                 reason,
+                require_committed_branch: false,
             })?;
             let projection = service.inspect_projection(&node.work_node_id)?;
             let protocol = serde_json::json!({
@@ -700,14 +703,26 @@ fn record_dispatch_report(
             fact_event_id: fact.event_id.clone(),
             snapshot_ids: snapshots,
             artifact_refs,
-            workspace_ref,
+            workspace_ref: workspace_ref.clone(),
             diff_ref,
         },
     )?;
+    let branch_integration = workspace_ref
+        .as_deref()
+        .map(|branch_ref| {
+            BranchService::new(&workspace, &store).ensure_pending_for_report(
+                &dispatch.dispatch_id,
+                &fact.event_id,
+                branch_ref,
+            )
+        })
+        .transpose()?
+        .flatten();
     let protocol = serde_json::json!({
         "fact": protocol.fact,
         "dispatch": protocol.dispatch,
         "work": work,
+        "branch_integration": branch_integration,
     });
     let display = serde_json::json!({
         "summary": format!("Recorded {} report for dispatch {}", status, dispatch.dispatch_id),
@@ -847,6 +862,12 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
         ("work_node_not_reviewable", false, "inspect_projection")
     } else if lower.contains("work node not found") {
         ("work_node_not_found", false, "fix_arguments")
+    } else if lower.contains("branch not found") {
+        ("branch_not_found", false, "inspect_branch")
+    } else if lower.contains("branch not pending") {
+        ("branch_not_pending", false, "inspect_branch")
+    } else if lower.contains("branch ref not committed") {
+        ("branch_ref_not_committed", false, "inspect_branch")
     } else if lower.contains("work graph not closed") {
         ("work_graph_not_closed", false, "inspect_projection")
     } else if lower.contains("invalid work note kind") {

@@ -118,6 +118,101 @@ fn inspect_work(temp: &TempDir, work: &str) -> Value {
     )
 }
 
+fn accept_work_require_branch(temp: &TempDir, work: &str, command_id: &str) -> Value {
+    run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("work")
+            .arg("accept")
+            .arg(work)
+            .arg("--require-committed-branch")
+            .arg("--command-id")
+            .arg(command_id),
+    )
+}
+
+fn accept_work_require_branch_expect_error(temp: &TempDir, work: &str, command_id: &str) -> Value {
+    run_json_expect_error(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("work")
+            .arg("accept")
+            .arg(work)
+            .arg("--require-committed-branch")
+            .arg("--command-id")
+            .arg(command_id),
+    )
+}
+
+fn branch_commit(temp: &TempDir, integration_id: &str, command_id: &str) -> Value {
+    run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .env("RIVE_BRANCH_BACKEND", "local-fake")
+            .arg("branch")
+            .arg("commit")
+            .arg(integration_id)
+            .arg("--command-id")
+            .arg(command_id),
+    )
+}
+
+fn branch_abort(temp: &TempDir, integration_id: &str, command_id: &str) -> Value {
+    run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .env("RIVE_BRANCH_BACKEND", "local-fake")
+            .arg("branch")
+            .arg("abort")
+            .arg(integration_id)
+            .arg("--command-id")
+            .arg(command_id),
+    )
+}
+
+fn branch_reject(temp: &TempDir, integration_id: &str, command_id: &str, reason: &str) -> Value {
+    let mut command = rive_cmd();
+    command
+        .current_dir(temp.path())
+        .arg("branch")
+        .arg("reject")
+        .arg(integration_id)
+        .arg("--command-id")
+        .arg(command_id)
+        .arg("--stdin");
+    let mut child = command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("command should spawn");
+    use std::io::Write;
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(reason.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn first_branch_integration_id(temp: &TempDir) -> String {
+    let conn = Connection::open(temp.path().join(".rive/rive.db")).unwrap();
+    conn.query_row(
+        "select integration_id from branch_integrations order by created_at limit 1",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .unwrap()
+}
+
 fn scheduler_command_with_mode(
     temp: &TempDir,
     fake: &Path,
@@ -159,6 +254,31 @@ fn scheduler_command_full(
         .arg(fake)
         .arg("--timeout-seconds")
         .arg("10");
+    command
+}
+
+fn branch_scheduler_command(
+    temp: &TempDir,
+    fake: &Path,
+    root: &str,
+    command_id: &str,
+    acceptance_mode: &str,
+) -> Command {
+    let mut command = scheduler_command_with_mode(temp, fake, root, command_id, acceptance_mode);
+    command.arg("--workspace-mode").arg("branchfs");
+    command.env("RIVE_BRANCH_BACKEND", "local-fake");
+    command
+}
+
+fn real_branchfs_scheduler_command_without_path(
+    temp: &TempDir,
+    fake: &Path,
+    root: &str,
+    command_id: &str,
+) -> Command {
+    let mut command = scheduler_command_with_mode(temp, fake, root, command_id, "manual");
+    command.arg("--workspace-mode").arg("branchfs");
+    command.env("PATH", "/nonexistent");
     command
 }
 
@@ -205,6 +325,26 @@ COUNT=$((COUNT + 1))
 printf '%s\n' "$COUNT" > "$COUNT_FILE"
 printf '{"final":"looks done but no team report"}\n'
 "#,
+    );
+}
+
+fn write_branch_worker(path: &Path) {
+    let rive_bin = env!("CARGO_BIN_EXE_rive");
+    let team_bin = env!("CARGO_BIN_EXE_team");
+    write_executable(
+        path,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+test -n "$RIVE_BRANCH_REF"
+test -n "$RIVE_STATE_WORKSPACE"
+printf '%s\n' "$RIVE_WORKSPACE" >> "$RIVE_STATE_WORKSPACE/.rive/phase12-branch-paths.txt"
+printf 'parent=%s\nstate=%s\nbranch=%s\n' "$RIVE_STATE_WORKSPACE" "$RIVE_STATE_WORKSPACE" "$RIVE_BRANCH_REF" > "$RIVE_WORKSPACE/phase12-branch-result.txt"
+SNAPSHOT_ID=$("{rive_bin}" snapshot capture --path "$RIVE_WORKSPACE/phase12-branch-result.txt" --label phase12-branch-worker --agent "$RIVE_AGENT_ID" --dispatch "$RIVE_DISPATCH_ID" | sed -n 's/.*"snapshot_id": "\([^"]*\)".*/\1/p' | head -n 1)
+printf 'branch worker done\n' | "{team_bin}" report --dispatch "$RIVE_DISPATCH_ID" --status done --snapshot "$SNAPSHOT_ID" --workspace-ref "$RIVE_BRANCH_REF" --command-id "phase12-report-$RIVE_RUN_ID" --stdin >/dev/null
+printf '{{"type":"step_finish","tokens":{{"input":5,"output":3,"reasoning":0,"cache":{{"read":1}},"total":9}}}}\n'
+"#
+        ),
     );
 }
 
@@ -470,4 +610,230 @@ fn scheduler_idempotency_conflict_and_dirty_graph_are_rejected() {
         "1",
     ));
     assert_eq!(conflict["protocol"]["code"], "idempotency_conflict");
+}
+
+#[test]
+fn branch_scheduler_manual_creates_pending_integration_without_parent_write() {
+    let temp = init_workspace();
+    add_worker(&temp, "worker-a");
+    add_worker(&temp, "worker-b");
+    let root = create_work(&temp, "phase12-manual-root", "root");
+    let a = create_work(&temp, "phase12-manual-a", "A");
+    add_edge(
+        &temp,
+        "decomposes-to",
+        &root,
+        &a,
+        "edge-phase12-manual-root-a",
+    );
+    let fake = temp.path().join("fake-opencode-branch");
+    write_branch_worker(&fake);
+
+    let response = run_json(&mut branch_scheduler_command(
+        &temp,
+        &fake,
+        &root,
+        "phase12-branch-manual",
+        "manual",
+    ));
+    assert_eq!(response["protocol"]["scheduler"]["state"], "waiting_review");
+    assert_eq!(
+        inspect_work(&temp, &a)["protocol"]["projection"]["state"],
+        "reviewable"
+    );
+    assert!(!temp.path().join("phase12-branch-result.txt").exists());
+    let paths = fs::read_to_string(temp.path().join(".rive/phase12-branch-paths.txt")).unwrap();
+    assert!(paths.contains(".rive/branches/"));
+    let conn = Connection::open(temp.path().join(".rive/rive.db")).unwrap();
+    let pending: i64 = conn
+        .query_row(
+            "select count(*) from branch_integrations where state='pending'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending, 1);
+}
+
+#[test]
+fn branch_scheduler_real_backend_missing_is_stable_error() {
+    let temp = init_workspace();
+    add_worker(&temp, "worker-a");
+    add_worker(&temp, "worker-b");
+    let root = create_work(&temp, "phase12-missing-branchfs-root", "root");
+    let a = create_work(&temp, "phase12-missing-branchfs-a", "A");
+    add_edge(
+        &temp,
+        "decomposes-to",
+        &root,
+        &a,
+        "edge-phase12-missing-branchfs-root-a",
+    );
+    let fake = temp.path().join("fake-opencode-missing-branchfs");
+    write_branch_worker(&fake);
+
+    let error = run_json_expect_error(&mut real_branchfs_scheduler_command_without_path(
+        &temp,
+        &fake,
+        &root,
+        "phase12-branchfs-missing",
+    ));
+    assert_eq!(error["protocol"]["code"], "branch_backend_unavailable");
+    assert_eq!(
+        inspect_work(&temp, &a)["protocol"]["projection"]["state"],
+        "ready"
+    );
+}
+
+#[test]
+fn branch_commit_is_required_before_guarded_accept() {
+    let temp = init_workspace();
+    add_worker(&temp, "worker-a");
+    add_worker(&temp, "worker-b");
+    let root = create_work(&temp, "phase12-commit-root", "root");
+    let a = create_work(&temp, "phase12-commit-a", "A");
+    add_edge(
+        &temp,
+        "decomposes-to",
+        &root,
+        &a,
+        "edge-phase12-commit-root-a",
+    );
+    let fake = temp.path().join("fake-opencode-branch-commit");
+    write_branch_worker(&fake);
+
+    run_json(&mut branch_scheduler_command(
+        &temp,
+        &fake,
+        &root,
+        "phase12-branch-commit-manual",
+        "manual",
+    ));
+    let blocked =
+        accept_work_require_branch_expect_error(&temp, &a, "phase12-accept-before-commit");
+    assert_eq!(blocked["protocol"]["code"], "branch_ref_not_committed");
+
+    let integration_id = first_branch_integration_id(&temp);
+    let commit = branch_commit(&temp, &integration_id, "phase12-branch-commit");
+    assert_eq!(
+        commit["protocol"]["integration"]["state"],
+        serde_json::Value::String("committed".to_string())
+    );
+    assert!(temp.path().join("phase12-branch-result.txt").exists());
+
+    let accepted = accept_work_require_branch(&temp, &a, "phase12-accept-after-commit");
+    assert_eq!(accepted["protocol"]["status_input"], "active");
+    assert_eq!(
+        inspect_work(&temp, &a)["protocol"]["projection"]["state"],
+        "done"
+    );
+}
+
+#[test]
+fn branch_reject_and_abort_are_explicit_terminal_events() {
+    let temp = init_workspace();
+    add_worker(&temp, "worker-a");
+    add_worker(&temp, "worker-b");
+    let root = create_work(&temp, "phase12-reject-root", "root");
+    let a = create_work(&temp, "phase12-reject-a", "A");
+    add_edge(
+        &temp,
+        "decomposes-to",
+        &root,
+        &a,
+        "edge-phase12-reject-root-a",
+    );
+    let fake = temp.path().join("fake-opencode-branch-reject");
+    write_branch_worker(&fake);
+
+    run_json(&mut branch_scheduler_command(
+        &temp,
+        &fake,
+        &root,
+        "phase12-branch-reject-manual",
+        "manual",
+    ));
+    let integration_id = first_branch_integration_id(&temp);
+    let rejected = branch_reject(&temp, &integration_id, "phase12-branch-reject", "bad patch");
+    assert_eq!(
+        rejected["protocol"]["integration"]["state"],
+        serde_json::Value::String("rejected".to_string())
+    );
+    let still_blocked =
+        accept_work_require_branch_expect_error(&temp, &a, "phase12-accept-after-reject");
+    assert_eq!(
+        still_blocked["protocol"]["code"],
+        "branch_ref_not_committed"
+    );
+
+    let root2 = create_work(&temp, "phase12-abort-root", "root abort");
+    let b = create_work(&temp, "phase12-abort-b", "B");
+    add_edge(
+        &temp,
+        "decomposes-to",
+        &root2,
+        &b,
+        "edge-phase12-abort-root-b",
+    );
+    let fake2 = temp.path().join("fake-opencode-branch-abort");
+    write_branch_worker(&fake2);
+    run_json(&mut branch_scheduler_command(
+        &temp,
+        &fake2,
+        &root2,
+        "phase12-branch-abort-manual",
+        "manual",
+    ));
+    let conn = Connection::open(temp.path().join(".rive/rive.db")).unwrap();
+    let abort_integration_id: String = conn
+        .query_row(
+            "select integration_id from branch_integrations where state='pending' order by created_at limit 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(conn);
+    let aborted = branch_abort(&temp, &abort_integration_id, "phase12-branch-abort");
+    assert_eq!(
+        aborted["protocol"]["integration"]["state"],
+        serde_json::Value::String("aborted".to_string())
+    );
+}
+
+#[test]
+fn branch_scheduler_auto_committed_commits_then_accepts() {
+    let temp = init_workspace();
+    add_worker(&temp, "worker-a");
+    add_worker(&temp, "worker-b");
+    let root = create_work(&temp, "phase12-auto-root", "root");
+    let a = create_work(&temp, "phase12-auto-a", "A");
+    add_edge(
+        &temp,
+        "decomposes-to",
+        &root,
+        &a,
+        "edge-phase12-auto-root-a",
+    );
+    let fake = temp.path().join("fake-opencode-branch-auto");
+    write_branch_worker(&fake);
+
+    let response = run_json(&mut branch_scheduler_command(
+        &temp,
+        &fake,
+        &root,
+        "phase12-branch-auto",
+        "auto-committed",
+    ));
+    assert_eq!(response["protocol"]["scheduler"]["state"], "completed");
+    assert_eq!(response["protocol"]["root_work"]["state"], "done");
+    assert!(temp.path().join("phase12-branch-result.txt").exists());
+    let conn = Connection::open(temp.path().join(".rive/rive.db")).unwrap();
+    let committed: i64 = conn
+        .query_row(
+            "select count(*) from branch_integrations where state='committed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(committed, 1);
 }

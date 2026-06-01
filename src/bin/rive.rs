@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
+use rive::branch::{backend_from_env, branch_integration_protocol, BranchService};
 use rive::debug_trace::{
     install_codex_hook, install_opencode_plugin, uninstall_managed, usage_for_workspace,
     DebugTraceStore, IngestTraceInput, TraceAdapter, TraceListFilter, TraceListProtocol,
@@ -69,6 +70,10 @@ enum Commands {
     Work {
         #[command(subcommand)]
         command: WorkCommands,
+    },
+    Branch {
+        #[command(subcommand)]
+        command: BranchCommands,
     },
     Debug {
         #[command(subcommand)]
@@ -186,11 +191,38 @@ enum WorkCommands {
         work_node_id: String,
         #[arg(long = "command-id")]
         command_id: String,
+        #[arg(long = "require-committed-branch")]
+        require_committed_branch: bool,
         #[arg(long)]
         stdin: bool,
     },
     Reopen {
         work_node_id: String,
+        #[arg(long = "command-id")]
+        command_id: String,
+        #[arg(long)]
+        stdin: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BranchCommands {
+    List,
+    Show {
+        id: String,
+    },
+    Commit {
+        integration_id: String,
+        #[arg(long = "command-id")]
+        command_id: String,
+    },
+    Abort {
+        integration_id: String,
+        #[arg(long = "command-id")]
+        command_id: String,
+    },
+    Reject {
+        integration_id: String,
         #[arg(long = "command-id")]
         command_id: String,
         #[arg(long)]
@@ -362,6 +394,8 @@ enum SchedulerCommands {
         max_parallel: usize,
         #[arg(long = "acceptance-mode", default_value = "manual")]
         acceptance_mode: String,
+        #[arg(long = "workspace-mode", default_value = "shared")]
+        workspace_mode: String,
         #[arg(long = "opencode-bin")]
         opencode_bin: Option<PathBuf>,
         #[arg(long = "timeout-seconds", default_value_t = 300)]
@@ -418,7 +452,12 @@ fn run() -> Result<()> {
                     .unwrap_or_else(|| workspace.root.clone());
                 let store = EventStore::open(&workspace.db_path())?;
                 store.init_schema()?;
-                let source = LocalFsEvidenceWorkspace::new(&workspace.root, &scope)?;
+                let source_root = std::env::var("RIVE_WORKSPACE")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| workspace.root.clone());
+                let source = LocalFsEvidenceWorkspace::new(&source_root, &scope)?;
                 let snapshot_store = LocalSnapshotStore::new(&workspace);
                 let capture = SnapshotCapture::new(&source, &snapshot_store, &store);
                 let snapshot = capture.capture(CaptureOptions {
@@ -802,6 +841,7 @@ fn run() -> Result<()> {
                 WorkCommands::Accept {
                     work_node_id,
                     command_id,
+                    require_committed_branch,
                     stdin,
                 } => {
                     let mut reason = Vec::new();
@@ -812,6 +852,7 @@ fn run() -> Result<()> {
                         command_id,
                         work_node_id,
                         reason,
+                        require_committed_branch,
                     })?;
                     let protocol =
                         work_node_protocol(&node, service.graph_version()?, idempotency_status);
@@ -833,11 +874,95 @@ fn run() -> Result<()> {
                         command_id,
                         work_node_id,
                         reason,
+                        require_committed_branch: false,
                     })?;
                     let protocol =
                         work_node_protocol(&node, service.graph_version()?, idempotency_status);
                     let display = serde_json::json!({
                         "summary": format!("Reopened work node {}", protocol.work_node_id),
+                    });
+                    print_json(&Envelope::new(protocol, display))
+                }
+            }
+        }
+        Commands::Branch { command } => {
+            let workspace = find_workspace(&std::env::current_dir()?)
+                .map_err(|_| anyhow!("workspace not initialized"))?;
+            let store = EventStore::open(&workspace.db_path())?;
+            store.init_schema()?;
+            store.init_work_schema()?;
+            let service = BranchService::new(&workspace, &store);
+            match command {
+                BranchCommands::List => {
+                    let integrations = service.list()?;
+                    let protocol = serde_json::json!({
+                        "integrations": integrations.iter().map(branch_integration_protocol).collect::<Vec<_>>(),
+                    });
+                    let display = serde_json::json!({
+                        "summary": format!("{} branch integrations", integrations.len()),
+                    });
+                    print_json(&Envelope::new(protocol, display))
+                }
+                BranchCommands::Show { id } => {
+                    let (branch, integration) = service.show(&id)?;
+                    let protocol = serde_json::json!({
+                        "branch": branch,
+                        "integration": integration.as_ref().map(branch_integration_protocol),
+                    });
+                    let display = serde_json::json!({
+                        "summary": format!("Branch {} {}", branch.branch_id, branch.state),
+                    });
+                    print_json(&Envelope::new(protocol, display))
+                }
+                BranchCommands::Commit {
+                    integration_id,
+                    command_id,
+                } => {
+                    let backend = backend_from_env();
+                    let (integration, idempotency_status) =
+                        service.commit(backend.as_ref(), &integration_id, &command_id)?;
+                    let protocol = serde_json::json!({
+                        "integration": branch_integration_protocol(&integration),
+                        "idempotency_status": idempotency_status,
+                    });
+                    let display = serde_json::json!({
+                        "summary": format!("Committed branch integration {}", integration.integration_id),
+                    });
+                    print_json(&Envelope::new(protocol, display))
+                }
+                BranchCommands::Abort {
+                    integration_id,
+                    command_id,
+                } => {
+                    let backend = backend_from_env();
+                    let (integration, idempotency_status) =
+                        service.abort(backend.as_ref(), &integration_id, &command_id)?;
+                    let protocol = serde_json::json!({
+                        "integration": branch_integration_protocol(&integration),
+                        "idempotency_status": idempotency_status,
+                    });
+                    let display = serde_json::json!({
+                        "summary": format!("Aborted branch integration {}", integration.integration_id),
+                    });
+                    print_json(&Envelope::new(protocol, display))
+                }
+                BranchCommands::Reject {
+                    integration_id,
+                    command_id,
+                    stdin,
+                } => {
+                    let mut reason = Vec::new();
+                    if stdin {
+                        std::io::stdin().read_to_end(&mut reason)?;
+                    }
+                    let (integration, idempotency_status) =
+                        service.reject(&integration_id, &command_id, &reason)?;
+                    let protocol = serde_json::json!({
+                        "integration": branch_integration_protocol(&integration),
+                        "idempotency_status": idempotency_status,
+                    });
+                    let display = serde_json::json!({
+                        "summary": format!("Rejected branch integration {}", integration.integration_id),
                     });
                     print_json(&Envelope::new(protocol, display))
                 }
@@ -1168,6 +1293,7 @@ fn run() -> Result<()> {
                 command_id,
                 max_parallel,
                 acceptance_mode,
+                workspace_mode,
                 opencode_bin,
                 timeout_seconds,
             } => {
@@ -1187,6 +1313,7 @@ fn run() -> Result<()> {
                     command_id,
                     max_parallel,
                     acceptance_mode,
+                    workspace_mode,
                     opencode_bin,
                     timeout_seconds,
                 })?;
@@ -1240,6 +1367,26 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
         ("scheduler_max_parallel_invalid", "fix_arguments")
     } else if lower.contains("invalid acceptance mode") {
         ("invalid_acceptance_mode", "fix_arguments")
+    } else if lower.contains("workspace mode not supported") {
+        ("workspace_mode_not_supported", "fix_arguments")
+    } else if lower.contains("branch backend unavailable") {
+        ("branch_backend_unavailable", "fix_installation")
+    } else if lower.contains("branch mount failed") {
+        ("branch_mount_failed", "fix_installation")
+    } else if lower.contains("branch create failed") {
+        ("branch_create_failed", "inspect_backend")
+    } else if lower.contains("branch commit failed") {
+        ("branch_commit_failed", "inspect_backend")
+    } else if lower.contains("branch abort failed") {
+        ("branch_abort_failed", "inspect_backend")
+    } else if lower.contains("branch ref not committed") {
+        ("branch_ref_not_committed", "inspect_branch")
+    } else if lower.contains("branch not pending") {
+        ("branch_not_pending", "inspect_branch")
+    } else if lower.contains("branch integration conflict") {
+        ("branch_integration_conflict", "inspect_branch")
+    } else if lower.contains("branch not found") {
+        ("branch_not_found", "inspect_branch")
     } else if lower.contains("work node already claimed") {
         ("work_node_already_claimed", "inspect_projection")
     } else if lower.contains("work scheduler stalled") {

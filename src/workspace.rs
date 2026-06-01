@@ -82,6 +82,21 @@ pub fn init_workspace(path: &Path) -> Result<Workspace> {
 }
 
 pub fn find_workspace(start: &Path) -> Result<Workspace> {
+    if let Ok(state_workspace) = std::env::var("RIVE_STATE_WORKSPACE") {
+        if !state_workspace.trim().is_empty() {
+            let root = PathBuf::from(state_workspace)
+                .canonicalize()
+                .with_context(|| "canonicalize RIVE_STATE_WORKSPACE")?;
+            if root.join(RIVE_DIR).is_dir() {
+                return Ok(Workspace { root });
+            }
+            return Err(anyhow!(
+                "RIVE_STATE_WORKSPACE does not contain .rive: {}",
+                root.display()
+            ));
+        }
+    }
+
     let canonical = start
         .canonicalize()
         .with_context(|| format!("canonicalize {}", start.display()))?;

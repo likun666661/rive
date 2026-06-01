@@ -96,6 +96,7 @@ pub struct WorkStatusInput {
     pub command_id: String,
     pub work_node_id: String,
     pub reason: Vec<u8>,
+    pub require_committed_branch: bool,
 }
 
 #[derive(Debug)]
@@ -413,6 +414,11 @@ impl<'a, S: SnapshotStore> WorkService<'a, S> {
                     input.work_node_id,
                     projection.state
                 ));
+            }
+            if input.require_committed_branch
+                && self.has_uncommitted_branch_ref(&input.work_node_id)?
+            {
+                return Err(anyhow!("branch ref not committed: {}", input.work_node_id));
             }
         }
         self.update_node_status(input, "active", true, "work.node.accepted")
@@ -916,6 +922,15 @@ impl<'a, S: SnapshotStore> WorkService<'a, S> {
             .list_work_root_bindings_for_root(work_node_id)?
             .iter()
             .any(|binding| binding.work_node_id == work_node_id))
+    }
+
+    fn has_uncommitted_branch_ref(&self, work_node_id: &str) -> Result<bool> {
+        for integration in self.store.list_branch_integrations()? {
+            if integration.work_node_id == work_node_id && integration.state != "committed" {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn ensure_schema(&self) -> Result<()> {

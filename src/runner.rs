@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+use crate::branch::{backend_from_env, BranchService};
 use crate::debug_trace::{
     install_codex_hook, install_opencode_plugin, DebugTraceStore, TraceListFilter,
 };
@@ -82,6 +83,7 @@ pub struct SchedulerRunInput {
     pub command_id: String,
     pub max_parallel: usize,
     pub acceptance_mode: String,
+    pub workspace_mode: String,
     pub opencode_bin: Option<PathBuf>,
     pub timeout_seconds: u64,
 }
@@ -629,7 +631,11 @@ impl<'a> SchedulerService<'a> {
             return Err(anyhow!("runner timeout must be greater than zero"));
         }
         let acceptance_mode = AcceptanceMode::parse(&input.acceptance_mode)?;
+        let workspace_mode = WorkspaceMode::parse(&input.workspace_mode)?;
         self.event_store.init_work_schema()?;
+        if workspace_mode == WorkspaceMode::BranchFs {
+            backend_from_env().ensure_available(self.workspace)?;
+        }
         let work_service = WorkService::new(self.workspace, self.event_store, self.blob_store);
         let graph = work_service.inspect_graph(&input.root_work_node_id)?;
         if !graph.orphan_nodes.is_empty() || !graph.unconnected_nodes.is_empty() {
@@ -643,15 +649,16 @@ impl<'a> SchedulerService<'a> {
             .iter()
             .map(|worker| worker.agent_id.clone())
             .collect::<Vec<_>>();
-        let request_hash = scheduler_request_hash(
-            &input.root_work_node_id,
-            &input.runner,
-            &worker_ids,
-            input.max_parallel,
-            acceptance_mode.as_str(),
-            input.timeout_seconds,
-            input.opencode_bin.as_deref(),
-        );
+        let request_hash = scheduler_request_hash(SchedulerRequestHashInput {
+            root_work_node_id: &input.root_work_node_id,
+            runner: &input.runner,
+            worker_ids: &worker_ids,
+            max_parallel: input.max_parallel,
+            acceptance_mode: acceptance_mode.as_str(),
+            workspace_mode: workspace_mode.as_str(),
+            timeout_seconds: input.timeout_seconds,
+            binary: input.opencode_bin.as_deref(),
+        });
         let inserted =
             self.event_store
                 .insert_scheduler_run_idempotent(&InsertSchedulerRunInput {
@@ -674,7 +681,13 @@ impl<'a> SchedulerService<'a> {
         let mut child_executed = false;
         let mut stalled_nodes = Vec::new();
         if should_execute {
-            match self.execute_scheduler(&scheduler_run, &workers, &input, acceptance_mode) {
+            match self.execute_scheduler(
+                &scheduler_run,
+                &workers,
+                &input,
+                acceptance_mode,
+                workspace_mode,
+            ) {
                 Ok(state) => {
                     scheduler_run = self.event_store.update_scheduler_run_state(
                         &UpdateSchedulerRunStateInput {
@@ -741,6 +754,7 @@ impl<'a> SchedulerService<'a> {
         workers: &[AgentRecord],
         input: &SchedulerRunInput,
         acceptance_mode: AcceptanceMode,
+        workspace_mode: WorkspaceMode,
     ) -> Result<String> {
         let work_service = WorkService::new(self.workspace, self.event_store, self.blob_store);
         let mut worker_index = 0usize;
@@ -769,11 +783,19 @@ impl<'a> SchedulerService<'a> {
                 })
                 .collect::<Vec<_>>();
             if !batch.is_empty() {
-                self.run_node_batch(scheduler_run, batch, input, acceptance_mode)?;
+                self.run_node_batch(scheduler_run, batch, input, acceptance_mode, workspace_mode)?;
                 made_progress = true;
             }
-            if acceptance_mode == AcceptanceMode::AutoReported {
-                if self.accept_reviewable_nodes(scheduler_run, &input.root_work_node_id)? > 0 {
+            if matches!(
+                acceptance_mode,
+                AcceptanceMode::AutoReported | AcceptanceMode::AutoCommitted
+            ) {
+                if self.accept_reviewable_nodes(
+                    scheduler_run,
+                    &input.root_work_node_id,
+                    acceptance_mode,
+                )? > 0
+                {
                     made_progress = true;
                 }
                 let root_projection = work_service.inspect_projection(&input.root_work_node_id)?;
@@ -784,7 +806,9 @@ impl<'a> SchedulerService<'a> {
                             scheduler_run.scheduler_run_id, input.root_work_node_id
                         ),
                         work_node_id: input.root_work_node_id.clone(),
-                        reason: b"scheduler auto-reported root acceptance".to_vec(),
+                        reason: format!("scheduler {} root acceptance", acceptance_mode.as_str())
+                            .into_bytes(),
+                        require_committed_branch: acceptance_mode == AcceptanceMode::AutoCommitted,
                     })?;
                     return Ok("completed".to_string());
                 }
@@ -821,6 +845,7 @@ impl<'a> SchedulerService<'a> {
         batch: Vec<(WorkNodeRecord, AgentRecord)>,
         input: &SchedulerRunInput,
         acceptance_mode: AcceptanceMode,
+        workspace_mode: WorkspaceMode,
     ) -> Result<()> {
         let dispatch_service =
             DispatchService::new(self.workspace, self.event_store, self.blob_store);
@@ -844,11 +869,13 @@ impl<'a> SchedulerService<'a> {
                 token_hash: token_hash(&worker_token),
                 created_at: Utc::now(),
             })?;
-            let task_body = scheduler_task_body(self.workspace, &node);
             let dispatch_command_id = format!(
                 "scheduler:{}:{}:dispatch",
                 scheduler_run.scheduler_run_id, node.work_node_id
             );
+            let mut branch_ref = None;
+            let mut branch_path = None;
+            let task_body = scheduler_task_body(self.workspace, &node, None);
             let dispatch = match dispatch_service.create_dispatch(CreateDispatchInput {
                 command_id: dispatch_command_id,
                 target_agent: worker.agent_id.clone(),
@@ -862,6 +889,20 @@ impl<'a> SchedulerService<'a> {
                 work_node_id: node.work_node_id.clone(),
                 dispatch_id: dispatch.dispatch_id.clone(),
             })?;
+            if workspace_mode == WorkspaceMode::BranchFs {
+                let backend = backend_from_env();
+                let branch = BranchService::new(self.workspace, self.event_store)
+                    .create_workspace(
+                        backend.as_ref(),
+                        &scheduler_run.root_work_node_id,
+                        &node.work_node_id,
+                        &dispatch.dispatch_id,
+                        &worker_run_id,
+                    )?;
+                branch_path = Some(PathBuf::from(branch.branch_path));
+                branch_ref = Some(branch.branch_ref);
+            }
+            let task_body = scheduler_task_body(self.workspace, &node, branch_ref.as_deref());
             self.event_store
                 .update_scheduler_node_run(&UpdateSchedulerNodeRunInput {
                     node_run_id: node_run.node_run_id.clone(),
@@ -881,6 +922,8 @@ impl<'a> SchedulerService<'a> {
                 task_body,
                 binary: input.opencode_bin.clone(),
                 timeout_seconds: input.timeout_seconds,
+                branch_ref,
+                branch_path,
             });
         }
 
@@ -910,7 +953,39 @@ impl<'a> SchedulerService<'a> {
                         continue;
                     }
                     let mut state = "reported";
-                    if acceptance_mode == AcceptanceMode::AutoReported
+                    if acceptance_mode == AcceptanceMode::AutoCommitted
+                        && projection.state == "reviewable"
+                    {
+                        if let Some(integration) =
+                            BranchService::new(self.workspace, self.event_store)
+                                .list()?
+                                .into_iter()
+                                .find(|integration| {
+                                    integration.work_node_id == result.work_node_id
+                                        && integration.dispatch_id == dispatch.dispatch_id
+                                })
+                        {
+                            let backend = backend_from_env();
+                            BranchService::new(self.workspace, self.event_store).commit(
+                                backend.as_ref(),
+                                &integration.integration_id,
+                                &format!(
+                                    "scheduler:{}:branch-commit:{}",
+                                    scheduler_run.scheduler_run_id, result.work_node_id
+                                ),
+                            )?;
+                        }
+                        work_service.accept_node(crate::work::WorkStatusInput {
+                            command_id: format!(
+                                "scheduler:{}:accept:{}",
+                                scheduler_run.scheduler_run_id, result.work_node_id
+                            ),
+                            work_node_id: result.work_node_id.clone(),
+                            reason: b"scheduler auto-committed acceptance".to_vec(),
+                            require_committed_branch: true,
+                        })?;
+                        state = "accepted";
+                    } else if acceptance_mode == AcceptanceMode::AutoReported
                         && projection.state == "reviewable"
                     {
                         work_service.accept_node(crate::work::WorkStatusInput {
@@ -920,6 +995,7 @@ impl<'a> SchedulerService<'a> {
                             ),
                             work_node_id: result.work_node_id.clone(),
                             reason: b"scheduler auto-reported acceptance".to_vec(),
+                            require_committed_branch: false,
                         })?;
                         state = "accepted";
                     }
@@ -1034,6 +1110,7 @@ impl<'a> SchedulerService<'a> {
         &self,
         scheduler_run: &SchedulerRunRecord,
         root_work_node_id: &str,
+        acceptance_mode: AcceptanceMode,
     ) -> Result<usize> {
         let work_service = WorkService::new(self.workspace, self.event_store, self.blob_store);
         let mut accepted = 0usize;
@@ -1046,13 +1123,34 @@ impl<'a> SchedulerService<'a> {
             }
             let projection = work_service.inspect_projection(&node_id)?;
             if projection.state == "reviewable" {
+                if acceptance_mode == AcceptanceMode::AutoCommitted {
+                    if let Some(integration) = BranchService::new(self.workspace, self.event_store)
+                        .list()?
+                        .into_iter()
+                        .find(|integration| {
+                            integration.work_node_id == node_id && integration.state == "pending"
+                        })
+                    {
+                        let backend = backend_from_env();
+                        BranchService::new(self.workspace, self.event_store).commit(
+                            backend.as_ref(),
+                            &integration.integration_id,
+                            &format!(
+                                "scheduler:{}:branch-commit:{}",
+                                scheduler_run.scheduler_run_id, node_id
+                            ),
+                        )?;
+                    }
+                }
                 work_service.accept_node(crate::work::WorkStatusInput {
                     command_id: format!(
                         "scheduler:{}:accept:{}",
                         scheduler_run.scheduler_run_id, node_id
                     ),
                     work_node_id: node_id,
-                    reason: b"scheduler auto-reported acceptance".to_vec(),
+                    reason: format!("scheduler {} acceptance", acceptance_mode.as_str())
+                        .into_bytes(),
+                    require_committed_branch: acceptance_mode == AcceptanceMode::AutoCommitted,
                 })?;
                 accepted += 1;
             }
@@ -1118,6 +1216,7 @@ impl<'a> SchedulerService<'a> {
 enum AcceptanceMode {
     Manual,
     AutoReported,
+    AutoCommitted,
 }
 
 impl AcceptanceMode {
@@ -1125,6 +1224,7 @@ impl AcceptanceMode {
         match value {
             "manual" => Ok(Self::Manual),
             "auto-reported" => Ok(Self::AutoReported),
+            "auto-committed" => Ok(Self::AutoCommitted),
             _ => Err(anyhow!("invalid acceptance mode: {value}")),
         }
     }
@@ -1133,6 +1233,30 @@ impl AcceptanceMode {
         match self {
             Self::Manual => "manual",
             Self::AutoReported => "auto-reported",
+            Self::AutoCommitted => "auto-committed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceMode {
+    Shared,
+    BranchFs,
+}
+
+impl WorkspaceMode {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "shared" => Ok(Self::Shared),
+            "branchfs" => Ok(Self::BranchFs),
+            _ => Err(anyhow!("workspace mode not supported: {value}")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::BranchFs => "branchfs",
         }
     }
 }
@@ -1148,6 +1272,8 @@ struct SchedulerLaunch {
     task_body: Vec<u8>,
     binary: Option<PathBuf>,
     timeout_seconds: u64,
+    branch_ref: Option<String>,
+    branch_path: Option<PathBuf>,
 }
 
 struct SchedulerLaunchResult {
@@ -1182,6 +1308,8 @@ fn run_scheduler_launch(workspace: &Workspace, launch: &SchedulerLaunch) -> Resu
         binary: launch.binary.as_deref(),
         timeout_seconds: launch.timeout_seconds,
         trust_project: false,
+        workspace_override: launch.branch_path.as_deref(),
+        branch_ref: launch.branch_ref.as_deref(),
     })?;
     Ok(dispatch.dispatch_id)
 }
@@ -1220,37 +1348,53 @@ fn scheduler_node_run_protocol(run: &SchedulerNodeRunRecord) -> SchedulerNodeRun
     }
 }
 
-fn scheduler_request_hash(
-    root_work_node_id: &str,
-    runner: &str,
-    worker_ids: &[String],
+struct SchedulerRequestHashInput<'a> {
+    root_work_node_id: &'a str,
+    runner: &'a str,
+    worker_ids: &'a [String],
     max_parallel: usize,
-    acceptance_mode: &str,
+    acceptance_mode: &'a str,
+    workspace_mode: &'a str,
     timeout_seconds: u64,
-    binary: Option<&Path>,
-) -> String {
+    binary: Option<&'a Path>,
+}
+
+fn scheduler_request_hash(input: SchedulerRequestHashInput<'_>) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(root_work_node_id.as_bytes());
+    hasher.update(input.root_work_node_id.as_bytes());
     hasher.update(b"\0");
-    hasher.update(runner.as_bytes());
+    hasher.update(input.runner.as_bytes());
     hasher.update(b"\0");
-    for worker_id in worker_ids {
+    for worker_id in input.worker_ids {
         hasher.update(worker_id.as_bytes());
         hasher.update(b"\0");
     }
-    hasher.update(max_parallel.to_string().as_bytes());
+    hasher.update(input.max_parallel.to_string().as_bytes());
     hasher.update(b"\0");
-    hasher.update(acceptance_mode.as_bytes());
+    hasher.update(input.acceptance_mode.as_bytes());
     hasher.update(b"\0");
-    hasher.update(timeout_seconds.to_string().as_bytes());
-    if let Some(binary) = binary {
+    hasher.update(input.workspace_mode.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(input.timeout_seconds.to_string().as_bytes());
+    if let Some(binary) = input.binary {
         hasher.update(b"\0");
         hasher.update(binary.to_string_lossy().as_bytes());
     }
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
-fn scheduler_task_body(workspace: &Workspace, node: &WorkNodeRecord) -> Vec<u8> {
+fn scheduler_task_body(
+    workspace: &Workspace,
+    node: &WorkNodeRecord,
+    branch_ref: Option<&str>,
+) -> Vec<u8> {
+    let branch_section = branch_ref
+        .map(|branch_ref| {
+            format!(
+                "\nBranch workspace:\n- ref: {branch_ref}\n- This worker is running in an isolated branch workspace.\n- Use `--workspace-ref \"$RIVE_BRANCH_REF\"` when reporting.\n- Do not call branchfs commit or abort directly.\n"
+            )
+        })
+        .unwrap_or_default();
     format!(
         r#"You are a Rive worker assigned to one work node.
 
@@ -1260,6 +1404,7 @@ Workspace:
 Work node:
 - id: {}
 - title: {}
+{}
 
 Rules:
 1. Inspect your assigned node with `rive work inspect {}` if needed.
@@ -1273,6 +1418,7 @@ Rules:
         workspace.root.display(),
         node.work_node_id,
         node.title,
+        branch_section,
         node.work_node_id
     )
     .into_bytes()
@@ -1373,6 +1519,8 @@ impl<'a, A: RunnerAdapter> RunnerCore<'a, A> {
                 run_id: &run_id,
                 prompt: &prompt,
                 trust_project: input.trust_project,
+                workspace_override: None,
+                branch_ref: None,
             })?;
             let output = run_child_process(&mut command, input.timeout_seconds)?;
             exit_code = output.exit_code;
@@ -1454,6 +1602,8 @@ impl<'a, A: RunnerAdapter> RunnerCore<'a, A> {
             run_id: input.run_id,
             prompt: &prompt,
             trust_project: input.trust_project,
+            workspace_override: input.workspace_override,
+            branch_ref: input.branch_ref,
         })?;
         let output = run_child_process(&mut command, input.timeout_seconds)?;
         fs::write(&stdout_path, &output.stdout)?;
@@ -1555,6 +1705,8 @@ struct ExistingRunnerInput<'a> {
     binary: Option<&'a Path>,
     timeout_seconds: u64,
     trust_project: bool,
+    workspace_override: Option<&'a Path>,
+    branch_ref: Option<&'a str>,
 }
 
 pub struct TeamSendService<'a> {
@@ -1715,6 +1867,8 @@ impl<'a> TeamSendService<'a> {
                     binary: input.opencode_bin.as_deref(),
                     timeout_seconds: input.timeout_seconds,
                     trust_project: false,
+                    workspace_override: None,
+                    branch_ref: None,
                 })?;
                 (dispatch, trace)
             }
@@ -1737,6 +1891,8 @@ impl<'a> TeamSendService<'a> {
                     binary: input.codex_bin.as_deref(),
                     timeout_seconds: input.timeout_seconds,
                     trust_project: input.trust_project,
+                    workspace_override: None,
+                    branch_ref: None,
                 })?;
                 (dispatch, trace)
             }
@@ -1925,7 +2081,7 @@ impl RunnerAdapter for OpenCodeAdapter {
     fn build_command(&self, input: RunnerProcessInput<'_>) -> Result<Command> {
         let mut command = Command::new(input.binary);
         command
-            .current_dir(&input.workspace.root)
+            .current_dir(input.workspace_override.unwrap_or(&input.workspace.root))
             .arg("run")
             .arg("--format")
             .arg("json")
@@ -1982,7 +2138,7 @@ impl RunnerAdapter for CodexAdapter {
             .arg("--skip-git-repo-check")
             .arg("--json")
             .arg("--cd")
-            .arg(&input.workspace.root);
+            .arg(input.workspace_override.unwrap_or(&input.workspace.root));
         if input.trust_project {
             command.arg("-c").arg(format!(
                 "projects.\"{}\".trust_level=\"trusted\"",
@@ -2015,6 +2171,8 @@ struct RunnerProcessInput<'a> {
     run_id: &'a str,
     prompt: &'a str,
     trust_project: bool,
+    workspace_override: Option<&'a Path>,
+    branch_ref: Option<&'a str>,
 }
 
 fn prepare_isolated_codex_home(run_dir: &Path) -> Result<PathBuf> {
@@ -2281,11 +2439,13 @@ fn apply_common_env(command: &mut Command, input: &RunnerProcessInput<'_>) {
         .or_else(|| std::env::var_os("PATH"))
         .unwrap_or_default();
     let path = format!("{}:{}", bin_dir.display(), old_path.to_string_lossy());
+    let worker_workspace = input.workspace_override.unwrap_or(&input.workspace.root);
     command
         .env_remove("RIVE_ORCHESTRATOR_ROOT_WORK_ID")
         .env_remove("RIVE_AVAILABLE_WORKERS")
         .env_remove("RIVE_ORCHESTRATOR_CAPABILITY_PROFILE")
-        .env("RIVE_WORKSPACE", &input.workspace.root)
+        .env("RIVE_WORKSPACE", worker_workspace)
+        .env("RIVE_STATE_WORKSPACE", &input.workspace.root)
         .env("RIVE_AGENT_ID", &input.agent.agent_id)
         .env("RIVE_AGENT_TOKEN", input.token)
         .env("RIVE_RUN_ID", input.run_id)
@@ -2293,6 +2453,11 @@ fn apply_common_env(command: &mut Command, input: &RunnerProcessInput<'_>) {
         .env("PATH", path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(branch_ref) = input.branch_ref {
+        command.env("RIVE_BRANCH_REF", branch_ref);
+    } else {
+        command.env_remove("RIVE_BRANCH_REF");
+    }
 }
 
 fn run_child_process(command: &mut Command, timeout_seconds: u64) -> Result<ProcessOutput> {

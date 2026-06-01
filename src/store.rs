@@ -315,6 +315,38 @@ pub struct SchedulerNodeRunRecord {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchWorkspaceRecord {
+    pub branch_id: String,
+    pub backend: String,
+    pub root_work_node_id: String,
+    pub work_node_id: String,
+    pub dispatch_id: String,
+    pub run_id: String,
+    pub branch_name: String,
+    pub branch_path: String,
+    pub branch_ref: String,
+    pub state: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchIntegrationRecord {
+    pub integration_id: String,
+    pub branch_id: String,
+    pub work_node_id: String,
+    pub dispatch_id: String,
+    pub fact_event_id: Option<String>,
+    pub branch_ref: String,
+    pub diff_ref: Option<String>,
+    pub state: String,
+    pub commit_ref: Option<String>,
+    pub rejection_reason_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone)]
 pub struct InsertWorkNodeInput {
     pub event: EventRecord,
@@ -362,6 +394,61 @@ pub struct UpdateSchedulerNodeRunInput {
     pub worker_run_id: Option<String>,
     pub state: String,
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertBranchWorkspaceInput {
+    pub branch_id: String,
+    pub backend: String,
+    pub root_work_node_id: String,
+    pub work_node_id: String,
+    pub dispatch_id: String,
+    pub run_id: String,
+    pub branch_name: String,
+    pub branch_path: String,
+    pub branch_ref: String,
+    pub state: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateBranchWorkspaceInput {
+    pub branch_id: String,
+    pub state: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertBranchIntegrationInput {
+    pub integration_id: String,
+    pub branch_id: String,
+    pub work_node_id: String,
+    pub dispatch_id: String,
+    pub fact_event_id: Option<String>,
+    pub branch_ref: String,
+    pub diff_ref: Option<String>,
+    pub state: String,
+    pub commit_ref: Option<String>,
+    pub rejection_reason_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateBranchIntegrationInput {
+    pub integration_id: String,
+    pub state: String,
+    pub commit_ref: Option<String>,
+    pub rejection_reason_hash: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordBranchCommandInput {
+    pub command_id: String,
+    pub integration_id: String,
+    pub action: String,
+    pub request_hash: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -659,6 +746,54 @@ impl EventStore {
               ON scheduler_node_runs(work_node_id, state);
             CREATE INDEX IF NOT EXISTS idx_scheduler_node_runs_scheduler
               ON scheduler_node_runs(scheduler_run_id);
+            CREATE TABLE IF NOT EXISTS branch_workspaces (
+              branch_id TEXT PRIMARY KEY,
+              backend TEXT NOT NULL,
+              root_work_node_id TEXT NOT NULL,
+              work_node_id TEXT NOT NULL,
+              dispatch_id TEXT NOT NULL,
+              run_id TEXT NOT NULL,
+              branch_name TEXT NOT NULL,
+              branch_path TEXT NOT NULL,
+              branch_ref TEXT NOT NULL UNIQUE,
+              state TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY(root_work_node_id) REFERENCES work_nodes(work_node_id),
+              FOREIGN KEY(work_node_id) REFERENCES work_nodes(work_node_id),
+              FOREIGN KEY(dispatch_id) REFERENCES dispatches(dispatch_id),
+              FOREIGN KEY(run_id) REFERENCES agent_runs(run_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_branch_workspaces_work
+              ON branch_workspaces(work_node_id, state);
+            CREATE TABLE IF NOT EXISTS branch_integrations (
+              integration_id TEXT PRIMARY KEY,
+              branch_id TEXT NOT NULL UNIQUE,
+              work_node_id TEXT NOT NULL,
+              dispatch_id TEXT NOT NULL,
+              fact_event_id TEXT,
+              branch_ref TEXT NOT NULL,
+              diff_ref TEXT,
+              state TEXT NOT NULL,
+              commit_ref TEXT,
+              rejection_reason_hash TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY(branch_id) REFERENCES branch_workspaces(branch_id),
+              FOREIGN KEY(work_node_id) REFERENCES work_nodes(work_node_id),
+              FOREIGN KEY(dispatch_id) REFERENCES dispatches(dispatch_id),
+              FOREIGN KEY(fact_event_id) REFERENCES facts(event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_branch_integrations_work
+              ON branch_integrations(work_node_id, state);
+            CREATE TABLE IF NOT EXISTS branch_commands (
+              command_id TEXT PRIMARY KEY,
+              integration_id TEXT NOT NULL,
+              action TEXT NOT NULL,
+              request_hash TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY(integration_id) REFERENCES branch_integrations(integration_id)
+            );
             "#,
         )?;
         Ok(())
@@ -2164,6 +2299,251 @@ impl EventStore {
         }
         Ok(runs)
     }
+
+    pub fn insert_branch_workspace(
+        &self,
+        input: &InsertBranchWorkspaceInput,
+    ) -> Result<BranchWorkspaceRecord> {
+        self.conn.execute(
+            r#"
+            INSERT INTO branch_workspaces (
+              branch_id, backend, root_work_node_id, work_node_id, dispatch_id, run_id,
+              branch_name, branch_path, branch_ref, state, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
+            "#,
+            params![
+                input.branch_id,
+                input.backend,
+                input.root_work_node_id,
+                input.work_node_id,
+                input.dispatch_id,
+                input.run_id,
+                input.branch_name,
+                input.branch_path,
+                input.branch_ref,
+                input.state,
+                input.created_at.to_rfc3339(),
+            ],
+        )?;
+        self.get_branch_workspace(&input.branch_id)?
+            .ok_or_else(|| anyhow::anyhow!("branch not found: {}", input.branch_id))
+    }
+
+    pub fn update_branch_workspace(
+        &self,
+        input: &UpdateBranchWorkspaceInput,
+    ) -> Result<BranchWorkspaceRecord> {
+        self.conn.execute(
+            r#"
+            UPDATE branch_workspaces
+            SET state = ?1, updated_at = ?2
+            WHERE branch_id = ?3
+            "#,
+            params![input.state, input.updated_at.to_rfc3339(), input.branch_id,],
+        )?;
+        self.get_branch_workspace(&input.branch_id)?
+            .ok_or_else(|| anyhow::anyhow!("branch not found: {}", input.branch_id))
+    }
+
+    pub fn get_branch_workspace(&self, branch_id: &str) -> Result<Option<BranchWorkspaceRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT branch_id, backend, root_work_node_id, work_node_id, dispatch_id, run_id,
+                   branch_name, branch_path, branch_ref, state, created_at, updated_at
+            FROM branch_workspaces
+            WHERE branch_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![branch_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_branch_workspace(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_branch_workspace_by_ref(
+        &self,
+        branch_ref: &str,
+    ) -> Result<Option<BranchWorkspaceRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT branch_id, backend, root_work_node_id, work_node_id, dispatch_id, run_id,
+                   branch_name, branch_path, branch_ref, state, created_at, updated_at
+            FROM branch_workspaces
+            WHERE branch_ref = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![branch_ref])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_branch_workspace(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn insert_branch_integration(
+        &self,
+        input: &InsertBranchIntegrationInput,
+    ) -> Result<BranchIntegrationRecord> {
+        self.conn.execute(
+            r#"
+            INSERT INTO branch_integrations (
+              integration_id, branch_id, work_node_id, dispatch_id, fact_event_id, branch_ref,
+              diff_ref, state, commit_ref, rejection_reason_hash, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
+            "#,
+            params![
+                input.integration_id,
+                input.branch_id,
+                input.work_node_id,
+                input.dispatch_id,
+                input.fact_event_id,
+                input.branch_ref,
+                input.diff_ref,
+                input.state,
+                input.commit_ref,
+                input.rejection_reason_hash,
+                input.created_at.to_rfc3339(),
+            ],
+        )?;
+        self.get_branch_integration(&input.integration_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("branch integration not found: {}", input.integration_id)
+            })
+    }
+
+    pub fn update_branch_integration(
+        &self,
+        input: &UpdateBranchIntegrationInput,
+        event_type: &str,
+        command_id: &str,
+    ) -> Result<BranchIntegrationRecord> {
+        let event_id = format!("evt_{}", uuid::Uuid::new_v4().simple());
+        let created_at = input.updated_at;
+        self.insert_event(&EventRecord {
+            event_id,
+            event_type: event_type.to_string(),
+            created_at,
+            payload: serde_json::json!({
+                "event_type": event_type,
+                "command_id": command_id,
+                "integration_id": input.integration_id,
+                "state": input.state,
+                "commit_ref": input.commit_ref,
+                "rejection_reason_hash": input.rejection_reason_hash,
+                "created_at": created_at,
+            }),
+        })?;
+        self.conn.execute(
+            r#"
+            UPDATE branch_integrations
+            SET state = ?1, commit_ref = ?2, rejection_reason_hash = ?3, updated_at = ?4
+            WHERE integration_id = ?5
+            "#,
+            params![
+                input.state,
+                input.commit_ref,
+                input.rejection_reason_hash,
+                input.updated_at.to_rfc3339(),
+                input.integration_id,
+            ],
+        )?;
+        self.get_branch_integration(&input.integration_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("branch integration not found: {}", input.integration_id)
+            })
+    }
+
+    pub fn get_branch_integration(
+        &self,
+        integration_id: &str,
+    ) -> Result<Option<BranchIntegrationRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT integration_id, branch_id, work_node_id, dispatch_id, fact_event_id,
+                   branch_ref, diff_ref, state, commit_ref, rejection_reason_hash,
+                   created_at, updated_at
+            FROM branch_integrations
+            WHERE integration_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![integration_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_branch_integration(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_branch_integration_by_branch_id(
+        &self,
+        branch_id: &str,
+    ) -> Result<Option<BranchIntegrationRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT integration_id, branch_id, work_node_id, dispatch_id, fact_event_id,
+                   branch_ref, diff_ref, state, commit_ref, rejection_reason_hash,
+                   created_at, updated_at
+            FROM branch_integrations
+            WHERE branch_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![branch_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_branch_integration(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_branch_integrations(&self) -> Result<Vec<BranchIntegrationRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT integration_id, branch_id, work_node_id, dispatch_id, fact_event_id,
+                   branch_ref, diff_ref, state, commit_ref, rejection_reason_hash,
+                   created_at, updated_at
+            FROM branch_integrations
+            ORDER BY created_at ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], row_to_branch_integration)?;
+        let mut integrations = Vec::new();
+        for row in rows {
+            integrations.push(row?);
+        }
+        Ok(integrations)
+    }
+
+    pub fn get_branch_command(&self, command_id: &str) -> Result<Option<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT integration_id, action FROM branch_commands WHERE command_id = ?1")?;
+        let mut rows = stmt.query(params![command_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((row.get(0)?, row.get(1)?)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn record_branch_command(&self, input: &RecordBranchCommandInput) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO branch_commands (
+              command_id, integration_id, action, request_hash, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![
+                input.command_id,
+                input.integration_id,
+                input.action,
+                input.request_hash,
+                input.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotRecord> {
@@ -2430,6 +2810,44 @@ fn row_to_scheduler_node_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Schedu
             .as_deref()
             .map(parse_time_for_sql)
             .transpose()?,
+    })
+}
+
+fn row_to_branch_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<BranchWorkspaceRecord> {
+    let created_at: String = row.get(10)?;
+    let updated_at: String = row.get(11)?;
+    Ok(BranchWorkspaceRecord {
+        branch_id: row.get(0)?,
+        backend: row.get(1)?,
+        root_work_node_id: row.get(2)?,
+        work_node_id: row.get(3)?,
+        dispatch_id: row.get(4)?,
+        run_id: row.get(5)?,
+        branch_name: row.get(6)?,
+        branch_path: row.get(7)?,
+        branch_ref: row.get(8)?,
+        state: row.get(9)?,
+        created_at: parse_time_for_sql(&created_at)?,
+        updated_at: parse_time_for_sql(&updated_at)?,
+    })
+}
+
+fn row_to_branch_integration(row: &rusqlite::Row<'_>) -> rusqlite::Result<BranchIntegrationRecord> {
+    let created_at: String = row.get(10)?;
+    let updated_at: String = row.get(11)?;
+    Ok(BranchIntegrationRecord {
+        integration_id: row.get(0)?,
+        branch_id: row.get(1)?,
+        work_node_id: row.get(2)?,
+        dispatch_id: row.get(3)?,
+        fact_event_id: row.get(4)?,
+        branch_ref: row.get(5)?,
+        diff_ref: row.get(6)?,
+        state: row.get(7)?,
+        commit_ref: row.get(8)?,
+        rejection_reason_hash: row.get(9)?,
+        created_at: parse_time_for_sql(&created_at)?,
+        updated_at: parse_time_for_sql(&updated_at)?,
     })
 }
 
