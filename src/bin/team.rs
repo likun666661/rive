@@ -15,6 +15,7 @@ use rive::output::{Envelope, ErrorEnvelope};
 use rive::runner::{TeamSendInput, TeamSendService};
 use rive::snapshot::LocalSnapshotStore;
 use rive::store::{AgentRecord, EventStore};
+use rive::work::{BindWorkRefsCommand, WorkService};
 use rive::workspace::find_workspace;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -49,12 +50,20 @@ enum Commands {
         status: String,
         #[arg(long = "snapshot")]
         snapshots: Vec<String>,
+        #[arg(long = "artifact-ref")]
+        artifact_refs: Vec<String>,
+        #[arg(long = "workspace-ref")]
+        workspace_ref: Option<String>,
+        #[arg(long = "diff-ref")]
+        diff_ref: Option<String>,
         #[arg(long = "command-id")]
         command_id: String,
         #[arg(long)]
         stdin: bool,
     },
     Send {
+        #[arg(long = "work")]
+        work_node_id: Option<String>,
         #[arg(long = "to")]
         target: String,
         #[arg(long)]
@@ -160,10 +169,23 @@ fn run() -> Result<()> {
             dispatch,
             status,
             snapshots,
+            artifact_refs,
+            workspace_ref,
+            diff_ref,
             command_id,
             stdin,
-        } => record_dispatch_report(dispatch, status, snapshots, command_id, stdin),
+        } => record_dispatch_report(
+            dispatch,
+            status,
+            snapshots,
+            artifact_refs,
+            workspace_ref,
+            diff_ref,
+            command_id,
+            stdin,
+        ),
         Commands::Send {
+            work_node_id,
             target,
             runner,
             title,
@@ -176,6 +198,7 @@ fn run() -> Result<()> {
             trust_project,
             stdin,
         } => send_delegation(
+            work_node_id,
             target,
             runner,
             title,
@@ -201,6 +224,7 @@ fn run() -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn send_delegation(
+    work_node_id: Option<String>,
     target: String,
     runner: String,
     title: String,
@@ -228,6 +252,7 @@ fn send_delegation(
     std::io::stdin().read_to_end(&mut task_body)?;
     let protocol = service.send(TeamSendInput {
         actor,
+        work_node_id,
         target,
         runner,
         title,
@@ -319,10 +344,14 @@ fn record_dispatch_status(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_dispatch_report(
     dispatch: String,
     status: String,
     snapshots: Vec<String>,
+    artifact_refs: Vec<String>,
+    workspace_ref: Option<String>,
+    diff_ref: Option<String>,
     command_id: String,
     stdin: bool,
 ) -> Result<()> {
@@ -343,7 +372,7 @@ fn record_dispatch_report(
             command_id,
             actor,
             dispatch_id: dispatch,
-            snapshot_ids: snapshots,
+            snapshot_ids: snapshots.clone(),
             body,
         },
         report_status,
@@ -353,8 +382,23 @@ fn record_dispatch_report(
         DispatchFactOutcome::Replayed { fact, dispatch } => (fact, dispatch, "replayed"),
     };
     let protocol = dispatch_fact_protocol(&fact, &dispatch, idempotency_status);
+    let work = WorkService::new(&workspace, &store, &snapshot_store).bind_refs_for_report(
+        BindWorkRefsCommand {
+            dispatch_id: dispatch.dispatch_id.clone(),
+            fact_event_id: fact.event_id.clone(),
+            snapshot_ids: snapshots,
+            artifact_refs,
+            workspace_ref,
+            diff_ref,
+        },
+    )?;
+    let protocol = serde_json::json!({
+        "fact": protocol.fact,
+        "dispatch": protocol.dispatch,
+        "work": work,
+    });
     let display = serde_json::json!({
-        "summary": format!("Recorded {} report for dispatch {}", status, protocol.dispatch.dispatch_id),
+        "summary": format!("Recorded {} report for dispatch {}", status, dispatch.dispatch_id),
     });
     println!(
         "{}",
@@ -472,6 +516,24 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
         ("codex_exit_failed", false, "inspect_projection")
     } else if lower.contains("dispatch not reported") {
         ("dispatch_not_reported", false, "inspect_projection")
+    } else if lower.contains("work graph cycle") {
+        ("work_graph_cycle", false, "inspect_projection")
+    } else if lower.contains("invalid work edge type") {
+        ("invalid_work_edge_type", false, "fix_arguments")
+    } else if lower.contains("invalid work node kind") {
+        ("invalid_work_node_kind", false, "fix_arguments")
+    } else if lower.contains("work node not ready") {
+        ("work_node_not_ready", false, "inspect_projection")
+    } else if lower.contains("work node not reviewable") {
+        ("work_node_not_reviewable", false, "inspect_projection")
+    } else if lower.contains("work node not found") {
+        ("work_node_not_found", false, "fix_arguments")
+    } else if lower.contains("dispatch already bound to work node") {
+        (
+            "work_dispatch_binding_conflict",
+            false,
+            "inspect_projection",
+        )
     } else if lower.contains("invalid report status") {
         ("invalid_report_status", false, "fix_arguments")
     } else if lower.contains("invalid fact type") {

@@ -21,6 +21,10 @@ use rive::snapshot::{
     SnapshotShowDisplay, SnapshotShowProtocol, SnapshotSummaryProtocol,
 };
 use rive::store::{AgentRole, EventStore};
+use rive::work::{
+    work_edge_protocol, work_node_protocol, AddWorkEdgeInput, CreateWorkNodeInput, WorkEdgeType,
+    WorkNodeKind, WorkService, WorkStatusInput,
+};
 use rive::workspace::{find_workspace, init_workspace};
 
 #[derive(Parser)]
@@ -56,6 +60,10 @@ enum Commands {
     Dispatch {
         #[command(subcommand)]
         command: DispatchCommands,
+    },
+    Work {
+        #[command(subcommand)]
+        command: WorkCommands,
     },
     Debug {
         #[command(subcommand)]
@@ -116,6 +124,8 @@ enum DispatchCommands {
     Create {
         #[arg(long)]
         target: String,
+        #[arg(long = "work")]
+        work_node_id: Option<String>,
         #[arg(long)]
         title: String,
         #[arg(long = "command-id")]
@@ -133,6 +143,59 @@ enum DispatchCommands {
         command_id: String,
         #[arg(long)]
         reason: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkCommands {
+    Create {
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long = "command-id")]
+        command_id: String,
+        #[arg(long)]
+        stdin: bool,
+    },
+    Edge {
+        #[command(subcommand)]
+        command: WorkEdgeCommands,
+    },
+    List,
+    Show {
+        work_node_id: String,
+    },
+    Inspect {
+        work_node_id: String,
+    },
+    Accept {
+        work_node_id: String,
+        #[arg(long = "command-id")]
+        command_id: String,
+        #[arg(long)]
+        stdin: bool,
+    },
+    Reopen {
+        work_node_id: String,
+        #[arg(long = "command-id")]
+        command_id: String,
+        #[arg(long)]
+        stdin: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkEdgeCommands {
+    Add {
+        #[arg(long = "type")]
+        edge_type: String,
+        #[arg(long = "from")]
+        from_node_id: String,
+        #[arg(long = "to")]
+        to_node_id: String,
+        #[arg(long = "command-id")]
+        command_id: String,
     },
 }
 
@@ -460,6 +523,7 @@ fn run() -> Result<()> {
         Commands::Dispatch { command } => match command {
             DispatchCommands::Create {
                 target,
+                work_node_id,
                 title,
                 command_id,
                 stdin,
@@ -484,11 +548,31 @@ fn run() -> Result<()> {
                     CreateDispatchOutcome::Inserted(dispatch) => (dispatch, "inserted"),
                     CreateDispatchOutcome::Replayed(dispatch) => (dispatch, "replayed"),
                 };
+                let work = if let Some(work_node_id) = work_node_id {
+                    let work_service = WorkService::new(&workspace, &store, &snapshot_store);
+                    work_service.bind_dispatch(rive::work::BindWorkDispatchCommand {
+                        work_node_id,
+                        dispatch_id: dispatch.dispatch_id.clone(),
+                    })?;
+                    work_service.projection_for_dispatch(&dispatch.dispatch_id)?
+                } else {
+                    None
+                };
                 let protocol = dispatch_protocol(&dispatch, idempotency_status);
                 let display = serde_json::json!({
-                    "summary": format!("Dispatch {} is {}", protocol.dispatch_id, protocol.state),
+                    "summary": format!("Dispatch {} is {}", dispatch.dispatch_id, dispatch.state.as_str()),
                 });
-                print_json(&Envelope::new(protocol, display))
+                if let Some(work) = work {
+                    print_json(&Envelope::new(
+                        serde_json::json!({
+                            "dispatch": protocol,
+                            "work": work,
+                        }),
+                        display,
+                    ))
+                } else {
+                    print_json(&Envelope::new(protocol, display))
+                }
             }
             DispatchCommands::List => {
                 let workspace = find_workspace(&std::env::current_dir()?)?;
@@ -545,6 +629,132 @@ fn run() -> Result<()> {
                 print_json(&Envelope::new(protocol, display))
             }
         },
+        Commands::Work { command } => {
+            let workspace = find_workspace(&std::env::current_dir()?)
+                .map_err(|_| anyhow!("workspace not initialized"))?;
+            let store = EventStore::open(&workspace.db_path())?;
+            store.init_schema()?;
+            let snapshot_store = LocalSnapshotStore::new(&workspace);
+            let service = WorkService::new(&workspace, &store, &snapshot_store);
+            match command {
+                WorkCommands::Create {
+                    kind,
+                    title,
+                    command_id,
+                    stdin,
+                } => {
+                    let mut body = Vec::new();
+                    if stdin {
+                        std::io::stdin().read_to_end(&mut body)?;
+                    }
+                    let (node, idempotency_status) = service.create_node(CreateWorkNodeInput {
+                        command_id,
+                        kind: WorkNodeKind::parse(&kind)?,
+                        title,
+                        body,
+                    })?;
+                    let protocol =
+                        work_node_protocol(&node, service.graph_version()?, idempotency_status);
+                    let display = serde_json::json!({
+                        "summary": format!("Work node {} is {}", protocol.work_node_id, protocol.status_input),
+                    });
+                    print_json(&Envelope::new(protocol, display))
+                }
+                WorkCommands::Edge { command } => match command {
+                    WorkEdgeCommands::Add {
+                        edge_type,
+                        from_node_id,
+                        to_node_id,
+                        command_id,
+                    } => {
+                        let (edge, idempotency_status) = service.add_edge(AddWorkEdgeInput {
+                            command_id,
+                            edge_type: WorkEdgeType::parse(&edge_type)?,
+                            from_node_id,
+                            to_node_id,
+                        })?;
+                        let protocol = work_edge_protocol(&edge, idempotency_status);
+                        let display = serde_json::json!({
+                            "summary": format!(
+                                "Work edge {} {} -> {}",
+                                protocol.edge_type, protocol.from_node_id, protocol.to_node_id
+                            ),
+                        });
+                        print_json(&Envelope::new(protocol, display))
+                    }
+                },
+                WorkCommands::List => {
+                    let protocol = service.list_nodes()?;
+                    let display = serde_json::json!({
+                        "summary": format!("{} work nodes", protocol.nodes.len()),
+                    });
+                    print_json(&Envelope::new(protocol, display))
+                }
+                WorkCommands::Show { work_node_id } => {
+                    let protocol = service.show_node(&work_node_id)?;
+                    let display = serde_json::json!({
+                        "summary": format!("Work node {} {}", protocol.work_node_id, protocol.title),
+                    });
+                    print_json(&Envelope::new(protocol, display))
+                }
+                WorkCommands::Inspect { work_node_id } => {
+                    let protocol = service.inspect(&work_node_id)?;
+                    let display = serde_json::json!({
+                        "summary": format!(
+                            "Work node {} is {}",
+                            protocol.node.work_node_id, protocol.projection.state
+                        ),
+                        "explanation": format!(
+                            "{} missing requirements",
+                            protocol.projection.missing_requirements.len()
+                        ),
+                    });
+                    print_json(&Envelope::new(protocol, display))
+                }
+                WorkCommands::Accept {
+                    work_node_id,
+                    command_id,
+                    stdin,
+                } => {
+                    let mut reason = Vec::new();
+                    if stdin {
+                        std::io::stdin().read_to_end(&mut reason)?;
+                    }
+                    let (node, idempotency_status) = service.accept_node(WorkStatusInput {
+                        command_id,
+                        work_node_id,
+                        reason,
+                    })?;
+                    let protocol =
+                        work_node_protocol(&node, service.graph_version()?, idempotency_status);
+                    let display = serde_json::json!({
+                        "summary": format!("Accepted work node {}", protocol.work_node_id),
+                    });
+                    print_json(&Envelope::new(protocol, display))
+                }
+                WorkCommands::Reopen {
+                    work_node_id,
+                    command_id,
+                    stdin,
+                } => {
+                    let mut reason = Vec::new();
+                    if stdin {
+                        std::io::stdin().read_to_end(&mut reason)?;
+                    }
+                    let (node, idempotency_status) = service.reopen_node(WorkStatusInput {
+                        command_id,
+                        work_node_id,
+                        reason,
+                    })?;
+                    let protocol =
+                        work_node_protocol(&node, service.graph_version()?, idempotency_status);
+                    let display = serde_json::json!({
+                        "summary": format!("Reopened work node {}", protocol.work_node_id),
+                    });
+                    print_json(&Envelope::new(protocol, display))
+                }
+            }
+        }
         Commands::Debug { command } => match command {
             DebugCommands::Trace { command } => match command {
                 DebugTraceCommands::Ingest {
@@ -790,6 +1000,20 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
         ("codex_exit_failed", "inspect_projection")
     } else if lower.contains("dispatch not reported") {
         ("dispatch_not_reported", "inspect_projection")
+    } else if lower.contains("work graph cycle") {
+        ("work_graph_cycle", "inspect_projection")
+    } else if lower.contains("invalid work edge type") {
+        ("invalid_work_edge_type", "fix_arguments")
+    } else if lower.contains("invalid work node kind") {
+        ("invalid_work_node_kind", "fix_arguments")
+    } else if lower.contains("work node not ready") {
+        ("work_node_not_ready", "inspect_projection")
+    } else if lower.contains("work node not reviewable") {
+        ("work_node_not_reviewable", "inspect_projection")
+    } else if lower.contains("work node not found") {
+        ("work_node_not_found", "fix_arguments")
+    } else if lower.contains("dispatch already bound to work node") {
+        ("work_dispatch_binding_conflict", "inspect_projection")
     } else if lower.contains("invalid trace payload json") {
         ("invalid_trace_payload", "fix_arguments")
     } else if lower.contains("unsupported trace adapter") {

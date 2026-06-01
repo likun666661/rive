@@ -24,6 +24,7 @@ use crate::store::{
     AgentRecord, AgentRole, CompleteDelegationInput, DelegationRecord, DispatchRecord,
     DispatchState, EventStore, IdempotencyResolution, InsertAgentRunInput, InsertDelegationInput,
 };
+use crate::work::{BindWorkDispatchCommand, WorkProjectionProtocol, WorkService};
 use crate::workspace::Workspace;
 
 #[derive(Debug)]
@@ -127,6 +128,7 @@ pub struct RunnerTraceProtocol {
 #[derive(Debug)]
 pub struct TeamSendInput {
     pub actor: ActorEnv,
+    pub work_node_id: Option<String>,
     pub target: String,
     pub runner: String,
     pub title: String,
@@ -149,6 +151,7 @@ pub struct TeamSendResponseProtocol {
     pub expected_next_action: &'static str,
     pub delegation: DelegationProtocol,
     pub dispatch: crate::dispatch::DispatchProtocol,
+    pub work: Option<WorkProjectionProtocol>,
     pub trace: RunnerTraceProtocol,
 }
 
@@ -538,6 +541,7 @@ impl<'a> TeamSendService<'a> {
         }
         let runner = RunnerKind::parse(&input.runner)?;
         let request_hash = team_send_request_hash(&input, &source, &target, runner.as_str());
+        let work_service = WorkService::new(self.workspace, self.event_store, self.blob_store);
 
         if let Some(existing) = self
             .event_store
@@ -563,7 +567,18 @@ impl<'a> TeamSendService<'a> {
             }
             let trace =
                 self.trace_summary_for(runner, &existing.worker_run_id, &dispatch.dispatch_id)?;
-            return Ok(self.response(existing, dispatch, "replayed", false, trace));
+            let work = work_projection_for_dispatch(&work_service, &dispatch.dispatch_id)?;
+            return Ok(self.response(existing, dispatch, "replayed", false, trace, work));
+        }
+
+        if let Some(work_node_id) = &input.work_node_id {
+            let projection = work_service.inspect_projection(work_node_id)?;
+            if !projection.allowed_next_actions.contains(&"delegate") {
+                return Err(anyhow!(
+                    "work node not ready: {work_node_id} is {}",
+                    projection.state
+                ));
+            }
         }
 
         let worker_run_id = prefixed_id("run");
@@ -586,6 +601,12 @@ impl<'a> TeamSendService<'a> {
             CreateDispatchOutcome::Inserted(dispatch)
             | CreateDispatchOutcome::Replayed(dispatch) => dispatch,
         };
+        if let Some(work_node_id) = &input.work_node_id {
+            work_service.bind_dispatch(BindWorkDispatchCommand {
+                work_node_id: work_node_id.clone(),
+                dispatch_id: dispatch.dispatch_id.clone(),
+            })?;
+        }
 
         let delegation =
             match self
@@ -660,7 +681,8 @@ impl<'a> TeamSendService<'a> {
                 child_executed: true,
                 completed_at: Utc::now(),
             })?;
-        Ok(self.response(delegation, dispatch, "inserted", true, trace))
+        let work = work_projection_for_dispatch(&work_service, &dispatch.dispatch_id)?;
+        Ok(self.response(delegation, dispatch, "inserted", true, trace, work))
     }
 
     fn authenticate_actor(&self, actor: &ActorEnv) -> Result<AgentRecord> {
@@ -718,6 +740,7 @@ impl<'a> TeamSendService<'a> {
         idempotency_status: &'static str,
         child_executed: bool,
         trace: RunnerTraceProtocol,
+        work: Option<WorkProjectionProtocol>,
     ) -> TeamSendResponseProtocol {
         TeamSendResponseProtocol {
             ok: true,
@@ -727,9 +750,17 @@ impl<'a> TeamSendService<'a> {
             expected_next_action: "inspect_dispatch",
             delegation: delegation_protocol(&delegation, idempotency_status),
             dispatch: crate::dispatch::dispatch_protocol(&dispatch, idempotency_status),
+            work,
             trace,
         }
     }
+}
+
+fn work_projection_for_dispatch(
+    work_service: &WorkService<'_, crate::snapshot::LocalSnapshotStore<'_>>,
+    dispatch_id: &str,
+) -> Result<Option<WorkProjectionProtocol>> {
+    work_service.projection_for_dispatch(dispatch_id)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -961,6 +992,10 @@ fn team_send_request_hash(
     hasher.update(runner.as_bytes());
     hasher.update(b"\0");
     hasher.update(input.title.as_bytes());
+    hasher.update(b"\0");
+    if let Some(work_node_id) = &input.work_node_id {
+        hasher.update(work_node_id.as_bytes());
+    }
     hasher.update(b"\0");
     hasher.update(&input.task_body);
     for path in &input.snapshot_paths {
