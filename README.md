@@ -19,3 +19,5 @@ Rive 是本地优先 agent team runtime 的体系文档。
 13. [Phase 6 Codex Runner 测试计划](./docs/13-phase6-codex-runner-test-plan.md)
 14. [Phase 7 Agent-to-Agent Delegation 设计](./docs/14-phase7-agent-to-agent-delegation-design.md)
 15. [Phase 7 Agent-to-Agent Delegation 测试计划](./docs/15-phase7-agent-to-agent-delegation-test-plan.md)
+16. [Phase 8 Work DAG / Dispatch Binding 设计](./docs/16-phase8-work-dag-dispatch-binding-design.md)
+17. [Phase 8 Work DAG / Dispatch Binding 测试计划](./docs/17-phase8-work-dag-dispatch-binding-test-plan.md)
