@@ -301,6 +301,62 @@ fn scheduler_manual_mode_waits_for_review() {
 }
 
 #[test]
+fn scheduler_auto_reported_accepts_existing_reviewable_then_continues() {
+    let temp = init_workspace();
+    add_worker(&temp, "worker-a");
+    add_worker(&temp, "worker-b");
+    let root = create_work(&temp, "phase11-existing-root", "root");
+    let a = create_work(&temp, "phase11-existing-a", "A");
+    let c = create_work(&temp, "phase11-existing-c", "C");
+    add_edge(&temp, "decomposes-to", &root, &a, "edge-existing-root-a");
+    add_edge(&temp, "decomposes-to", &root, &c, "edge-existing-root-c");
+    add_edge(&temp, "depends-on", &c, &a, "edge-existing-c-a");
+    let fake = temp.path().join("fake-opencode-scheduler");
+    write_scheduler_worker(&fake);
+
+    let manual = run_json(&mut scheduler_command_with_mode(
+        &temp,
+        &fake,
+        &root,
+        "phase11-existing-manual",
+        "manual",
+    ));
+    assert_eq!(manual["protocol"]["scheduler"]["state"], "waiting_review");
+    assert_eq!(
+        inspect_work(&temp, &a)["protocol"]["projection"]["state"],
+        "reviewable"
+    );
+    assert_eq!(
+        inspect_work(&temp, &c)["protocol"]["projection"]["state"],
+        "blocked"
+    );
+
+    let auto = run_json(&mut scheduler_command(
+        &temp,
+        &fake,
+        &root,
+        "phase11-existing-auto",
+    ));
+    assert_eq!(auto["protocol"]["scheduler"]["state"], "completed");
+    assert_eq!(auto["protocol"]["root_work"]["state"], "done");
+    assert_eq!(
+        inspect_work(&temp, &a)["protocol"]["projection"]["state"],
+        "done"
+    );
+    assert_eq!(
+        inspect_work(&temp, &c)["protocol"]["projection"]["state"],
+        "done"
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join("phase11-invocations.txt"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn scheduler_replay_does_not_relaunch_workers() {
     let temp = init_workspace();
     add_worker(&temp, "worker-a");
@@ -346,6 +402,23 @@ fn scheduler_rejects_stdout_success_without_report() {
         "phase11-sched-no-report",
     ));
     assert_eq!(error["protocol"]["code"], "dispatch_not_reported");
+    let conn = Connection::open(temp.path().join(".rive/rive.db")).unwrap();
+    let failed_node_runs: i64 = conn
+        .query_row(
+            "select count(*) from scheduler_node_runs where state='failed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(failed_node_runs, 2);
+    let active_node_runs: i64 = conn
+        .query_row(
+            "select count(*) from scheduler_node_runs where state in ('claimed', 'running')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(active_node_runs, 0);
 }
 
 #[test]

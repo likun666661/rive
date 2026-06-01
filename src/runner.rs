@@ -683,6 +683,10 @@ impl<'a> SchedulerService<'a> {
                             completed_at: Some(Utc::now()),
                         },
                     )?;
+                    child_executed = !self
+                        .event_store
+                        .list_scheduler_node_runs_for_scheduler(&scheduler_run.scheduler_run_id)?
+                        .is_empty();
                 }
                 Err(err) => {
                     let _ = self.event_store.update_scheduler_run_state(
@@ -695,7 +699,6 @@ impl<'a> SchedulerService<'a> {
                     return Err(err);
                 }
             }
-            child_executed = true;
         }
         if !should_execute && scheduler_run.state == "running" {
             scheduler_run =
@@ -770,7 +773,9 @@ impl<'a> SchedulerService<'a> {
                 made_progress = true;
             }
             if acceptance_mode == AcceptanceMode::AutoReported {
-                self.accept_reviewable_nodes(scheduler_run, &input.root_work_node_id)?;
+                if self.accept_reviewable_nodes(scheduler_run, &input.root_work_node_id)? > 0 {
+                    made_progress = true;
+                }
                 let root_projection = work_service.inspect_projection(&input.root_work_node_id)?;
                 if root_projection.state == "reviewable" {
                     work_service.accept_node(crate::work::WorkStatusInput {
@@ -880,6 +885,7 @@ impl<'a> SchedulerService<'a> {
         }
 
         let results = self.execute_launches(launches)?;
+        let mut first_error = None;
         for result in results {
             match result.result {
                 Ok(dispatch_id) => {
@@ -898,7 +904,10 @@ impl<'a> SchedulerService<'a> {
                                 completed_at: Some(Utc::now()),
                             },
                         )?;
-                        return Err(anyhow!("work scheduler stalled: {}", result.work_node_id));
+                        first_error.get_or_insert_with(|| {
+                            anyhow!("work scheduler stalled: {}", result.work_node_id)
+                        });
+                        continue;
                     }
                     let mut state = "reported";
                     if acceptance_mode == AcceptanceMode::AutoReported
@@ -932,9 +941,12 @@ impl<'a> SchedulerService<'a> {
                             state: "failed".to_string(),
                             completed_at: Some(Utc::now()),
                         })?;
-                    return Err(err);
+                    first_error.get_or_insert(err);
                 }
             }
+        }
+        if let Some(err) = first_error {
+            return Err(err);
         }
         Ok(())
     }
@@ -1022,8 +1034,9 @@ impl<'a> SchedulerService<'a> {
         &self,
         scheduler_run: &SchedulerRunRecord,
         root_work_node_id: &str,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let work_service = WorkService::new(self.workspace, self.event_store, self.blob_store);
+        let mut accepted = 0usize;
         for node_id in work_service
             .inspect_graph(root_work_node_id)?
             .reachable_nodes
@@ -1041,9 +1054,10 @@ impl<'a> SchedulerService<'a> {
                     work_node_id: node_id,
                     reason: b"scheduler auto-reported acceptance".to_vec(),
                 })?;
+                accepted += 1;
             }
         }
-        Ok(())
+        Ok(accepted)
     }
 
     fn waiting_review_nodes(&self, root_work_node_id: &str) -> Result<Vec<String>> {
