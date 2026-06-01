@@ -215,11 +215,12 @@ This writes:
 Runner should ensure Codex sees:
 
 ```text
+CODEX_HOME=<run debug dir>/codex-home
 -c features.codex_hooks=true
 -c projects."<workspace>".trust_level="trusted"
 ```
 
-The trust override should be per invocation unless user explicitly asks to persist config later. Phase 6 should not mutate global Codex config.
+The trust override should be scoped to an isolated per-run `CODEX_HOME` unless user explicitly asks to persist config later. Phase 6 should not mutate global `~/.codex/config.toml`; the runner may copy the minimum auth files into the isolated home so the real Codex CLI can run while any trust/config writes stay inside the run debug directory.
 
 ### 6.2 Child process command
 

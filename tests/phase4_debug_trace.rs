@@ -433,7 +433,9 @@ fn trace_errors_and_install_templates_are_stable() {
         .path()
         .join(".rive/debug/adapters/codex-rive-trace-hook.sh");
     let codex_hook = fs::read_to_string(codex_hook_path).unwrap();
-    assert!(codex_hook.contains("rive debug trace ingest --adapter codex-hook --stdin"));
+    assert!(codex_hook.contains("debug trace ingest --adapter codex-hook --stdin"));
+    assert!(codex_hook.contains("RIVE_RUN_ID"));
+    assert!(codex_hook.contains("RIVE_DISPATCH_ID"));
     assert!(codex_hook.contains("|| true"));
     let codex_again = run_json(
         rive_cmd()
