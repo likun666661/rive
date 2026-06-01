@@ -129,6 +129,17 @@ printf '{"final":"mutated directly"}\n'
     );
 }
 
+fn write_mutating_existing_artifact_opencode(path: &Path) {
+    write_executable(
+        path,
+        r#"#!/bin/sh
+set -eu
+printf hacked > "$RIVE_WORKSPACE/phase10-result.txt"
+printf '{"final":"mutated existing artifact directly"}\n'
+"#,
+    );
+}
+
 fn write_orphan_opencode(path: &Path) {
     let team_bin = env!("CARGO_BIN_EXE_team");
     write_executable(
@@ -208,6 +219,7 @@ fn orchestrator_sandbox_allows_control_plane_and_worker_writes() {
             .arg(root),
     );
     assert_eq!(graph["protocol"]["hygiene_state"], "clean");
+    assert_eq!(graph["protocol"]["state"], "done");
     let usage = run_json(
         rive_cmd()
             .current_dir(temp.path())
@@ -229,6 +241,42 @@ fn orchestrator_direct_workspace_mutation_is_rejected() {
     let error = run_json_expect_error(
         &mut orchestrator_command(&temp, &fake, "phase10-mutation"),
         "Try direct mutation.\n",
+    );
+    assert_eq!(error["protocol"]["code"], "orchestrator_workspace_mutation");
+}
+
+#[test]
+fn historical_worker_ref_does_not_allow_later_orchestrator_mutation() {
+    let temp = init_workspace();
+    let fake = temp.path().join("fake-opencode");
+    write_legal_opencode(&fake);
+    run_json_with_stdin(
+        &mut orchestrator_command(&temp, &fake, "phase10-historical-legal"),
+        "Create a legitimate worker artifact.\n",
+    );
+
+    write_mutating_existing_artifact_opencode(&fake);
+    let mut second = rive_cmd();
+    second
+        .current_dir(temp.path())
+        .arg("runner")
+        .arg("orchestrator")
+        .arg("--runner")
+        .arg("opencode")
+        .arg("--agent")
+        .arg("orchestrator-two")
+        .arg("--worker")
+        .arg("worker-two")
+        .arg("--command-id")
+        .arg("phase10-historical-mutation")
+        .arg("--opencode-bin")
+        .arg(&fake)
+        .arg("--timeout-seconds")
+        .arg("20")
+        .arg("--stdin");
+    let error = run_json_expect_error(
+        &mut second,
+        "Mutate the previous worker artifact directly.\n",
     );
     assert_eq!(error["protocol"]["code"], "orchestrator_workspace_mutation");
 }

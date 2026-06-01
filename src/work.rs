@@ -640,6 +640,7 @@ impl<'a, S: SnapshotStore> WorkService<'a, S> {
         self.store
             .get_work_node(root_work_node_id)?
             .ok_or_else(|| anyhow!("work node not found: {root_work_node_id}"))?;
+        let root_projection = self.inspect_projection(root_work_node_id)?;
         let scoped = self
             .store
             .list_work_root_bindings_for_root(root_work_node_id)?
@@ -692,7 +693,7 @@ impl<'a, S: SnapshotStore> WorkService<'a, S> {
         };
         Ok(WorkGraphInspectProtocol {
             root_work_node_id: root_work_node_id.to_string(),
-            state: hygiene_state.to_string(),
+            state: root_projection.state,
             hygiene_state: hygiene_state.to_string(),
             scoped_nodes,
             reachable_nodes,

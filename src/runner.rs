@@ -25,6 +25,7 @@ use crate::facts::ActorEnv;
 use crate::store::{
     AgentRecord, AgentRole, CompleteDelegationInput, DelegationRecord, DispatchRecord,
     DispatchState, EventStore, IdempotencyResolution, InsertAgentRunInput, InsertDelegationInput,
+    WorkRefBindingRecord,
 };
 use crate::work::{
     BindWorkDispatchCommand, BindWorkRootCommand, CreateWorkNodeInput, WorkNodeKind,
@@ -369,7 +370,7 @@ impl<'a> OrchestratorRunner<'a> {
             denied_paths: Vec::new(),
         };
         if should_execute {
-            let baseline = WorkspaceMutationBaseline::capture(self.workspace)?;
+            let baseline = WorkspaceMutationBaseline::capture(self.workspace, self.event_store)?;
             self.event_store.insert_agent_run(&InsertAgentRunInput {
                 run_id: run_id.clone(),
                 agent_id: orchestrator.agent_id.clone(),
@@ -1389,12 +1390,14 @@ fn write_executable_script(path: &Path, content: &str) -> Result<()> {
 
 struct WorkspaceMutationBaseline {
     files: BTreeMap<String, String>,
+    work_ref_binding_keys: BTreeSet<String>,
 }
 
 impl WorkspaceMutationBaseline {
-    fn capture(workspace: &Workspace) -> Result<Self> {
+    fn capture(workspace: &Workspace, store: &EventStore) -> Result<Self> {
         Ok(Self {
             files: workspace_file_hashes(workspace)?,
+            work_ref_binding_keys: work_ref_binding_keys(store)?,
         })
     }
 }
@@ -1416,7 +1419,8 @@ fn audit_workspace_mutation(
             changed.insert(path.clone());
         }
     }
-    let allowed = allowed_workspace_mutation_paths(workspace, store)?;
+    let allowed =
+        allowed_workspace_mutation_paths(workspace, store, &baseline.work_ref_binding_keys)?;
     let denied = changed
         .iter()
         .filter(|path| !allowed.contains(*path))
@@ -1462,12 +1466,16 @@ fn is_audit_ignored(path: &Path, root: &Path) -> bool {
 fn allowed_workspace_mutation_paths(
     workspace: &Workspace,
     store: &EventStore,
+    baseline_ref_keys: &BTreeSet<String>,
 ) -> Result<BTreeSet<String>> {
     let mut allowed = BTreeSet::new();
     if !store.has_work_schema()? {
         return Ok(allowed);
     }
     for binding in store.list_work_ref_bindings()? {
+        if baseline_ref_keys.contains(&work_ref_binding_key(&binding)) {
+            continue;
+        }
         if let Some(artifact_ref) = binding.artifact_ref {
             if let Some(path) = artifact_ref.strip_prefix("file:") {
                 allowed.insert(path.trim_start_matches("./").to_string());
@@ -1484,6 +1492,30 @@ fn allowed_workspace_mutation_paths(
         }
     }
     Ok(allowed)
+}
+
+fn work_ref_binding_keys(store: &EventStore) -> Result<BTreeSet<String>> {
+    if !store.has_work_schema()? {
+        return Ok(BTreeSet::new());
+    }
+    Ok(store
+        .list_work_ref_bindings()?
+        .iter()
+        .map(work_ref_binding_key)
+        .collect::<BTreeSet<_>>())
+}
+
+fn work_ref_binding_key(binding: &WorkRefBindingRecord) -> String {
+    format!(
+        "{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}",
+        binding.work_node_id,
+        binding.dispatch_id,
+        binding.fact_event_id,
+        binding.snapshot_id.as_deref().unwrap_or(""),
+        binding.artifact_ref.as_deref().unwrap_or(""),
+        binding.workspace_ref.as_deref().unwrap_or(""),
+        binding.diff_ref.as_deref().unwrap_or("")
+    )
 }
 
 fn apply_common_env(command: &mut Command, input: &RunnerProcessInput<'_>) {
