@@ -826,7 +826,15 @@ pub fn install_codex_hook(workspace: &Workspace) -> Result<TraceInstallProtocol>
     let script_dir = workspace.debug_dir().join("adapters");
     fs::create_dir_all(&script_dir)?;
     let script_path = script_dir.join("codex-rive-trace-hook.sh");
-    let content = "#!/bin/sh\n# RIVE-MANAGED-CODEX-TRACE-HOOK\nrive debug trace ingest --adapter codex-hook --stdin >/dev/null 2>/dev/null || true\nexit 0\n";
+    let content = r#"#!/bin/sh
+# RIVE-MANAGED-CODEX-TRACE-HOOK
+args="debug trace ingest --adapter codex-hook --stdin"
+if [ -n "${RIVE_AGENT_ID:-}" ]; then args="$args --agent $RIVE_AGENT_ID"; fi
+if [ -n "${RIVE_RUN_ID:-}" ]; then args="$args --run $RIVE_RUN_ID"; fi
+if [ -n "${RIVE_DISPATCH_ID:-}" ]; then args="$args --dispatch $RIVE_DISPATCH_ID"; fi
+rive $args >/dev/null 2>/dev/null || true
+exit 0
+"#;
     let script_status = write_managed_file(&script_path, content, "RIVE-MANAGED-CODEX-TRACE-HOOK")?;
     #[cfg(unix)]
     {

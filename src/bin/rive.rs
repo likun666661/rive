@@ -14,7 +14,7 @@ use rive::dispatch::{
 };
 use rive::facts::{protocol_from_fact, FactDisplay, FactListDisplay, FactListProtocol};
 use rive::output::{Envelope, ErrorEnvelope};
-use rive::runner::{OpenCodeRunner, OpenCodeRunnerInput};
+use rive::runner::{CodexRunner, CodexRunnerInput, OpenCodeRunner, OpenCodeRunnerInput};
 use rive::snapshot::{
     read_manifest, CaptureDisplay, CaptureOptions, CaptureProtocol, LocalFsEvidenceWorkspace,
     LocalSnapshotStore, SnapshotCapture, SnapshotListDisplay, SnapshotListProtocol,
@@ -206,6 +206,26 @@ enum RunnerCommands {
         timeout_seconds: u64,
         #[arg(long = "snapshot-path")]
         snapshot_paths: Vec<PathBuf>,
+        #[arg(long)]
+        stdin: bool,
+    },
+    Codex {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long = "command-id")]
+        command_id: String,
+        #[arg(long = "agent-token")]
+        agent_token: Option<String>,
+        #[arg(long = "codex-bin")]
+        codex_bin: Option<PathBuf>,
+        #[arg(long = "timeout-seconds", default_value_t = 300)]
+        timeout_seconds: u64,
+        #[arg(long = "snapshot-path")]
+        snapshot_paths: Vec<PathBuf>,
+        #[arg(long = "trust-project")]
+        trust_project: bool,
         #[arg(long)]
         stdin: bool,
     },
@@ -688,6 +708,52 @@ fn run() -> Result<()> {
                 });
                 print_json(&Envelope::new(protocol, display))
             }
+            RunnerCommands::Codex {
+                agent,
+                title,
+                command_id,
+                agent_token,
+                codex_bin,
+                timeout_seconds,
+                snapshot_paths,
+                trust_project,
+                stdin,
+            } => {
+                if !stdin {
+                    return Err(anyhow!("runner codex requires --stdin"));
+                }
+                let workspace = find_workspace(&std::env::current_dir()?)
+                    .map_err(|_| anyhow!("workspace not initialized"))?;
+                let store = EventStore::open(&workspace.db_path())?;
+                store.init_schema()?;
+                let trace_store = DebugTraceStore::open(&workspace.db_path())?;
+                trace_store.init_schema()?;
+                let snapshot_store = LocalSnapshotStore::new(&workspace);
+                let runner = CodexRunner::new(&workspace, &store, &trace_store, &snapshot_store);
+                let mut task_body = Vec::new();
+                std::io::stdin().read_to_end(&mut task_body)?;
+                let protocol = runner.run(CodexRunnerInput {
+                    agent,
+                    title,
+                    command_id,
+                    agent_token,
+                    codex_bin,
+                    timeout_seconds,
+                    snapshot_paths,
+                    task_body,
+                    trust_project,
+                })?;
+                let display = serde_json::json!({
+                    "summary": format!(
+                        "Codex runner {} ended with dispatch {} {}",
+                        protocol.runner.run_id,
+                        protocol.dispatch.dispatch_id,
+                        protocol.dispatch.state
+                    ),
+                    "trace_note": "Debug trace is for Rive diagnostics only; dispatch success is based on ledger projection.",
+                });
+                print_json(&Envelope::new(protocol, display))
+            }
         },
     }
 }
@@ -712,10 +778,16 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
         ("runner_agent_role_invalid", "fix_arguments")
     } else if lower.contains("opencode not found") {
         ("opencode_not_found", "fix_installation")
+    } else if lower.contains("codex not found") {
+        ("codex_not_found", "fix_installation")
     } else if lower.contains("opencode timeout") {
         ("opencode_timeout", "inspect_projection")
+    } else if lower.contains("codex timeout") {
+        ("codex_timeout", "inspect_projection")
     } else if lower.contains("opencode exit failed") {
         ("opencode_exit_failed", "inspect_projection")
+    } else if lower.contains("codex exit failed") {
+        ("codex_exit_failed", "inspect_projection")
     } else if lower.contains("dispatch not reported") {
         ("dispatch_not_reported", "inspect_projection")
     } else if lower.contains("invalid trace payload json") {
