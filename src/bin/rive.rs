@@ -18,7 +18,7 @@ use rive::facts::{protocol_from_fact, FactDisplay, FactListDisplay, FactListProt
 use rive::output::{Envelope, ErrorEnvelope};
 use rive::runner::{
     CodexRunner, CodexRunnerInput, OpenCodeRunner, OpenCodeRunnerInput, OrchestratorRunner,
-    OrchestratorRunnerInput,
+    OrchestratorRunnerInput, SchedulerRunInput, SchedulerService,
 };
 use rive::snapshot::{
     read_manifest, CaptureDisplay, CaptureOptions, CaptureProtocol, LocalFsEvidenceWorkspace,
@@ -77,6 +77,10 @@ enum Commands {
     Runner {
         #[command(subcommand)]
         command: RunnerCommands,
+    },
+    Scheduler {
+        #[command(subcommand)]
+        command: SchedulerCommands,
     },
 }
 
@@ -340,6 +344,28 @@ enum RunnerCommands {
         trust_project: bool,
         #[arg(long)]
         stdin: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SchedulerCommands {
+    Run {
+        #[arg(long = "root")]
+        root_work_node_id: String,
+        #[arg(long)]
+        runner: String,
+        #[arg(long = "worker")]
+        workers: Vec<String>,
+        #[arg(long = "command-id")]
+        command_id: String,
+        #[arg(long = "max-parallel", default_value_t = 1)]
+        max_parallel: usize,
+        #[arg(long = "acceptance-mode", default_value = "manual")]
+        acceptance_mode: String,
+        #[arg(long = "opencode-bin")]
+        opencode_bin: Option<PathBuf>,
+        #[arg(long = "timeout-seconds", default_value_t = 300)]
+        timeout_seconds: u64,
     },
 }
 
@@ -1134,6 +1160,49 @@ fn run() -> Result<()> {
                 print_json(&Envelope::new(protocol, display))
             }
         },
+        Commands::Scheduler { command } => match command {
+            SchedulerCommands::Run {
+                root_work_node_id,
+                runner,
+                workers,
+                command_id,
+                max_parallel,
+                acceptance_mode,
+                opencode_bin,
+                timeout_seconds,
+            } => {
+                let workspace = find_workspace(&std::env::current_dir()?)
+                    .map_err(|_| anyhow!("workspace not initialized"))?;
+                let store = EventStore::open(&workspace.db_path())?;
+                store.init_schema()?;
+                let trace_store = DebugTraceStore::open(&workspace.db_path())?;
+                trace_store.init_schema()?;
+                let snapshot_store = LocalSnapshotStore::new(&workspace);
+                let scheduler =
+                    SchedulerService::new(&workspace, &store, &trace_store, &snapshot_store);
+                let protocol = scheduler.run(SchedulerRunInput {
+                    root_work_node_id,
+                    runner,
+                    workers,
+                    command_id,
+                    max_parallel,
+                    acceptance_mode,
+                    opencode_bin,
+                    timeout_seconds,
+                })?;
+                let display = serde_json::json!({
+                    "summary": format!(
+                        "Scheduler {} ended {} with root {} {}",
+                        protocol.scheduler.scheduler_run_id,
+                        protocol.scheduler.state,
+                        protocol.scheduler.root_work_node_id,
+                        protocol.root_work.state
+                    ),
+                    "trace_note": "Debug trace is for Rive diagnostics only; scheduler success is based on Work DAG projection.",
+                });
+                print_json(&Envelope::new(protocol, display))
+            }
+        },
     }
 }
 
@@ -1163,6 +1232,18 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
         ("orchestrator_worker_required", "fix_arguments")
     } else if lower.contains("orchestrator objective is required") {
         ("orchestrator_objective_required", "fix_arguments")
+    } else if lower.contains("scheduler worker is required") {
+        ("scheduler_worker_required", "fix_arguments")
+    } else if lower.contains("scheduler runner not supported") {
+        ("scheduler_runner_not_supported", "fix_arguments")
+    } else if lower.contains("scheduler max parallel") {
+        ("scheduler_max_parallel_invalid", "fix_arguments")
+    } else if lower.contains("invalid acceptance mode") {
+        ("invalid_acceptance_mode", "fix_arguments")
+    } else if lower.contains("work node already claimed") {
+        ("work_node_already_claimed", "inspect_projection")
+    } else if lower.contains("work scheduler stalled") {
+        ("work_scheduler_stalled", "inspect_projection")
     } else if lower.contains("work not done") {
         ("work_not_done", "inspect_projection")
     } else if lower.contains("work graph not closed") {

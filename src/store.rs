@@ -288,6 +288,33 @@ pub struct WorkNoteRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerRunRecord {
+    pub scheduler_run_id: String,
+    pub command_id: String,
+    pub root_work_node_id: String,
+    pub runner: String,
+    pub max_parallel: i64,
+    pub acceptance_mode: String,
+    pub request_hash: String,
+    pub state: String,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerNodeRunRecord {
+    pub node_run_id: String,
+    pub scheduler_run_id: String,
+    pub work_node_id: String,
+    pub dispatch_id: Option<String>,
+    pub worker_agent_id: String,
+    pub worker_run_id: Option<String>,
+    pub state: String,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct InsertWorkNodeInput {
     pub event: EventRecord,
@@ -297,6 +324,44 @@ pub struct InsertWorkNodeInput {
     pub title: String,
     pub body_hash: Option<String>,
     pub body_blob_ref: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertSchedulerRunInput {
+    pub scheduler_run_id: String,
+    pub command_id: String,
+    pub root_work_node_id: String,
+    pub runner: String,
+    pub max_parallel: i64,
+    pub acceptance_mode: String,
+    pub request_hash: String,
+    pub state: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateSchedulerRunStateInput {
+    pub scheduler_run_id: String,
+    pub state: String,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertSchedulerNodeRunInput {
+    pub node_run_id: String,
+    pub scheduler_run_id: String,
+    pub work_node_id: String,
+    pub worker_agent_id: String,
+    pub started_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateSchedulerNodeRunInput {
+    pub node_run_id: String,
+    pub dispatch_id: Option<String>,
+    pub worker_run_id: Option<String>,
+    pub state: String,
+    pub completed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -562,6 +627,38 @@ impl EventStore {
             );
             CREATE INDEX IF NOT EXISTS idx_work_notes_node
               ON work_notes(work_node_id, created_at);
+            CREATE TABLE IF NOT EXISTS scheduler_runs (
+              scheduler_run_id TEXT PRIMARY KEY,
+              command_id TEXT NOT NULL UNIQUE,
+              root_work_node_id TEXT NOT NULL,
+              runner TEXT NOT NULL,
+              max_parallel INTEGER NOT NULL,
+              acceptance_mode TEXT NOT NULL,
+              request_hash TEXT NOT NULL,
+              state TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              completed_at TEXT,
+              FOREIGN KEY(root_work_node_id) REFERENCES work_nodes(work_node_id)
+            );
+            CREATE TABLE IF NOT EXISTS scheduler_node_runs (
+              node_run_id TEXT PRIMARY KEY,
+              scheduler_run_id TEXT NOT NULL,
+              work_node_id TEXT NOT NULL,
+              dispatch_id TEXT,
+              worker_agent_id TEXT NOT NULL,
+              worker_run_id TEXT,
+              state TEXT NOT NULL,
+              started_at TEXT NOT NULL,
+              completed_at TEXT,
+              FOREIGN KEY(scheduler_run_id) REFERENCES scheduler_runs(scheduler_run_id),
+              FOREIGN KEY(work_node_id) REFERENCES work_nodes(work_node_id),
+              FOREIGN KEY(dispatch_id) REFERENCES dispatches(dispatch_id),
+              FOREIGN KEY(worker_agent_id) REFERENCES agents(agent_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_scheduler_node_runs_work_state
+              ON scheduler_node_runs(work_node_id, state);
+            CREATE INDEX IF NOT EXISTS idx_scheduler_node_runs_scheduler
+              ON scheduler_node_runs(scheduler_run_id);
             "#,
         )?;
         Ok(())
@@ -1856,6 +1953,217 @@ impl EventStore {
         }
         Ok(notes)
     }
+
+    pub fn insert_scheduler_run_idempotent(
+        &self,
+        input: &InsertSchedulerRunInput,
+    ) -> Result<IdempotencyResolution<SchedulerRunRecord>> {
+        if let Some(existing) = self.get_scheduler_run_by_command_id(&input.command_id)? {
+            if existing.root_work_node_id == input.root_work_node_id
+                && existing.runner == input.runner
+                && existing.max_parallel == input.max_parallel
+                && existing.acceptance_mode == input.acceptance_mode
+                && existing.request_hash == input.request_hash
+            {
+                return Ok(IdempotencyResolution::Replayed(existing));
+            }
+            return Ok(IdempotencyResolution::Conflict(existing));
+        }
+        self.conn.execute(
+            r#"
+            INSERT INTO scheduler_runs (
+              scheduler_run_id, command_id, root_work_node_id, runner, max_parallel,
+              acceptance_mode, request_hash, state, created_at, completed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)
+            "#,
+            params![
+                input.scheduler_run_id,
+                input.command_id,
+                input.root_work_node_id,
+                input.runner,
+                input.max_parallel,
+                input.acceptance_mode,
+                input.request_hash,
+                input.state,
+                input.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(IdempotencyResolution::Inserted(
+            self.get_scheduler_run(&input.scheduler_run_id)?
+                .expect("inserted scheduler run should be readable"),
+        ))
+    }
+
+    pub fn get_scheduler_run(&self, scheduler_run_id: &str) -> Result<Option<SchedulerRunRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT scheduler_run_id, command_id, root_work_node_id, runner, max_parallel,
+                   acceptance_mode, request_hash, state, created_at, completed_at
+            FROM scheduler_runs
+            WHERE scheduler_run_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![scheduler_run_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_scheduler_run(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_scheduler_run_by_command_id(
+        &self,
+        command_id: &str,
+    ) -> Result<Option<SchedulerRunRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT scheduler_run_id, command_id, root_work_node_id, runner, max_parallel,
+                   acceptance_mode, request_hash, state, created_at, completed_at
+            FROM scheduler_runs
+            WHERE command_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![command_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_scheduler_run(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn update_scheduler_run_state(
+        &self,
+        input: &UpdateSchedulerRunStateInput,
+    ) -> Result<SchedulerRunRecord> {
+        self.conn.execute(
+            r#"
+            UPDATE scheduler_runs
+            SET state = ?1, completed_at = ?2
+            WHERE scheduler_run_id = ?3
+            "#,
+            params![
+                input.state,
+                input.completed_at.map(|time| time.to_rfc3339()),
+                input.scheduler_run_id,
+            ],
+        )?;
+        self.get_scheduler_run(&input.scheduler_run_id)?
+            .ok_or_else(|| anyhow::anyhow!("scheduler run not found: {}", input.scheduler_run_id))
+    }
+
+    pub fn insert_scheduler_node_run_claim(
+        &self,
+        input: &InsertSchedulerNodeRunInput,
+    ) -> Result<SchedulerNodeRunRecord> {
+        if self
+            .list_active_scheduler_node_runs_for_work_node(&input.work_node_id)?
+            .iter()
+            .any(|run| run.scheduler_run_id != input.scheduler_run_id)
+        {
+            anyhow::bail!("work node already claimed: {}", input.work_node_id);
+        }
+        self.conn.execute(
+            r#"
+            INSERT INTO scheduler_node_runs (
+              node_run_id, scheduler_run_id, work_node_id, dispatch_id, worker_agent_id,
+              worker_run_id, state, started_at, completed_at
+            ) VALUES (?1, ?2, ?3, NULL, ?4, NULL, 'claimed', ?5, NULL)
+            "#,
+            params![
+                input.node_run_id,
+                input.scheduler_run_id,
+                input.work_node_id,
+                input.worker_agent_id,
+                input.started_at.to_rfc3339(),
+            ],
+        )?;
+        self.get_scheduler_node_run(&input.node_run_id)?
+            .ok_or_else(|| anyhow::anyhow!("scheduler node run not found: {}", input.node_run_id))
+    }
+
+    pub fn update_scheduler_node_run(
+        &self,
+        input: &UpdateSchedulerNodeRunInput,
+    ) -> Result<SchedulerNodeRunRecord> {
+        self.conn.execute(
+            r#"
+            UPDATE scheduler_node_runs
+            SET dispatch_id = ?1, worker_run_id = ?2, state = ?3, completed_at = ?4
+            WHERE node_run_id = ?5
+            "#,
+            params![
+                input.dispatch_id,
+                input.worker_run_id,
+                input.state,
+                input.completed_at.map(|time| time.to_rfc3339()),
+                input.node_run_id,
+            ],
+        )?;
+        self.get_scheduler_node_run(&input.node_run_id)?
+            .ok_or_else(|| anyhow::anyhow!("scheduler node run not found: {}", input.node_run_id))
+    }
+
+    pub fn get_scheduler_node_run(
+        &self,
+        node_run_id: &str,
+    ) -> Result<Option<SchedulerNodeRunRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT node_run_id, scheduler_run_id, work_node_id, dispatch_id, worker_agent_id,
+                   worker_run_id, state, started_at, completed_at
+            FROM scheduler_node_runs
+            WHERE node_run_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![node_run_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_scheduler_node_run(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_scheduler_node_runs_for_scheduler(
+        &self,
+        scheduler_run_id: &str,
+    ) -> Result<Vec<SchedulerNodeRunRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT node_run_id, scheduler_run_id, work_node_id, dispatch_id, worker_agent_id,
+                   worker_run_id, state, started_at, completed_at
+            FROM scheduler_node_runs
+            WHERE scheduler_run_id = ?1
+            ORDER BY started_at ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![scheduler_run_id], row_to_scheduler_node_run)?;
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(row?);
+        }
+        Ok(runs)
+    }
+
+    pub fn list_active_scheduler_node_runs_for_work_node(
+        &self,
+        work_node_id: &str,
+    ) -> Result<Vec<SchedulerNodeRunRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT node_run_id, scheduler_run_id, work_node_id, dispatch_id, worker_agent_id,
+                   worker_run_id, state, started_at, completed_at
+            FROM scheduler_node_runs
+            WHERE work_node_id = ?1 AND state IN ('claimed', 'running')
+            ORDER BY started_at ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![work_node_id], row_to_scheduler_node_run)?;
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(row?);
+        }
+        Ok(runs)
+    }
 }
 
 fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotRecord> {
@@ -2083,6 +2391,45 @@ fn row_to_work_note(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkNoteRecord>
         actor_agent_id: row.get(7)?,
         actor_run_id: row.get(8)?,
         created_at: parse_time_for_sql(&created_at)?,
+    })
+}
+
+fn row_to_scheduler_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SchedulerRunRecord> {
+    let created_at: String = row.get(8)?;
+    let completed_at: Option<String> = row.get(9)?;
+    Ok(SchedulerRunRecord {
+        scheduler_run_id: row.get(0)?,
+        command_id: row.get(1)?,
+        root_work_node_id: row.get(2)?,
+        runner: row.get(3)?,
+        max_parallel: row.get(4)?,
+        acceptance_mode: row.get(5)?,
+        request_hash: row.get(6)?,
+        state: row.get(7)?,
+        created_at: parse_time_for_sql(&created_at)?,
+        completed_at: completed_at
+            .as_deref()
+            .map(parse_time_for_sql)
+            .transpose()?,
+    })
+}
+
+fn row_to_scheduler_node_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SchedulerNodeRunRecord> {
+    let started_at: String = row.get(7)?;
+    let completed_at: Option<String> = row.get(8)?;
+    Ok(SchedulerNodeRunRecord {
+        node_run_id: row.get(0)?,
+        scheduler_run_id: row.get(1)?,
+        work_node_id: row.get(2)?,
+        dispatch_id: row.get(3)?,
+        worker_agent_id: row.get(4)?,
+        worker_run_id: row.get(5)?,
+        state: row.get(6)?,
+        started_at: parse_time_for_sql(&started_at)?,
+        completed_at: completed_at
+            .as_deref()
+            .map(parse_time_for_sql)
+            .transpose()?,
     })
 }
 
