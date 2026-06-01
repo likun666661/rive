@@ -101,7 +101,7 @@ fn write_happy_opencode(path: &Path) {
             r#"#!/bin/sh
 set -eu
 if [ -n "${{RIVE_ORCHESTRATOR_ROOT_WORK_ID:-}}" ]; then
-  COUNT_FILE="$RIVE_WORKSPACE/phase9-orchestrator-count.txt"
+  COUNT_FILE="$RIVE_WORKSPACE/.rive/phase9-orchestrator-count.txt"
   if [ -f "$COUNT_FILE" ]; then COUNT=$(cat "$COUNT_FILE"); else COUNT=0; fi
   COUNT=$((COUNT + 1))
   printf '%s\n' "$COUNT" > "$COUNT_FILE"
@@ -262,7 +262,7 @@ fn orchestrator_runner_replay_does_not_relaunch_opencode() {
     assert_eq!(second["protocol"]["root_work"]["state"], "done");
     assert_eq!(second["protocol"]["runner"]["child_executed"], false);
     assert_eq!(
-        fs::read_to_string(temp.path().join("phase9-orchestrator-count.txt")).unwrap(),
+        fs::read_to_string(temp.path().join(".rive/phase9-orchestrator-count.txt")).unwrap(),
         "1\n"
     );
 }

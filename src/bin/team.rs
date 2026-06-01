@@ -16,8 +16,9 @@ use rive::runner::{TeamSendInput, TeamSendService};
 use rive::snapshot::LocalSnapshotStore;
 use rive::store::{AgentRecord, AgentRole, EventStore};
 use rive::work::{
-    work_edge_protocol, work_node_protocol, AddWorkEdgeInput, BindWorkRefsCommand,
-    CreateWorkNodeInput, WorkEdgeType, WorkNodeKind, WorkService, WorkStatusInput,
+    work_edge_protocol, work_node_protocol, work_note_protocol, AddWorkEdgeInput,
+    BindWorkRefsCommand, BindWorkRootCommand, CreateWorkNodeInput, RecordWorkNoteInput,
+    WorkEdgeType, WorkNodeKind, WorkNoteKind, WorkService, WorkStatusInput,
 };
 use rive::workspace::find_workspace;
 use serde::Serialize;
@@ -130,6 +131,10 @@ enum WorkCommands {
         #[command(subcommand)]
         command: WorkEdgeCommands,
     },
+    Graph {
+        #[command(subcommand)]
+        command: WorkGraphCommands,
+    },
     List,
     Show {
         work_node_id: String,
@@ -151,6 +156,15 @@ enum WorkCommands {
         #[arg(long)]
         stdin: bool,
     },
+    Note {
+        work_node_id: String,
+        #[arg(long = "kind")]
+        note_kind: String,
+        #[arg(long = "command-id")]
+        command_id: String,
+        #[arg(long)]
+        stdin: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -164,6 +178,14 @@ enum WorkEdgeCommands {
         to_node_id: String,
         #[arg(long = "command-id")]
         command_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkGraphCommands {
+    Inspect {
+        #[arg(long = "root")]
+        root_work_node_id: String,
     },
 }
 
@@ -309,6 +331,7 @@ fn handle_work(command: WorkCommands) -> Result<()> {
                 title,
                 body,
             })?;
+            bind_orchestrator_root_scope(&service, &agent, &node.work_node_id)?;
             let projection = service.inspect_projection(&node.work_node_id)?;
             let protocol = serde_json::json!({
                 "node": work_node_protocol(&node, service.graph_version()?, idempotency_status),
@@ -340,6 +363,23 @@ fn handle_work(command: WorkCommands) -> Result<()> {
                 let protocol = work_edge_protocol(&edge, idempotency_status);
                 let display = serde_json::json!({
                     "summary": format!("Created work edge {}", protocol.work_edge_id),
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&Envelope::new(protocol, display))?
+                );
+                Ok(())
+            }
+        },
+        WorkCommands::Graph { command } => match command {
+            WorkGraphCommands::Inspect { root_work_node_id } => {
+                let protocol = service.inspect_graph(&root_work_node_id)?;
+                let display = serde_json::json!({
+                    "summary": format!(
+                        "Work graph {} hygiene {}",
+                        protocol.root_work_node_id,
+                        protocol.hygiene_state
+                    ),
                 });
                 println!(
                     "{}",
@@ -440,7 +480,58 @@ fn handle_work(command: WorkCommands) -> Result<()> {
             );
             Ok(())
         }
+        WorkCommands::Note {
+            work_node_id,
+            note_kind,
+            command_id,
+            stdin,
+        } => {
+            require_orchestrator(&agent)?;
+            if !stdin {
+                return Err(anyhow!("team work note requires --stdin"));
+            }
+            let mut body = Vec::new();
+            std::io::stdin().read_to_end(&mut body)?;
+            let (note, idempotency_status) = service.record_note(RecordWorkNoteInput {
+                command_id,
+                work_node_id,
+                note_kind: WorkNoteKind::parse(&note_kind)?,
+                body,
+                actor_agent_id: agent.agent_id,
+                actor_run_id: actor.run_id,
+            })?;
+            let protocol = work_note_protocol(&note, idempotency_status);
+            let display = serde_json::json!({
+                "summary": format!("Recorded {} note for {}", protocol.note_kind, protocol.work_node_id),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&Envelope::new(protocol, display))?
+            );
+            Ok(())
+        }
     }
+}
+
+fn bind_orchestrator_root_scope(
+    service: &WorkService<'_, LocalSnapshotStore<'_>>,
+    agent: &AgentRecord,
+    work_node_id: &str,
+) -> Result<()> {
+    let Some(root_work_node_id) = std::env::var("RIVE_ORCHESTRATOR_ROOT_WORK_ID")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    service.bind_root(BindWorkRootCommand {
+        root_work_node_id,
+        work_node_id: work_node_id.to_string(),
+        created_by_agent_id: Some(agent.agent_id.clone()),
+        created_by_run_id: std::env::var("RIVE_RUN_ID")
+            .ok()
+            .filter(|value| !value.is_empty()),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -756,6 +847,10 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
         ("work_node_not_reviewable", false, "inspect_projection")
     } else if lower.contains("work node not found") {
         ("work_node_not_found", false, "fix_arguments")
+    } else if lower.contains("work graph not closed") {
+        ("work_graph_not_closed", false, "inspect_projection")
+    } else if lower.contains("invalid work note kind") {
+        ("invalid_work_note_kind", false, "fix_arguments")
     } else if lower.contains("dispatch already bound to work node") {
         (
             "work_dispatch_binding_conflict",

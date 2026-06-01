@@ -1,11 +1,13 @@
+use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use rive::debug_trace::{
-    install_codex_hook, install_opencode_plugin, uninstall_managed, DebugTraceStore,
-    IngestTraceInput, TraceAdapter, TraceListFilter, TraceListProtocol,
+    install_codex_hook, install_opencode_plugin, uninstall_managed, usage_for_workspace,
+    DebugTraceStore, IngestTraceInput, TraceAdapter, TraceListFilter, TraceListProtocol,
+    TraceUsageFilter,
 };
 use rive::dispatch::{
     agent_protocol, dispatch_protocol, AddAgentInput, AddAgentProtocol, AgentListProtocol,
@@ -165,6 +167,10 @@ enum WorkCommands {
         #[command(subcommand)]
         command: WorkEdgeCommands,
     },
+    Graph {
+        #[command(subcommand)]
+        command: WorkGraphCommands,
+    },
     List,
     Show {
         work_node_id: String,
@@ -199,6 +205,14 @@ enum WorkEdgeCommands {
         to_node_id: String,
         #[arg(long = "command-id")]
         command_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkGraphCommands {
+    Inspect {
+        #[arg(long = "root")]
+        root_work_node_id: String,
     },
 }
 
@@ -242,6 +256,18 @@ enum DebugTraceCommands {
     },
     Export {
         trace_session_id: String,
+    },
+    Usage {
+        #[arg(long)]
+        run: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        dispatch: Option<String>,
+        #[arg(long = "work")]
+        work_node_id: Option<String>,
+        #[arg(long = "root")]
+        root_work_node_id: Option<String>,
     },
     Install {
         target: String,
@@ -706,6 +732,19 @@ fn run() -> Result<()> {
                         print_json(&Envelope::new(protocol, display))
                     }
                 },
+                WorkCommands::Graph { command } => match command {
+                    WorkGraphCommands::Inspect { root_work_node_id } => {
+                        let protocol = service.inspect_graph(&root_work_node_id)?;
+                        let display = serde_json::json!({
+                            "summary": format!(
+                                "Work graph {} hygiene {}",
+                                protocol.root_work_node_id,
+                                protocol.hygiene_state
+                            ),
+                        });
+                        print_json(&Envelope::new(protocol, display))
+                    }
+                },
                 WorkCommands::List => {
                     let protocol = service.list_nodes()?;
                     let display = serde_json::json!({
@@ -858,6 +897,66 @@ fn run() -> Result<()> {
                             protocol.session.trace_session_id,
                             protocol.events.len()
                         ),
+                    });
+                    print_json(&Envelope::new(protocol, display))
+                }
+                DebugTraceCommands::Usage {
+                    run,
+                    agent,
+                    dispatch,
+                    work_node_id,
+                    root_work_node_id,
+                } => {
+                    let workspace = find_workspace(&std::env::current_dir()?)?;
+                    let trace_store = DebugTraceStore::open(&workspace.db_path())?;
+                    let store = EventStore::open(&workspace.db_path())?;
+                    store.init_schema()?;
+                    let snapshot_store = LocalSnapshotStore::new(&workspace);
+                    let work_service = WorkService::new(&workspace, &store, &snapshot_store);
+                    let dispatch = if let Some(work_node_id) = work_node_id {
+                        store
+                            .list_work_dispatch_bindings()?
+                            .into_iter()
+                            .find(|binding| binding.work_node_id == work_node_id)
+                            .map(|binding| binding.dispatch_id)
+                            .or(dispatch)
+                    } else {
+                        dispatch
+                    };
+                    let mut correlated_run_ids = BTreeSet::new();
+                    let mut correlated_dispatch_ids = BTreeSet::new();
+                    if let Some(root_work_node_id) = root_work_node_id {
+                        let graph = work_service.inspect_graph(&root_work_node_id)?;
+                        let scoped_nodes = graph.scoped_nodes.into_iter().collect::<BTreeSet<_>>();
+                        for binding in store.list_work_root_bindings_for_root(&root_work_node_id)? {
+                            if let Some(run_id) = binding.created_by_run_id {
+                                correlated_run_ids.insert(run_id);
+                            }
+                        }
+                        for binding in store.list_work_dispatch_bindings()? {
+                            if scoped_nodes.contains(&binding.work_node_id) {
+                                correlated_dispatch_ids.insert(binding.dispatch_id);
+                            }
+                        }
+                    }
+                    let protocol = usage_for_workspace(
+                        &workspace,
+                        &trace_store,
+                        TraceUsageFilter {
+                            run_id: run,
+                            agent_id: agent,
+                            dispatch_id: dispatch,
+                            correlated_run_ids,
+                            correlated_dispatch_ids,
+                        },
+                    )?;
+                    let display = serde_json::json!({
+                        "summary": format!(
+                            "{} runs, {} total tokens",
+                            protocol.runs.len(),
+                            protocol.totals.total_tokens
+                        ),
+                        "debug_note": "Usage is a debug read model only and does not affect Rive protocol state.",
                     });
                     print_json(&Envelope::new(protocol, display))
                 }
@@ -1066,6 +1165,10 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
         ("orchestrator_objective_required", "fix_arguments")
     } else if lower.contains("work not done") {
         ("work_not_done", "inspect_projection")
+    } else if lower.contains("work graph not closed") {
+        ("work_graph_not_closed", "inspect_projection")
+    } else if lower.contains("orchestrator workspace mutation") {
+        ("orchestrator_workspace_mutation", "inspect_projection")
     } else if lower.contains("opencode not found") {
         ("opencode_not_found", "fix_installation")
     } else if lower.contains("codex not found") {

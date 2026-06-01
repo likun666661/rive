@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,6 +12,7 @@ use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+use walkdir::WalkDir;
 
 use crate::debug_trace::{
     install_codex_hook, install_opencode_plugin, DebugTraceStore, TraceListFilter,
@@ -26,7 +27,8 @@ use crate::store::{
     DispatchState, EventStore, IdempotencyResolution, InsertAgentRunInput, InsertDelegationInput,
 };
 use crate::work::{
-    BindWorkDispatchCommand, CreateWorkNodeInput, WorkNodeKind, WorkProjectionProtocol, WorkService,
+    BindWorkDispatchCommand, BindWorkRootCommand, CreateWorkNodeInput, WorkNodeKind,
+    WorkProjectionProtocol, WorkService,
 };
 use crate::workspace::Workspace;
 
@@ -194,6 +196,16 @@ pub struct OrchestratorRunnerProtocol {
     pub stderr_ref: String,
     pub child_executed: bool,
     pub idempotency_status: &'static str,
+    pub audit: WorkspaceAuditProtocol,
+    pub usage_summary: Option<crate::debug_trace::TraceUsageTotals>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct WorkspaceAuditProtocol {
+    pub checked: bool,
+    pub changed_paths: Vec<String>,
+    pub allowed_paths: Vec<String>,
+    pub denied_paths: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -321,17 +333,24 @@ impl<'a> OrchestratorRunner<'a> {
             title: format!("orchestrator objective {}", input.command_id),
             body: root_body,
         })?;
-
         let should_execute = root_idempotency == "inserted";
         let run_id = if should_execute {
             prefixed_id("run")
         } else {
             format!("replay-{}", root.work_node_id)
         };
+        work_service.bind_root(BindWorkRootCommand {
+            root_work_node_id: root.work_node_id.clone(),
+            work_node_id: root.work_node_id.clone(),
+            created_by_agent_id: Some(orchestrator.agent_id.clone()),
+            created_by_run_id: Some(run_id.clone()),
+        })?;
         let run_dir = self.workspace.debug_runs_dir().join(&run_id);
         fs::create_dir_all(&run_dir)?;
         let stdout_path = run_dir.join("stdout.jsonl");
         let stderr_path = run_dir.join("stderr.log");
+        let planner_bin = run_dir.join("planner-bin");
+        prepare_planner_bin(&planner_bin)?;
         let binary = OpenCodeAdapter.resolve_binary(input.opencode_bin.as_deref())?;
         let prompt = build_orchestrator_prompt(
             self.workspace,
@@ -343,7 +362,14 @@ impl<'a> OrchestratorRunner<'a> {
         fs::write(run_dir.join("prompt.txt"), &prompt)?;
 
         let mut exit_code = None;
+        let mut audit = WorkspaceAuditProtocol {
+            checked: false,
+            changed_paths: Vec::new(),
+            allowed_paths: Vec::new(),
+            denied_paths: Vec::new(),
+        };
         if should_execute {
+            let baseline = WorkspaceMutationBaseline::capture(self.workspace)?;
             self.event_store.insert_agent_run(&InsertAgentRunInput {
                 run_id: run_id.clone(),
                 agent_id: orchestrator.agent_id.clone(),
@@ -360,12 +386,15 @@ impl<'a> OrchestratorRunner<'a> {
                 .arg(&prompt);
             apply_orchestrator_env(
                 &mut command,
-                self.workspace,
-                &orchestrator,
-                &token,
-                &run_id,
-                &root.work_node_id,
-                &workers,
+                OrchestratorEnvInput {
+                    workspace: self.workspace,
+                    agent: &orchestrator,
+                    token: &token,
+                    run_id: &run_id,
+                    root_work_node_id: &root.work_node_id,
+                    workers: &workers,
+                    planner_bin: &planner_bin,
+                },
             );
             let output = run_child_process(&mut command, input.timeout_seconds)?;
             exit_code = output.exit_code;
@@ -377,11 +406,22 @@ impl<'a> OrchestratorRunner<'a> {
             if output.exit_code.unwrap_or(1) != 0 {
                 return Err(anyhow!("opencode exit failed: {:?}", output.exit_code));
             }
+            audit = audit_workspace_mutation(self.workspace, self.event_store, &baseline)?;
+            if !audit.denied_paths.is_empty() {
+                return Err(anyhow!(
+                    "orchestrator workspace mutation: {}",
+                    audit.denied_paths.join(",")
+                ));
+            }
         } else {
             fs::write(&stdout_path, b"")?;
             fs::write(&stderr_path, b"")?;
         }
 
+        let graph = work_service.inspect_graph(&root.work_node_id)?;
+        if graph.hygiene_state != "clean" {
+            return Err(anyhow!("work graph not closed: {}", root.work_node_id));
+        }
         let root_projection = work_service.inspect_projection(&root.work_node_id)?;
         if root_projection.state != "done" {
             return Err(anyhow!(
@@ -391,6 +431,16 @@ impl<'a> OrchestratorRunner<'a> {
             ));
         }
         let trace = self.trace_summary(&run_id)?;
+        let usage_summary = crate::debug_trace::usage_for_workspace(
+            self.workspace,
+            self.trace_store,
+            crate::debug_trace::TraceUsageFilter {
+                run_id: Some(run_id.clone()),
+                ..Default::default()
+            },
+        )
+        .ok()
+        .map(|usage| usage.totals);
         let binary = binary.display().to_string();
         Ok(OrchestratorRunnerResponseProtocol {
             runner: OrchestratorRunnerProtocol {
@@ -406,6 +456,8 @@ impl<'a> OrchestratorRunner<'a> {
                 stderr_ref: path_relative_to(&stderr_path, &self.workspace.root)?,
                 child_executed: should_execute,
                 idempotency_status: root_idempotency,
+                audit,
+                usage_summary,
             },
             agent: agent_protocol(&orchestrator),
             root_work: root_projection,
@@ -1274,16 +1326,179 @@ struct ProcessOutput {
     timed_out: bool,
 }
 
+fn prepare_planner_bin(planner_bin: &Path) -> Result<()> {
+    fs::create_dir_all(planner_bin)?;
+    let bin_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_default();
+    write_executable_script(
+        &planner_bin.join("team"),
+        &format!(
+            "#!/bin/sh\nexec \"{}\" \"$@\"\n",
+            bin_dir.join("team").display()
+        ),
+    )?;
+    write_executable_script(
+        &planner_bin.join("rive"),
+        &format!(
+            "#!/bin/sh\nexec \"{}\" \"$@\"\n",
+            bin_dir.join("rive").display()
+        ),
+    )?;
+    let deny = "#!/bin/sh\necho orchestrator_capability_denied >&2\nexit 126\n";
+    for command in [
+        "python",
+        "python3",
+        "pytest",
+        "cargo",
+        "npm",
+        "node",
+        "apply_patch",
+    ] {
+        write_executable_script(&planner_bin.join(command), deny)?;
+    }
+    write_executable_script(
+        &planner_bin.join("git"),
+        r#"#!/bin/sh
+case "${1:-}" in
+  status|diff|log|show|grep|rev-parse)
+    exec /usr/bin/git "$@"
+    ;;
+  *)
+    echo orchestrator_capability_denied >&2
+    exit 126
+    ;;
+esac
+"#,
+    )?;
+    Ok(())
+}
+
+fn write_executable_script(path: &Path, content: &str) -> Result<()> {
+    fs::write(path, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+struct WorkspaceMutationBaseline {
+    files: BTreeMap<String, String>,
+}
+
+impl WorkspaceMutationBaseline {
+    fn capture(workspace: &Workspace) -> Result<Self> {
+        Ok(Self {
+            files: workspace_file_hashes(workspace)?,
+        })
+    }
+}
+
+fn audit_workspace_mutation(
+    workspace: &Workspace,
+    store: &EventStore,
+    baseline: &WorkspaceMutationBaseline,
+) -> Result<WorkspaceAuditProtocol> {
+    let current = workspace_file_hashes(workspace)?;
+    let mut changed = BTreeSet::new();
+    for (path, hash) in &current {
+        if baseline.files.get(path) != Some(hash) {
+            changed.insert(path.clone());
+        }
+    }
+    for path in baseline.files.keys() {
+        if !current.contains_key(path) {
+            changed.insert(path.clone());
+        }
+    }
+    let allowed = allowed_workspace_mutation_paths(workspace, store)?;
+    let denied = changed
+        .iter()
+        .filter(|path| !allowed.contains(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(WorkspaceAuditProtocol {
+        checked: true,
+        changed_paths: changed.into_iter().collect(),
+        allowed_paths: allowed.into_iter().collect(),
+        denied_paths: denied,
+    })
+}
+
+fn workspace_file_hashes(workspace: &Workspace) -> Result<BTreeMap<String, String>> {
+    let mut files = BTreeMap::new();
+    for entry in WalkDir::new(&workspace.root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !is_audit_ignored(entry.path(), &workspace.root))
+    {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let relative = path_relative_to(path, &workspace.root)?;
+        let bytes = fs::read(path)?;
+        files.insert(relative, format!("sha256:{}", sha256_hex(&bytes)));
+    }
+    Ok(files)
+}
+
+fn is_audit_ignored(path: &Path, root: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return true;
+    };
+    relative.components().next().is_some_and(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        matches!(name.as_ref(), ".rive" | ".opencode" | ".git")
+    })
+}
+
+fn allowed_workspace_mutation_paths(
+    workspace: &Workspace,
+    store: &EventStore,
+) -> Result<BTreeSet<String>> {
+    let mut allowed = BTreeSet::new();
+    if !store.has_work_schema()? {
+        return Ok(allowed);
+    }
+    for binding in store.list_work_ref_bindings()? {
+        if let Some(artifact_ref) = binding.artifact_ref {
+            if let Some(path) = artifact_ref.strip_prefix("file:") {
+                allowed.insert(path.trim_start_matches("./").to_string());
+            }
+        }
+        if let Some(snapshot_id) = binding.snapshot_id {
+            let Some(snapshot) = store.get_snapshot(&snapshot_id)? else {
+                continue;
+            };
+            let manifest = crate::snapshot::read_manifest(workspace, &snapshot)?;
+            for file in manifest.files {
+                allowed.insert(file.path.trim_start_matches("./").to_string());
+            }
+        }
+    }
+    Ok(allowed)
+}
+
 fn apply_common_env(command: &mut Command, input: &RunnerProcessInput<'_>) {
     let bin_dir = std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .unwrap_or_default();
-    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let old_path = std::env::var_os("RIVE_WORKER_BASE_PATH")
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
     let path = format!("{}:{}", bin_dir.display(), old_path.to_string_lossy());
     command
         .env_remove("RIVE_ORCHESTRATOR_ROOT_WORK_ID")
         .env_remove("RIVE_AVAILABLE_WORKERS")
+        .env_remove("RIVE_ORCHESTRATOR_CAPABILITY_PROFILE")
         .env("RIVE_WORKSPACE", &input.workspace.root)
         .env("RIVE_AGENT_ID", &input.agent.agent_id)
         .env("RIVE_AGENT_TOKEN", input.token)
@@ -1471,34 +1686,40 @@ Required final action:
     )
 }
 
-fn apply_orchestrator_env(
-    command: &mut Command,
-    workspace: &Workspace,
-    agent: &AgentRecord,
-    token: &str,
-    run_id: &str,
-    root_work_node_id: &str,
-    workers: &[AgentRecord],
-) {
+struct OrchestratorEnvInput<'a> {
+    workspace: &'a Workspace,
+    agent: &'a AgentRecord,
+    token: &'a str,
+    run_id: &'a str,
+    root_work_node_id: &'a str,
+    workers: &'a [AgentRecord],
+    planner_bin: &'a Path,
+}
+
+fn apply_orchestrator_env(command: &mut Command, input: OrchestratorEnvInput<'_>) {
     let bin_dir = std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .unwrap_or_default();
     let old_path = std::env::var_os("PATH").unwrap_or_default();
-    let path = format!("{}:{}", bin_dir.display(), old_path.to_string_lossy());
-    let available_workers = workers
+    let base_path = format!("{}:{}", bin_dir.display(), old_path.to_string_lossy());
+    let path = format!("{}:{}", input.planner_bin.display(), base_path);
+    let available_workers = input
+        .workers
         .iter()
         .map(|worker| worker.name.clone())
         .collect::<Vec<_>>()
         .join(",");
     command
         .env_remove("RIVE_DISPATCH_ID")
-        .env("RIVE_WORKSPACE", &workspace.root)
-        .env("RIVE_AGENT_ID", &agent.agent_id)
-        .env("RIVE_AGENT_TOKEN", token)
-        .env("RIVE_RUN_ID", run_id)
-        .env("RIVE_ORCHESTRATOR_ROOT_WORK_ID", root_work_node_id)
+        .env("RIVE_WORKSPACE", &input.workspace.root)
+        .env("RIVE_AGENT_ID", &input.agent.agent_id)
+        .env("RIVE_AGENT_TOKEN", input.token)
+        .env("RIVE_RUN_ID", input.run_id)
+        .env("RIVE_ORCHESTRATOR_ROOT_WORK_ID", input.root_work_node_id)
         .env("RIVE_AVAILABLE_WORKERS", available_workers)
+        .env("RIVE_ORCHESTRATOR_CAPABILITY_PROFILE", "planner")
+        .env("RIVE_WORKER_BASE_PATH", base_path)
         .env("PATH", path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

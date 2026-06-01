@@ -265,6 +265,29 @@ pub struct WorkRefBindingRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkRootBindingRecord {
+    pub root_work_node_id: String,
+    pub work_node_id: String,
+    pub created_by_agent_id: Option<String>,
+    pub created_by_run_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkNoteRecord {
+    pub note_id: String,
+    pub command_id: String,
+    pub event_id: String,
+    pub work_node_id: String,
+    pub note_kind: String,
+    pub body_hash: String,
+    pub body_blob_ref: String,
+    pub actor_agent_id: String,
+    pub actor_run_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone)]
 pub struct InsertWorkNodeInput {
     pub event: EventRecord,
@@ -314,6 +337,28 @@ pub struct UpdateWorkNodeStatusInput {
     pub work_node_id: String,
     pub status_input: String,
     pub accepted_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BindWorkRootInput {
+    pub root_work_node_id: String,
+    pub work_node_id: String,
+    pub created_by_agent_id: Option<String>,
+    pub created_by_run_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertWorkNoteInput {
+    pub event: EventRecord,
+    pub command_id: String,
+    pub note_id: String,
+    pub work_node_id: String,
+    pub note_kind: String,
+    pub body_hash: String,
+    pub body_blob_ref: String,
+    pub actor_agent_id: String,
+    pub actor_run_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -489,6 +534,34 @@ impl EventStore {
               FOREIGN KEY(dispatch_id) REFERENCES dispatches(dispatch_id),
               FOREIGN KEY(fact_event_id) REFERENCES facts(event_id)
             );
+            CREATE TABLE IF NOT EXISTS work_root_bindings (
+              root_work_node_id TEXT NOT NULL,
+              work_node_id TEXT NOT NULL PRIMARY KEY,
+              created_by_agent_id TEXT,
+              created_by_run_id TEXT,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY(root_work_node_id) REFERENCES work_nodes(work_node_id),
+              FOREIGN KEY(work_node_id) REFERENCES work_nodes(work_node_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_work_root_bindings_root
+              ON work_root_bindings(root_work_node_id);
+            CREATE TABLE IF NOT EXISTS work_notes (
+              note_id TEXT PRIMARY KEY,
+              command_id TEXT NOT NULL UNIQUE,
+              event_id TEXT NOT NULL UNIQUE,
+              work_node_id TEXT NOT NULL,
+              note_kind TEXT NOT NULL,
+              body_hash TEXT NOT NULL,
+              body_blob_ref TEXT NOT NULL,
+              actor_agent_id TEXT NOT NULL,
+              actor_run_id TEXT,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY(event_id) REFERENCES events(event_id),
+              FOREIGN KEY(work_node_id) REFERENCES work_nodes(work_node_id),
+              FOREIGN KEY(actor_agent_id) REFERENCES agents(agent_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_work_notes_node
+              ON work_notes(work_node_id, created_at);
             "#,
         )?;
         Ok(())
@@ -1641,6 +1714,148 @@ impl EventStore {
         }
         Ok(bindings)
     }
+
+    pub fn bind_work_root(&self, input: &BindWorkRootInput) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT OR IGNORE INTO work_root_bindings (
+              root_work_node_id, work_node_id, created_by_agent_id, created_by_run_id, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![
+                input.root_work_node_id,
+                input.work_node_id,
+                input.created_by_agent_id,
+                input.created_by_run_id,
+                input.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_work_root_bindings(&self) -> Result<Vec<WorkRootBindingRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT root_work_node_id, work_node_id, created_by_agent_id, created_by_run_id, created_at
+            FROM work_root_bindings
+            ORDER BY created_at ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], row_to_work_root_binding)?;
+        let mut bindings = Vec::new();
+        for row in rows {
+            bindings.push(row?);
+        }
+        Ok(bindings)
+    }
+
+    pub fn list_work_root_bindings_for_root(
+        &self,
+        root_work_node_id: &str,
+    ) -> Result<Vec<WorkRootBindingRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT root_work_node_id, work_node_id, created_by_agent_id, created_by_run_id, created_at
+            FROM work_root_bindings
+            WHERE root_work_node_id = ?1
+            ORDER BY created_at ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![root_work_node_id], row_to_work_root_binding)?;
+        let mut bindings = Vec::new();
+        for row in rows {
+            bindings.push(row?);
+        }
+        Ok(bindings)
+    }
+
+    pub fn insert_work_note_idempotent(
+        &self,
+        input: &InsertWorkNoteInput,
+    ) -> Result<IdempotencyResolution<WorkNoteRecord>> {
+        if let Some(existing) = self.get_work_note_by_command_id(&input.command_id)? {
+            if existing.work_node_id == input.work_node_id
+                && existing.note_kind == input.note_kind
+                && existing.body_hash == input.body_hash
+                && existing.actor_agent_id == input.actor_agent_id
+                && existing.actor_run_id == input.actor_run_id
+            {
+                return Ok(IdempotencyResolution::Replayed(existing));
+            }
+            return Ok(IdempotencyResolution::Conflict(existing));
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO events (event_id, event_type, created_at, payload_json) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                input.event.event_id,
+                input.event.event_type,
+                input.event.created_at.to_rfc3339(),
+                serde_json::to_string(&input.event.payload)?,
+            ],
+        )?;
+        tx.execute(
+            r#"
+            INSERT INTO work_notes (
+              note_id, command_id, event_id, work_node_id, note_kind,
+              body_hash, body_blob_ref, actor_agent_id, actor_run_id, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+            params![
+                input.note_id,
+                input.command_id,
+                input.event.event_id,
+                input.work_node_id,
+                input.note_kind,
+                input.body_hash,
+                input.body_blob_ref,
+                input.actor_agent_id,
+                input.actor_run_id,
+                input.event.created_at.to_rfc3339(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(IdempotencyResolution::Inserted(
+            self.get_work_note_by_command_id(&input.command_id)?
+                .expect("inserted work note should be readable"),
+        ))
+    }
+
+    pub fn get_work_note_by_command_id(&self, command_id: &str) -> Result<Option<WorkNoteRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT note_id, command_id, event_id, work_node_id, note_kind,
+                   body_hash, body_blob_ref, actor_agent_id, actor_run_id, created_at
+            FROM work_notes
+            WHERE command_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![command_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_work_note(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_work_notes_for_node(&self, work_node_id: &str) -> Result<Vec<WorkNoteRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT note_id, command_id, event_id, work_node_id, note_kind,
+                   body_hash, body_blob_ref, actor_agent_id, actor_run_id, created_at
+            FROM work_notes
+            WHERE work_node_id = ?1
+            ORDER BY created_at ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![work_node_id], row_to_work_note)?;
+        let mut notes = Vec::new();
+        for row in rows {
+            notes.push(row?);
+        }
+        Ok(notes)
+    }
 }
 
 fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotRecord> {
@@ -1840,6 +2055,33 @@ fn row_to_work_ref_binding(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkRefB
         artifact_ref: row.get(4)?,
         workspace_ref: row.get(5)?,
         diff_ref: row.get(6)?,
+        created_at: parse_time_for_sql(&created_at)?,
+    })
+}
+
+fn row_to_work_root_binding(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkRootBindingRecord> {
+    let created_at: String = row.get(4)?;
+    Ok(WorkRootBindingRecord {
+        root_work_node_id: row.get(0)?,
+        work_node_id: row.get(1)?,
+        created_by_agent_id: row.get(2)?,
+        created_by_run_id: row.get(3)?,
+        created_at: parse_time_for_sql(&created_at)?,
+    })
+}
+
+fn row_to_work_note(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkNoteRecord> {
+    let created_at: String = row.get(9)?;
+    Ok(WorkNoteRecord {
+        note_id: row.get(0)?,
+        command_id: row.get(1)?,
+        event_id: row.get(2)?,
+        work_node_id: row.get(3)?,
+        note_kind: row.get(4)?,
+        body_hash: row.get(5)?,
+        body_blob_ref: row.get(6)?,
+        actor_agent_id: row.get(7)?,
+        actor_run_id: row.get(8)?,
         created_at: parse_time_for_sql(&created_at)?,
     })
 }

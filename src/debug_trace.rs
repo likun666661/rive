@@ -130,6 +130,50 @@ pub struct TraceListFilter {
     pub trace_session_id: Option<String>,
 }
 
+#[derive(Debug, Default)]
+pub struct TraceUsageFilter {
+    pub run_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub dispatch_id: Option<String>,
+    pub correlated_run_ids: std::collections::BTreeSet<String>,
+    pub correlated_dispatch_ids: std::collections::BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TraceUsageTotals {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub total_tokens: i64,
+    pub non_cache_tokens: i64,
+    pub tool_output_bytes: i64,
+    pub trace_event_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceUsageRunProtocol {
+    pub run_id: String,
+    pub adapter: Option<String>,
+    pub agent_id: Option<String>,
+    pub dispatch_id: Option<String>,
+    pub usage_available: bool,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub total_tokens: i64,
+    pub non_cache_tokens: i64,
+    pub tool_output_bytes: i64,
+    pub trace_event_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceUsageProtocol {
+    pub runs: Vec<TraceUsageRunProtocol>,
+    pub totals: TraceUsageTotals,
+}
+
 pub struct DebugTraceStore {
     conn: Connection,
 }
@@ -556,6 +600,129 @@ impl DebugTraceStore {
             root: workspace_id.into(),
         }
     }
+}
+
+pub fn usage_for_workspace(
+    workspace: &Workspace,
+    store: &DebugTraceStore,
+    filter: TraceUsageFilter,
+) -> Result<TraceUsageProtocol> {
+    let mut events = store.list_events(TraceListFilter {
+        agent_id: filter.agent_id,
+        dispatch_id: filter.dispatch_id.clone(),
+        ..TraceListFilter::default()
+    })?;
+    if let Some(run_id) = &filter.run_id {
+        events.retain(|event| event.run_id.as_deref() == Some(run_id));
+    }
+    let has_correlation_filter =
+        !filter.correlated_run_ids.is_empty() || !filter.correlated_dispatch_ids.is_empty();
+    if has_correlation_filter {
+        events.retain(|event| {
+            event
+                .run_id
+                .as_ref()
+                .is_some_and(|run_id| filter.correlated_run_ids.contains(run_id))
+                || event
+                    .dispatch_id
+                    .as_ref()
+                    .is_some_and(|dispatch_id| filter.correlated_dispatch_ids.contains(dispatch_id))
+        });
+    }
+    let mut by_run: std::collections::BTreeMap<String, Vec<DebugTraceEventRecord>> =
+        std::collections::BTreeMap::new();
+    for event in events {
+        if let Some(run_id) = &event.run_id {
+            by_run.entry(run_id.clone()).or_default().push(event);
+        }
+    }
+    if let Some(run_id) = filter.run_id {
+        by_run.entry(run_id).or_default();
+    }
+    for run_id in filter.correlated_run_ids {
+        by_run.entry(run_id).or_default();
+    }
+    let mut runs = Vec::new();
+    let mut totals = TraceUsageTotals::default();
+    for (run_id, events) in by_run {
+        let mut run = usage_for_run(workspace, &run_id, &events)?;
+        run.trace_event_count = events.len() as i64;
+        totals.input_tokens += run.input_tokens;
+        totals.output_tokens += run.output_tokens;
+        totals.reasoning_tokens += run.reasoning_tokens;
+        totals.cache_read_tokens += run.cache_read_tokens;
+        totals.total_tokens += run.total_tokens;
+        totals.non_cache_tokens += run.non_cache_tokens;
+        totals.tool_output_bytes += run.tool_output_bytes;
+        totals.trace_event_count += run.trace_event_count;
+        runs.push(run);
+    }
+    Ok(TraceUsageProtocol { runs, totals })
+}
+
+fn usage_for_run(
+    workspace: &Workspace,
+    run_id: &str,
+    events: &[DebugTraceEventRecord],
+) -> Result<TraceUsageRunProtocol> {
+    let mut totals = TraceUsageTotals::default();
+    let stdout_path = workspace.debug_runs_dir().join(run_id).join("stdout.jsonl");
+    if let Ok(bytes) = fs::read(&stdout_path) {
+        totals.tool_output_bytes = bytes.len() as i64;
+        for line in bytes.split(|byte| *byte == b'\n') {
+            if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+                continue;
+            }
+            let Ok(value) = serde_json::from_slice::<Value>(line) else {
+                continue;
+            };
+            if let Some(tokens) = value
+                .get("tokens")
+                .or_else(|| value.pointer("/properties/tokens"))
+            {
+                add_tokens(&mut totals, tokens);
+            }
+        }
+    }
+    let usage_available = totals.total_tokens > 0
+        || totals.input_tokens > 0
+        || totals.output_tokens > 0
+        || totals.reasoning_tokens > 0
+        || totals.cache_read_tokens > 0;
+    let adapter = events.iter().map(|event| event.adapter.clone()).next();
+    let agent_id = events.iter().find_map(|event| event.agent_id.clone());
+    let dispatch_id = events.iter().find_map(|event| event.dispatch_id.clone());
+    Ok(TraceUsageRunProtocol {
+        run_id: run_id.to_string(),
+        adapter,
+        agent_id,
+        dispatch_id,
+        usage_available,
+        input_tokens: totals.input_tokens,
+        output_tokens: totals.output_tokens,
+        reasoning_tokens: totals.reasoning_tokens,
+        cache_read_tokens: totals.cache_read_tokens,
+        total_tokens: totals.total_tokens,
+        non_cache_tokens: totals.non_cache_tokens,
+        tool_output_bytes: totals.tool_output_bytes,
+        trace_event_count: events.len() as i64,
+    })
+}
+
+fn add_tokens(totals: &mut TraceUsageTotals, tokens: &Value) {
+    let input = int_at(tokens, &["input"]).unwrap_or(0);
+    let output = int_at(tokens, &["output"]).unwrap_or(0);
+    let reasoning = int_at(tokens, &["reasoning"]).unwrap_or(0);
+    let cache_read = int_at(tokens, &["cache", "read"])
+        .or_else(|| int_at(tokens, &["cache_read"]))
+        .unwrap_or(0);
+    let total = int_at(tokens, &["total"]).unwrap_or(input + output + reasoning + cache_read);
+    totals.input_tokens += input;
+    totals.output_tokens += output;
+    totals.reasoning_tokens += reasoning;
+    totals.cache_read_tokens += cache_read;
+    totals.total_tokens += total;
+    totals.non_cache_tokens += total.saturating_sub(cache_read);
 }
 
 #[derive(Debug)]

@@ -10,9 +10,10 @@ use uuid::Uuid;
 use crate::dispatch::dispatch_protocol;
 use crate::snapshot::SnapshotStore;
 use crate::store::{
-    BindWorkDispatchInput, DispatchState, EventRecord, EventStore, IdempotencyResolution,
-    InsertWorkEdgeInput, InsertWorkNodeInput, InsertWorkRefBindingInput, UpdateWorkNodeStatusInput,
-    WorkEdgeRecord, WorkNodeRecord, WorkRefBindingRecord,
+    BindWorkDispatchInput, BindWorkRootInput, DispatchState, EventRecord, EventStore,
+    IdempotencyResolution, InsertWorkEdgeInput, InsertWorkNodeInput, InsertWorkNoteInput,
+    InsertWorkRefBindingInput, UpdateWorkNodeStatusInput, WorkEdgeRecord, WorkNodeRecord,
+    WorkNoteRecord, WorkRefBindingRecord,
 };
 use crate::workspace::Workspace;
 
@@ -113,6 +114,56 @@ pub struct BindWorkRefsCommand {
     pub diff_ref: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct BindWorkRootCommand {
+    pub root_work_node_id: String,
+    pub work_node_id: String,
+    pub created_by_agent_id: Option<String>,
+    pub created_by_run_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct RecordWorkNoteInput {
+    pub command_id: String,
+    pub work_node_id: String,
+    pub note_kind: WorkNoteKind,
+    pub body: Vec<u8>,
+    pub actor_agent_id: String,
+    pub actor_run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkNoteKind {
+    Progress,
+    Decision,
+    Blocker,
+    Risk,
+    Validation,
+}
+
+impl WorkNoteKind {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "progress" => Ok(Self::Progress),
+            "decision" => Ok(Self::Decision),
+            "blocker" => Ok(Self::Blocker),
+            "risk" => Ok(Self::Risk),
+            "validation" => Ok(Self::Validation),
+            _ => Err(anyhow!("invalid work note kind: {value}")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Progress => "progress",
+            Self::Decision => "decision",
+            Self::Blocker => "blocker",
+            Self::Risk => "risk",
+            Self::Validation => "validation",
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct WorkNodeProtocol {
     pub work_node_id: String,
@@ -163,6 +214,7 @@ pub struct WorkInspectProtocol {
     pub outgoing_edges: Vec<WorkEdgeProtocol>,
     pub dispatches: Vec<crate::dispatch::DispatchProtocol>,
     pub refs: Vec<WorkRefBindingProtocol>,
+    pub notes: Vec<WorkNoteProtocol>,
 }
 
 #[derive(Debug, Serialize)]
@@ -180,6 +232,36 @@ pub struct WorkRefBindingProtocol {
     pub workspace_ref: Option<String>,
     pub diff_ref: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkNoteProtocol {
+    pub note_id: String,
+    pub command_id: String,
+    pub event_id: String,
+    pub work_node_id: String,
+    pub note_kind: String,
+    pub body_hash: String,
+    pub body_blob_ref: String,
+    pub actor_agent_id: String,
+    pub actor_run_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub idempotency_status: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkGraphInspectProtocol {
+    pub root_work_node_id: String,
+    pub state: String,
+    pub hygiene_state: String,
+    pub scoped_nodes: Vec<String>,
+    pub reachable_nodes: Vec<String>,
+    pub orphan_nodes: Vec<String>,
+    pub unconnected_nodes: Vec<String>,
+    pub incomplete_reachable_nodes: Vec<String>,
+    pub reviewable_unaccepted_nodes: Vec<String>,
+    pub missing_requirements: Vec<String>,
+    pub allowed_next_actions: Vec<&'static str>,
 }
 
 pub struct WorkService<'a, S: SnapshotStore> {
@@ -318,6 +400,12 @@ impl<'a, S: SnapshotStore> WorkService<'a, S> {
             return Err(anyhow!("missing command id"));
         }
         if !self.is_status_command_replay(&input, true)? {
+            if self.is_root_scoped_node(&input.work_node_id)? {
+                let graph = self.inspect_graph(&input.work_node_id)?;
+                if graph.hygiene_state != "clean" {
+                    return Err(anyhow!("work graph not closed: {}", input.work_node_id));
+                }
+            }
             let projection = self.inspect_projection(&input.work_node_id)?;
             if projection.state != "reviewable" {
                 return Err(anyhow!(
@@ -402,6 +490,79 @@ impl<'a, S: SnapshotStore> WorkService<'a, S> {
         Ok(Some(self.inspect_projection(&binding.work_node_id)?))
     }
 
+    pub fn bind_root(&self, input: BindWorkRootCommand) -> Result<()> {
+        self.ensure_schema()?;
+        self.store
+            .get_work_node(&input.root_work_node_id)?
+            .ok_or_else(|| anyhow!("work node not found: {}", input.root_work_node_id))?;
+        self.store
+            .get_work_node(&input.work_node_id)?
+            .ok_or_else(|| anyhow!("work node not found: {}", input.work_node_id))?;
+        self.store.bind_work_root(&BindWorkRootInput {
+            root_work_node_id: input.root_work_node_id,
+            work_node_id: input.work_node_id,
+            created_by_agent_id: input.created_by_agent_id,
+            created_by_run_id: input.created_by_run_id,
+            created_at: Utc::now(),
+        })
+    }
+
+    pub fn record_note(
+        &self,
+        input: RecordWorkNoteInput,
+    ) -> Result<(WorkNoteRecord, &'static str)> {
+        self.ensure_schema()?;
+        if input.command_id.trim().is_empty() {
+            return Err(anyhow!("missing command id"));
+        }
+        self.store
+            .get_work_node(&input.work_node_id)?
+            .ok_or_else(|| anyhow!("work node not found: {}", input.work_node_id))?;
+        let body_sha = sha256_hex(&input.body);
+        let body_hash = format!("sha256:{body_sha}");
+        let body_blob_ref = self.blob_store.write_blob(&body_sha, &input.body)?;
+        let event_id = prefixed_id("evt");
+        let note_id = prefixed_id("note");
+        let created_at = Utc::now();
+        let note_kind = input.note_kind.as_str().to_string();
+        let payload = json!({
+            "protocol_version": "rive.work.v0",
+            "event_id": event_id,
+            "command_id": input.command_id,
+            "event_type": "work.note.recorded",
+            "workspace_id": workspace_id(self.workspace),
+            "note_id": note_id,
+            "work_node_id": input.work_node_id,
+            "note_kind": note_kind,
+            "body_hash": body_hash,
+            "body_blob_ref": body_blob_ref,
+            "actor_agent_id": input.actor_agent_id,
+            "actor_run_id": input.actor_run_id,
+            "created_at": created_at,
+        });
+        let insert = InsertWorkNoteInput {
+            event: EventRecord {
+                event_id,
+                event_type: "work.note.recorded".to_string(),
+                created_at,
+                payload,
+            },
+            command_id: input.command_id,
+            note_id,
+            work_node_id: input.work_node_id,
+            note_kind,
+            body_hash,
+            body_blob_ref,
+            actor_agent_id: input.actor_agent_id,
+            actor_run_id: input.actor_run_id,
+        };
+        match self.store.insert_work_note_idempotent(&insert)? {
+            IdempotencyResolution::Inserted(note) => Ok((note, "inserted")),
+            IdempotencyResolution::Replayed(note) => Ok((note, "replayed")),
+            IdempotencyResolution::Conflict(_) => Err(anyhow!("idempotency conflict")),
+        }
+    }
+
     pub fn list_nodes(&self) -> Result<WorkListProtocol> {
         self.ensure_schema()?;
         let graph_version = self.graph_version()?;
@@ -453,6 +614,12 @@ impl<'a, S: SnapshotStore> WorkService<'a, S> {
             .filter(|binding| binding.work_node_id == work_node_id)
             .map(work_ref_protocol)
             .collect();
+        let notes = self
+            .store
+            .list_work_notes_for_node(work_node_id)?
+            .into_iter()
+            .map(|note| work_note_protocol(&note, "read"))
+            .collect();
         Ok(WorkInspectProtocol {
             node: work_node_protocol(&node, graph_version, "read"),
             projection,
@@ -464,6 +631,81 @@ impl<'a, S: SnapshotStore> WorkService<'a, S> {
                 .collect(),
             dispatches,
             refs,
+            notes,
+        })
+    }
+
+    pub fn inspect_graph(&self, root_work_node_id: &str) -> Result<WorkGraphInspectProtocol> {
+        self.ensure_schema()?;
+        self.store
+            .get_work_node(root_work_node_id)?
+            .ok_or_else(|| anyhow!("work node not found: {root_work_node_id}"))?;
+        let scoped = self
+            .store
+            .list_work_root_bindings_for_root(root_work_node_id)?
+            .into_iter()
+            .map(|binding| binding.work_node_id)
+            .collect::<HashSet<_>>();
+        let mut scoped_nodes = scoped.iter().cloned().collect::<Vec<_>>();
+        scoped_nodes.sort();
+        let edges = self.store.list_work_edges()?;
+        let reachable = reachable_from(root_work_node_id, &edges);
+        let mut reachable_nodes = reachable.iter().cloned().collect::<Vec<_>>();
+        reachable_nodes.sort();
+        let mut orphan_nodes = scoped
+            .difference(&reachable)
+            .filter(|node| node.as_str() != root_work_node_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        orphan_nodes.sort();
+        let unconnected_nodes = orphan_nodes.clone();
+        let mut incomplete_reachable_nodes = Vec::new();
+        let mut reviewable_unaccepted_nodes = Vec::new();
+        for node_id in reachable
+            .iter()
+            .filter(|node| node.as_str() != root_work_node_id)
+        {
+            let projection = self.inspect_projection(node_id)?;
+            if projection.state != "done" {
+                incomplete_reachable_nodes.push(node_id.clone());
+            }
+            if projection.state == "reviewable" {
+                reviewable_unaccepted_nodes.push(node_id.clone());
+            }
+        }
+        incomplete_reachable_nodes.sort();
+        reviewable_unaccepted_nodes.sort();
+        let mut missing_requirements = Vec::new();
+        for node_id in &orphan_nodes {
+            missing_requirements.push(format!("orphan:{node_id}"));
+        }
+        for node_id in &incomplete_reachable_nodes {
+            missing_requirements.push(format!("incomplete:{node_id}"));
+        }
+        for node_id in &reviewable_unaccepted_nodes {
+            missing_requirements.push(format!("reviewable_unaccepted:{node_id}"));
+        }
+        let hygiene_state = if missing_requirements.is_empty() {
+            "clean"
+        } else {
+            "dirty"
+        };
+        Ok(WorkGraphInspectProtocol {
+            root_work_node_id: root_work_node_id.to_string(),
+            state: hygiene_state.to_string(),
+            hygiene_state: hygiene_state.to_string(),
+            scoped_nodes,
+            reachable_nodes,
+            orphan_nodes,
+            unconnected_nodes,
+            incomplete_reachable_nodes,
+            reviewable_unaccepted_nodes,
+            missing_requirements,
+            allowed_next_actions: if hygiene_state == "clean" {
+                vec!["accept", "inspect"]
+            } else {
+                vec!["inspect_requirements", "connect_or_reopen", "inspect"]
+            },
         })
     }
 
@@ -667,6 +909,14 @@ impl<'a, S: SnapshotStore> WorkService<'a, S> {
             && accepted == accepted_event_id.is_some())
     }
 
+    fn is_root_scoped_node(&self, work_node_id: &str) -> Result<bool> {
+        Ok(self
+            .store
+            .list_work_root_bindings_for_root(work_node_id)?
+            .iter()
+            .any(|binding| binding.work_node_id == work_node_id))
+    }
+
     fn ensure_schema(&self) -> Result<()> {
         self.store.init_work_schema()
     }
@@ -723,6 +973,25 @@ fn work_ref_protocol(binding: WorkRefBindingRecord) -> WorkRefBindingProtocol {
     }
 }
 
+pub fn work_note_protocol(
+    note: &WorkNoteRecord,
+    idempotency_status: &'static str,
+) -> WorkNoteProtocol {
+    WorkNoteProtocol {
+        note_id: note.note_id.clone(),
+        command_id: note.command_id.clone(),
+        event_id: note.event_id.clone(),
+        work_node_id: note.work_node_id.clone(),
+        note_kind: note.note_kind.clone(),
+        body_hash: note.body_hash.clone(),
+        body_blob_ref: note.body_blob_ref.clone(),
+        actor_agent_id: note.actor_agent_id.clone(),
+        actor_run_id: note.actor_run_id.clone(),
+        created_at: note.created_at,
+        idempotency_status,
+    }
+}
+
 fn dependencies_for(work_node_id: &str, edges: &[WorkEdgeRecord]) -> Vec<String> {
     edges
         .iter()
@@ -737,6 +1006,27 @@ fn children_for(work_node_id: &str, edges: &[WorkEdgeRecord]) -> Vec<String> {
         .filter(|edge| edge.from_node_id == work_node_id && edge.edge_type == "decomposes_to")
         .map(|edge| edge.to_node_id.clone())
         .collect()
+}
+
+fn reachable_from(root: &str, edges: &[WorkEdgeRecord]) -> HashSet<String> {
+    let mut outgoing: HashMap<&str, Vec<&str>> = HashMap::new();
+    for edge in edges {
+        outgoing
+            .entry(edge.from_node_id.as_str())
+            .or_default()
+            .push(edge.to_node_id.as_str());
+    }
+    let mut reachable = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if !reachable.insert(node.to_string()) {
+            continue;
+        }
+        if let Some(next) = outgoing.get(node) {
+            stack.extend(next.iter().copied());
+        }
+    }
+    reachable
 }
 
 fn would_create_cycle(edges: &[WorkEdgeRecord], from: &str, to: &str) -> bool {
