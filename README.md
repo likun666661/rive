@@ -25,3 +25,5 @@ Rive 是本地优先 agent team runtime 的体系文档。
 19. [Phase 9 OpenCode Orchestrator Control 测试计划](./docs/19-phase9-opencode-orchestrator-control-test-plan.md)
 20. [Phase 10 Orchestrator Sandbox / Graph Hygiene / Usage 设计](./docs/20-phase10-orchestrator-sandbox-graph-hygiene-usage-design.md)
 21. [Phase 10 Orchestrator Sandbox / Graph Hygiene / Usage 测试计划](./docs/21-phase10-orchestrator-sandbox-graph-hygiene-usage-test-plan.md)
+22. [Phase 11 Work DAG Scheduler 设计](./docs/22-phase11-work-dag-scheduler-design.md)
+23. [Phase 11 Work DAG Scheduler 测试计划](./docs/23-phase11-work-dag-scheduler-test-plan.md)
