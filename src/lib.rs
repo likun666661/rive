@@ -5,4 +5,5 @@ pub mod output;
 pub mod runner;
 pub mod snapshot;
 pub mod store;
+pub mod work;
 pub mod workspace;

@@ -219,6 +219,103 @@ pub struct InsertFactInput {
     pub evidence_refs: Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkNodeRecord {
+    pub work_node_id: String,
+    pub command_id: String,
+    pub kind: String,
+    pub title: String,
+    pub body_hash: Option<String>,
+    pub body_blob_ref: Option<String>,
+    pub status_input: String,
+    pub node_version: i64,
+    pub accepted_event_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkEdgeRecord {
+    pub work_edge_id: String,
+    pub command_id: String,
+    pub edge_type: String,
+    pub from_node_id: String,
+    pub to_node_id: String,
+    pub graph_version: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkDispatchBindingRecord {
+    pub work_node_id: String,
+    pub dispatch_id: String,
+    pub binding_kind: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkRefBindingRecord {
+    pub work_node_id: String,
+    pub dispatch_id: String,
+    pub fact_event_id: String,
+    pub snapshot_id: Option<String>,
+    pub artifact_ref: Option<String>,
+    pub workspace_ref: Option<String>,
+    pub diff_ref: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertWorkNodeInput {
+    pub event: EventRecord,
+    pub command_id: String,
+    pub work_node_id: String,
+    pub kind: String,
+    pub title: String,
+    pub body_hash: Option<String>,
+    pub body_blob_ref: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertWorkEdgeInput {
+    pub event: EventRecord,
+    pub command_id: String,
+    pub work_edge_id: String,
+    pub edge_type: String,
+    pub from_node_id: String,
+    pub to_node_id: String,
+    pub graph_version: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BindWorkDispatchInput {
+    pub work_node_id: String,
+    pub dispatch_id: String,
+    pub binding_kind: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertWorkRefBindingInput {
+    pub work_node_id: String,
+    pub dispatch_id: String,
+    pub fact_event_id: String,
+    pub snapshot_id: Option<String>,
+    pub artifact_ref: Option<String>,
+    pub workspace_ref: Option<String>,
+    pub diff_ref: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateWorkNodeStatusInput {
+    pub event: EventRecord,
+    pub command_id: String,
+    pub work_node_id: String,
+    pub status_input: String,
+    pub accepted_event_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum IdempotencyResolution<T> {
     Inserted(T),
@@ -331,6 +428,79 @@ impl EventStore {
             "#,
         )?;
         Ok(())
+    }
+
+    pub fn init_work_schema(&self) -> Result<()> {
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS work_nodes (
+              work_node_id TEXT PRIMARY KEY,
+              command_id TEXT NOT NULL UNIQUE,
+              kind TEXT NOT NULL,
+              title TEXT NOT NULL,
+              body_hash TEXT,
+              body_blob_ref TEXT,
+              status_input TEXT NOT NULL,
+              node_version INTEGER NOT NULL,
+              accepted_event_id TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS work_edges (
+              work_edge_id TEXT PRIMARY KEY,
+              command_id TEXT NOT NULL UNIQUE,
+              edge_type TEXT NOT NULL,
+              from_node_id TEXT NOT NULL,
+              to_node_id TEXT NOT NULL,
+              graph_version INTEGER NOT NULL,
+              created_at TEXT NOT NULL,
+              UNIQUE(edge_type, from_node_id, to_node_id),
+              FOREIGN KEY(from_node_id) REFERENCES work_nodes(work_node_id),
+              FOREIGN KEY(to_node_id) REFERENCES work_nodes(work_node_id)
+            );
+            CREATE TABLE IF NOT EXISTS work_node_status_commands (
+              command_id TEXT PRIMARY KEY,
+              event_id TEXT NOT NULL UNIQUE,
+              work_node_id TEXT NOT NULL,
+              status_input TEXT NOT NULL,
+              accepted_event_id TEXT,
+              FOREIGN KEY(work_node_id) REFERENCES work_nodes(work_node_id)
+            );
+            CREATE TABLE IF NOT EXISTS work_dispatch_bindings (
+              dispatch_id TEXT PRIMARY KEY,
+              work_node_id TEXT NOT NULL,
+              binding_kind TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY(work_node_id) REFERENCES work_nodes(work_node_id),
+              FOREIGN KEY(dispatch_id) REFERENCES dispatches(dispatch_id)
+            );
+            CREATE TABLE IF NOT EXISTS work_ref_bindings (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              fact_event_id TEXT NOT NULL,
+              work_node_id TEXT NOT NULL,
+              dispatch_id TEXT NOT NULL,
+              snapshot_id TEXT,
+              artifact_ref TEXT,
+              workspace_ref TEXT,
+              diff_ref TEXT,
+              created_at TEXT NOT NULL,
+              UNIQUE(fact_event_id, snapshot_id, artifact_ref, workspace_ref, diff_ref),
+              FOREIGN KEY(work_node_id) REFERENCES work_nodes(work_node_id),
+              FOREIGN KEY(dispatch_id) REFERENCES dispatches(dispatch_id),
+              FOREIGN KEY(fact_event_id) REFERENCES facts(event_id)
+            );
+            "#,
+        )?;
+        Ok(())
+    }
+
+    pub fn has_work_schema(&self) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'work_dispatch_bindings'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     pub fn insert_event(&self, event: &EventRecord) -> Result<()> {
@@ -1069,6 +1239,408 @@ impl EventStore {
             Ok(None)
         }
     }
+
+    pub fn insert_work_node_idempotent(
+        &self,
+        input: &InsertWorkNodeInput,
+    ) -> Result<IdempotencyResolution<WorkNodeRecord>> {
+        if let Some(existing) = self.get_work_node_by_command_id(&input.command_id)? {
+            if existing.kind == input.kind
+                && existing.title == input.title
+                && existing.body_hash == input.body_hash
+            {
+                return Ok(IdempotencyResolution::Replayed(existing));
+            }
+            return Ok(IdempotencyResolution::Conflict(existing));
+        }
+
+        let now = input.event.created_at;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO events (event_id, event_type, created_at, payload_json) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                input.event.event_id,
+                input.event.event_type,
+                input.event.created_at.to_rfc3339(),
+                serde_json::to_string(&input.event.payload)?,
+            ],
+        )?;
+        tx.execute(
+            r#"
+            INSERT INTO work_nodes (
+              work_node_id, command_id, kind, title, body_hash, body_blob_ref,
+              status_input, node_version, accepted_event_id, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 1, NULL, ?7, ?8)
+            "#,
+            params![
+                input.work_node_id,
+                input.command_id,
+                input.kind,
+                input.title,
+                input.body_hash,
+                input.body_blob_ref,
+                now.to_rfc3339(),
+                now.to_rfc3339(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(IdempotencyResolution::Inserted(
+            self.get_work_node(&input.work_node_id)?
+                .expect("inserted work node should be readable"),
+        ))
+    }
+
+    pub fn get_work_node(&self, work_node_id: &str) -> Result<Option<WorkNodeRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT work_node_id, command_id, kind, title, body_hash, body_blob_ref,
+                   status_input, node_version, accepted_event_id, created_at, updated_at
+            FROM work_nodes
+            WHERE work_node_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![work_node_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_work_node(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_work_node_by_command_id(&self, command_id: &str) -> Result<Option<WorkNodeRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT work_node_id, command_id, kind, title, body_hash, body_blob_ref,
+                   status_input, node_version, accepted_event_id, created_at, updated_at
+            FROM work_nodes
+            WHERE command_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![command_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_work_node(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_work_nodes(&self) -> Result<Vec<WorkNodeRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT work_node_id, command_id, kind, title, body_hash, body_blob_ref,
+                   status_input, node_version, accepted_event_id, created_at, updated_at
+            FROM work_nodes
+            ORDER BY created_at ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], row_to_work_node)?;
+        let mut nodes = Vec::new();
+        for row in rows {
+            nodes.push(row?);
+        }
+        Ok(nodes)
+    }
+
+    pub fn insert_work_edge_idempotent(
+        &self,
+        input: &InsertWorkEdgeInput,
+    ) -> Result<IdempotencyResolution<WorkEdgeRecord>> {
+        if let Some(existing) = self.get_work_edge_by_command_id(&input.command_id)? {
+            if existing.edge_type == input.edge_type
+                && existing.from_node_id == input.from_node_id
+                && existing.to_node_id == input.to_node_id
+            {
+                return Ok(IdempotencyResolution::Replayed(existing));
+            }
+            return Ok(IdempotencyResolution::Conflict(existing));
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO events (event_id, event_type, created_at, payload_json) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                input.event.event_id,
+                input.event.event_type,
+                input.event.created_at.to_rfc3339(),
+                serde_json::to_string(&input.event.payload)?,
+            ],
+        )?;
+        tx.execute(
+            r#"
+            INSERT INTO work_edges (
+              work_edge_id, command_id, edge_type, from_node_id, to_node_id,
+              graph_version, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![
+                input.work_edge_id,
+                input.command_id,
+                input.edge_type,
+                input.from_node_id,
+                input.to_node_id,
+                input.graph_version,
+                input.event.created_at.to_rfc3339(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(IdempotencyResolution::Inserted(
+            self.get_work_edge_by_command_id(&input.command_id)?
+                .expect("inserted work edge should be readable"),
+        ))
+    }
+
+    pub fn get_work_edge_by_command_id(&self, command_id: &str) -> Result<Option<WorkEdgeRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT work_edge_id, command_id, edge_type, from_node_id, to_node_id,
+                   graph_version, created_at
+            FROM work_edges
+            WHERE command_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![command_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_work_edge(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_work_edges(&self) -> Result<Vec<WorkEdgeRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT work_edge_id, command_id, edge_type, from_node_id, to_node_id,
+                   graph_version, created_at
+            FROM work_edges
+            ORDER BY created_at ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], row_to_work_edge)?;
+        let mut edges = Vec::new();
+        for row in rows {
+            edges.push(row?);
+        }
+        Ok(edges)
+    }
+
+    pub fn next_work_graph_version(&self) -> Result<i64> {
+        let max_version: Option<i64> =
+            self.conn
+                .query_row("SELECT MAX(graph_version) FROM work_edges", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(max_version.unwrap_or(0) + 1)
+    }
+
+    pub fn update_work_node_status_idempotent(
+        &self,
+        input: &UpdateWorkNodeStatusInput,
+    ) -> Result<IdempotencyResolution<WorkNodeRecord>> {
+        if let Some(existing) = self.get_work_node_status_command(&input.command_id)? {
+            let (work_node_id, status_input, accepted_event_id) = existing;
+            let node = self
+                .get_work_node(&work_node_id)?
+                .ok_or_else(|| anyhow::anyhow!("work node not found: {work_node_id}"))?;
+            if work_node_id == input.work_node_id
+                && status_input == input.status_input
+                && accepted_event_id.is_some() == input.accepted_event_id.is_some()
+            {
+                return Ok(IdempotencyResolution::Replayed(node));
+            }
+            return Ok(IdempotencyResolution::Conflict(node));
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO events (event_id, event_type, created_at, payload_json) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                input.event.event_id,
+                input.event.event_type,
+                input.event.created_at.to_rfc3339(),
+                serde_json::to_string(&input.event.payload)?,
+            ],
+        )?;
+        tx.execute(
+            r#"
+            INSERT INTO work_node_status_commands (
+              command_id, event_id, work_node_id, status_input, accepted_event_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![
+                input.command_id,
+                input.event.event_id,
+                input.work_node_id,
+                input.status_input,
+                input.accepted_event_id,
+            ],
+        )?;
+        tx.execute(
+            r#"
+            UPDATE work_nodes
+            SET status_input = ?1,
+                accepted_event_id = ?2,
+                node_version = node_version + 1,
+                updated_at = ?3
+            WHERE work_node_id = ?4
+            "#,
+            params![
+                input.status_input,
+                input.accepted_event_id,
+                input.event.created_at.to_rfc3339(),
+                input.work_node_id,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(IdempotencyResolution::Inserted(
+            self.get_work_node(&input.work_node_id)?
+                .ok_or_else(|| anyhow::anyhow!("work node not found: {}", input.work_node_id))?,
+        ))
+    }
+
+    pub fn get_work_node_status_command(
+        &self,
+        command_id: &str,
+    ) -> Result<Option<(String, String, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT work_node_id, status_input, accepted_event_id
+            FROM work_node_status_commands
+            WHERE command_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![command_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn bind_work_dispatch(&self, input: &BindWorkDispatchInput) -> Result<()> {
+        if let Some(existing) = self.get_work_dispatch_binding(&input.dispatch_id)? {
+            if existing.work_node_id == input.work_node_id
+                && existing.binding_kind == input.binding_kind
+            {
+                return Ok(());
+            }
+            anyhow::bail!("dispatch already bound to work node: {}", input.dispatch_id);
+        }
+        self.conn.execute(
+            r#"
+            INSERT OR IGNORE INTO work_dispatch_bindings (
+              dispatch_id, work_node_id, binding_kind, created_at
+            ) VALUES (?1, ?2, ?3, ?4)
+            "#,
+            params![
+                input.dispatch_id,
+                input.work_node_id,
+                input.binding_kind,
+                input.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_work_dispatch_binding(
+        &self,
+        dispatch_id: &str,
+    ) -> Result<Option<WorkDispatchBindingRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT work_node_id, dispatch_id, binding_kind, created_at
+            FROM work_dispatch_bindings
+            WHERE dispatch_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![dispatch_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_work_dispatch_binding(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_work_dispatch_bindings(&self) -> Result<Vec<WorkDispatchBindingRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT work_node_id, dispatch_id, binding_kind, created_at
+            FROM work_dispatch_bindings
+            ORDER BY created_at ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], row_to_work_dispatch_binding)?;
+        let mut bindings = Vec::new();
+        for row in rows {
+            bindings.push(row?);
+        }
+        Ok(bindings)
+    }
+
+    pub fn insert_work_ref_binding_idempotent(
+        &self,
+        input: &InsertWorkRefBindingInput,
+    ) -> Result<()> {
+        let existing: i64 = self.conn.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM work_ref_bindings
+            WHERE fact_event_id = ?1
+              AND dispatch_id = ?2
+              AND ((snapshot_id = ?3) OR (snapshot_id IS NULL AND ?3 IS NULL))
+              AND ((artifact_ref = ?4) OR (artifact_ref IS NULL AND ?4 IS NULL))
+              AND ((workspace_ref = ?5) OR (workspace_ref IS NULL AND ?5 IS NULL))
+              AND ((diff_ref = ?6) OR (diff_ref IS NULL AND ?6 IS NULL))
+            "#,
+            params![
+                input.fact_event_id,
+                input.dispatch_id,
+                input.snapshot_id,
+                input.artifact_ref,
+                input.workspace_ref,
+                input.diff_ref,
+            ],
+            |row| row.get(0),
+        )?;
+        if existing > 0 {
+            return Ok(());
+        }
+        self.conn.execute(
+            r#"
+            INSERT OR IGNORE INTO work_ref_bindings (
+              fact_event_id, work_node_id, dispatch_id, snapshot_id,
+              artifact_ref, workspace_ref, diff_ref, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+            params![
+                input.fact_event_id,
+                input.work_node_id,
+                input.dispatch_id,
+                input.snapshot_id,
+                input.artifact_ref,
+                input.workspace_ref,
+                input.diff_ref,
+                input.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_work_ref_bindings(&self) -> Result<Vec<WorkRefBindingRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT work_node_id, dispatch_id, fact_event_id, snapshot_id,
+                   artifact_ref, workspace_ref, diff_ref, created_at
+            FROM work_ref_bindings
+            ORDER BY created_at ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], row_to_work_ref_binding)?;
+        let mut bindings = Vec::new();
+        for row in rows {
+            bindings.push(row?);
+        }
+        Ok(bindings)
+    }
 }
 
 fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotRecord> {
@@ -1212,6 +1784,63 @@ fn row_to_delegation(row: &rusqlite::Row<'_>) -> rusqlite::Result<DelegationReco
             .as_deref()
             .map(parse_time_for_sql)
             .transpose()?,
+    })
+}
+
+fn row_to_work_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkNodeRecord> {
+    let created_at: String = row.get(9)?;
+    let updated_at: String = row.get(10)?;
+    Ok(WorkNodeRecord {
+        work_node_id: row.get(0)?,
+        command_id: row.get(1)?,
+        kind: row.get(2)?,
+        title: row.get(3)?,
+        body_hash: row.get(4)?,
+        body_blob_ref: row.get(5)?,
+        status_input: row.get(6)?,
+        node_version: row.get(7)?,
+        accepted_event_id: row.get(8)?,
+        created_at: parse_time_for_sql(&created_at)?,
+        updated_at: parse_time_for_sql(&updated_at)?,
+    })
+}
+
+fn row_to_work_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkEdgeRecord> {
+    let created_at: String = row.get(6)?;
+    Ok(WorkEdgeRecord {
+        work_edge_id: row.get(0)?,
+        command_id: row.get(1)?,
+        edge_type: row.get(2)?,
+        from_node_id: row.get(3)?,
+        to_node_id: row.get(4)?,
+        graph_version: row.get(5)?,
+        created_at: parse_time_for_sql(&created_at)?,
+    })
+}
+
+fn row_to_work_dispatch_binding(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WorkDispatchBindingRecord> {
+    let created_at: String = row.get(3)?;
+    Ok(WorkDispatchBindingRecord {
+        work_node_id: row.get(0)?,
+        dispatch_id: row.get(1)?,
+        binding_kind: row.get(2)?,
+        created_at: parse_time_for_sql(&created_at)?,
+    })
+}
+
+fn row_to_work_ref_binding(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkRefBindingRecord> {
+    let created_at: String = row.get(7)?;
+    Ok(WorkRefBindingRecord {
+        work_node_id: row.get(0)?,
+        dispatch_id: row.get(1)?,
+        fact_event_id: row.get(2)?,
+        snapshot_id: row.get(3)?,
+        artifact_ref: row.get(4)?,
+        workspace_ref: row.get(5)?,
+        diff_ref: row.get(6)?,
+        created_at: parse_time_for_sql(&created_at)?,
     })
 }
 
