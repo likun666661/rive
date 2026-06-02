@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rive"
+  short_description: "Use Rive to plan and run local multi-agent Work DAGs."
+  default_prompt: "Use Rive to turn my objective into a Work DAG, run workers, and report the ledger-backed result."
