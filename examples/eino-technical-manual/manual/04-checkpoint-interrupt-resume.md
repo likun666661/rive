@@ -1,239 +1,240 @@
-# 04 — Checkpoint / Interrupt / Resume
+# 04 — Checkpoint / 中断 / 恢复
 
-## 1. Facing Problem
+## 1. 面临的问题
 
-Eino's execution graphs can be arbitrarily deep: `Graph` nests sub-graphs, `Agent` wraps `Graph`, `ToolsNode` fans out multiple parallel tool calls, and a `Lambda` node may spin up an entire standalone `Runnable`. When any component in this deeply nested mesh decides to pause — because it needs human input, hits a rate limit, or a tool call requires approval — the runtime must:
+Eino 的执行图可以任意嵌套深度：`Graph` 嵌套子图，`Agent` 包裹 `Graph`，`ToolsNode` 扇出多个并行工具调用，而 `Lambda` 节点可能启动一个完整的独立 `Runnable`。当这个深度嵌套网络中的任意组件决定暂停 —— 因为需要人工输入、触发了速率限制或工具调用需要审批 —— 运行时必须：
 
-- **Save exact execution state** so the graph can be restarted from the precise interruption point, not from scratch.
-- **Uniquely identify every interrupt point** across the entire call tree, even when the same tool is called twice with different call IDs (`tool:my_tool:call_1` vs `tool:my_tool:call_2`).
-- **Prevent parent graphs from swallowing child interrupts** — a sub-graph interrupt must propagate up to the root caller.
-- **Materialize stream data** before checkpointing so that resumption has deterministic, non-ephemeral inputs.
-- **Support targeted resume** — the user may choose to resume only one of several parallel interrupt points, leaving others paused.
+- **保存精确的执行状态**，以便图可以从精确的中断点重新启动，而非从头开始。
+- **在整个调用树中唯一标识每一个中断点**，即使同一个工具以不同的调用 ID 被调用了两次（`tool:my_tool:call_1` 与 `tool:my_tool:call_2`）。
+- **防止父图吞掉子中断** —— 子图的中断必须向上传播到根调用方。
+- **在检查点保存之前物化流数据**，以便恢复时具有确定性的、非临时的输入。
+- **支持定向恢复** —— 用户可以选择仅恢复若干并行中断点中的一个，而让其他中断点保持暂停。
 
-An ad-hoc approach (save a stack trace, re-run from the top) fails because: component invocations are side-effectful (LLM API calls, database writes), re-running would re-execute already-completed work, and there is no guarantee the same execution path would be taken again without the exact same checkpoint state.
+临时方案（保存调用栈、从顶部重新运行）之所以失败，是因为：组件调用具有副作用（LLM API 调用、数据库写入），重新运行会重复执行已完成的工作，且如果没有完全相同的检查点状态，无法保证会走同一条执行路径。
 
-## 2. Why It Is Hard
+## 2. 为什么困难
 
-The difficulty is not saving state — it is saving the **right** state at the **right** identity in a **hierarchical, concurrent, heterogeneous** runtime.
+难点不在于保存状态 —— 而在于在**分层、并发、异构**的运行时中，以**正确的身份**在**正确的时机**保存**正确的**状态。
 
-### 2.1 Hierarchical Identity
+### 2.1 分层身份
 
-Execution points are not flat function calls. They form a tree:
+执行点不是扁平的函数调用，它们形成一棵树：
 
 ```text
 runnable:root;node:sub_graph_a;node:sub_graph_b;node:tools;tool:interrupt_tool:tool_call_123
                                             ^^^^^^^^^^^^^^^  ^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-                                            graph node        tools    tool name : tool call id
+                                            graph node         tools    工具名 : 工具调用 ID
 ```
 
-Without a stable, hierarchical address system, the runtime cannot:
-- Distinguish tool call `#1` from tool call `#2` running in parallel on the same `ToolsNode`.
-- Route resume data to the correct leaf node when the user says "continue tool call `#3`".
-- Let a `Lambda` node that wraps a standalone `Graph` correctly prepend its own address segments to the inner graph's addresses.
+如果没有稳定的、分层式的地址系统，运行时无法：
+- 区分在同一个 `ToolsNode` 上并行运行的工具调用 `#1` 和工具调用 `#2`。
+- 当用户说“继续工具调用 `#3`”时，将恢复数据路由到正确的叶子节点。
+- 让包裹了独立 `Graph` 的 `Lambda` 节点将其自身的地址段正确地前置到内部图的地址之前。
 
-### 2.2 Concurrency
+### 2.2 并发性
 
-Eino uses a Pregel-style (or DAG-style) execution model where multiple nodes can run simultaneously. When a `ToolsNode` runs 3 tools in parallel and 2 of them interrupt, the checkpoint must:
-- Record the outputs of the 1 completed tool.
-- Record the interrupt signals of the 2 paused tools.
-- Store sub-graph checkpoints for any sub-graph nodes that also interrupted.
+Eino 使用类 Pregel（或 DAG 风格）的执行模型，多个节点可以同时运行。当 `ToolsNode` 并行运行 3 个工具且其中 2 个中断时，检查点必须：
+- 记录 1 个已完成工具的输出。
+- 记录 2 个暂停工具的中断信号。
+- 为同样发生中断的子图节点存储子图检查点。
 
-### 2.3 Stream Materialization
+### 2.3 流物化
 
-Eino supports streaming (`Stream`, `Transform`, `Collect`) as first-class execution modes. A `StreamReader` is an ephemeral, one-shot consumer — once consumed, it is gone. Before checkpointing, all stream values in channels and inputs must be materialized into concrete values (`convertCheckPoint` in `compose/checkpoint.go:272`). On resumption, those concrete values must be re-wrapped into `StreamReader` instances (`restoreCheckPoint` in `compose/checkpoint.go:291`) so that downstream stream-mode nodes receive the correct types.
+Eino 将流（`Stream`、`Transform`、`Collect`）作为一等执行模式支持。`StreamReader` 是一个临时的、一次性消费者 —— 一旦消费，它就消失了。在创建检查点之前，通道和输入中的所有流值必须物化为具体值（`compose/checkpoint.go:272` 中的 `convertCheckPoint`）。恢复时，这些具体值必须重新包装为 `StreamReader` 实例（`compose/checkpoint.go:291` 中的 `restoreCheckPoint`），以便下游的流模式节点接收到正确的类型。
 
-### 2.4 Legacy Interoperability
+### 2.4 遗留互操作性
 
-Eino's original interrupt mechanism (`InterruptAndRerun`, `NewInterruptAndRerunErr`) was a flat sentinel error with no address or unique ID. The modern system (`Interrupt`, `StatefulInterrupt`, `CompositeInterrupt`) must coexist with legacy code via `WrapInterruptAndRerunIfNeeded` (`compose/interrupt.go:78`) and the deprecated path through `CompositeInterrupt` (`compose/interrupt.go:181-213`).
+Eino 原始的中断机制（`InterruptAndRerun`、`NewInterruptAndRerunErr`）是一个没有地址或唯一 ID 的扁平哨兵错误。现代系统（`Interrupt`、`StatefulInterrupt`、`CompositeInterrupt`）必须通过 `WrapInterruptAndRerunIfNeeded`（`compose/interrupt.go:78`）以及经过 `CompositeInterrupt` 的废弃路径（`compose/interrupt.go:181-213`）与遗留代码共存。
 
-### 2.5 Composite Component Duality
+### 2.5 复合组件的双重性
 
-A `ToolsNode` or a `Lambda` that wraps a sub-`Graph` must serve two roles simultaneously:
-1. **Self-targeting**: The composite node itself might be the resume target (e.g., to modify its own internal state).
-2. **Conduit**: If the resume target is a descendant, the composite node must re-execute its children to let the resume context flow down — it must not consume the signal.
+包裹子 `Graph` 的 `ToolsNode` 或 `Lambda` 必须同时扮演两种角色：
+1. **自指目标**：复合节点本身可能是恢复目标（例如，修改自身的内部状态）。
+2. **管道**：如果恢复目标是后代节点，复合节点必须重新执行其子节点以让恢复上下文向下流动 —— 它不能消费该信号。
 
-This duality is encoded in `GetResumeContext`'s return value `isResumeTarget` (`compose/resume.go:77`): `true` with `hasData = false` means "a descendant is the target, propagate"; `true` with `hasData = true` means "you are the direct target."
+这种双重性编码在 `GetResumeContext` 的返回值 `isResumeTarget` 中（`compose/resume.go:77`）：`true` 且 `hasData = false` 表示“某后代是目标，向下传播”；`true` 且 `hasData = true` 表示“你本人是直接目标”。
 
-## 3. Design Idea
+## 3. 设计思路
 
-Eino's design rests on four pillars:
+Eino 的设计建立在四个支柱之上：
 
-### 3.1 Address System (`internal/core/address.go`)
+### 3.1 地址系统（`internal/core/address.go`）
 
-Every execution context carries a hierarchical `Address` — a `[]AddressSegment` — stored in the Go context under `addrCtxKey{}`. Each `AddressSegment` has:
+每个执行上下文携带一个分层 `Address` —— 即 `[]AddressSegment` —— 存储在 Go context 的 `addrCtxKey{}` 键下。每个 `AddressSegment` 包含：
 
 ```go
 // internal/core/address.go:69-77
 type AddressSegment struct {
-    ID    string              // node key, tool name, runnable name
-    Type  AddressSegmentType  // "node", "tool", "runnable"
-    SubID string              // tool call ID for disambiguation
+    ID    string              // 节点键、工具名、runnable 名称
+    Type  AddressSegmentType  // "node"、"tool"、"runnable"
+    SubID string              // 工具调用 ID，用于消歧义
 }
 ```
 
-Three segment types are defined (`compose/interrupt.go:275-286`):
-- `AddressSegmentNode` (`"node"`) — graph nodes added via `AddLambdaNode`, `AddGraphNode`, etc.
-- `AddressSegmentTool` (`"tool"`) — tool invocations within a `ToolsNode`.
-- `AddressSegmentRunnable` (`"runnable"`) — standalone `Graph`/`Workflow`/`Chain` instances (created by `WithGraphName`).
+定义了三种段类型（`compose/interrupt.go:275-286`）：
+- `AddressSegmentNode`（`"node"`）—— 通过 `AddLambdaNode`、`AddGraphNode` 等添加的图节点。
+- `AddressSegmentTool`（`"tool"`）—— `ToolsNode` 内部的工具调用。
+- `AddressSegmentRunnable`（`"runnable"`）—— 独立的 `Graph` / `Workflow` / `Chain` 实例（由 `WithGraphName` 创建）。
 
-The `String()` method (`internal/core/address.go:35-53`) produces a stable, joinable representation: `runnable:root;node:sub_a;tool:my_tool:call_1`.
+`String()` 方法（`internal/core/address.go:35-53`）产生一个稳定的、可连接的表示形式：`runnable:root;node:sub_a;tool:my_tool:call_1`。
 
-`AppendAddressSegment` (`internal/core/address.go:118-187`) is called whenever the runtime enters a new execution scope (graph node, tool call, sub-runnable). It:
-1. Builds the new hierarchical address by extending the parent's address.
-2. Checks `globalResumeInfo` (the global resume target map) to see if this new address matches a stored interrupt state or resume data.
-3. Sets `interruptState`, `isResumeTarget`, and `resumeData` on the new `addrCtx` accordingly.
+`AppendAddressSegment`（`internal/core/address.go:118-187`）在运行时进入新的执行作用域（图节点、工具调用、子 runnable）时被调用。它：
+1. 通过扩展父地址来构建新的分层地址。
+2. 检查 `globalResumeInfo`（全局恢复目标映射），判断新地址是否匹配已存储的中断状态或恢复数据。
+3. 相应地在新的 `addrCtx` 上设置 `interruptState`、`isResumeTarget` 和 `resumeData`。
 
-A critical design choice: `isResumeTarget` is set to `true` not only when the address **exactly** matches a resume target, but also when a resume target exists that is a **descendant** of the current address (`internal/core/address.go:175-183`). This is what enables composite components to act as conduits — they know a child needs resuming.
+一个关键的设计选择：`isResumeTarget` 不仅在地址**精确**匹配恢复目标时设为 `true`，也会在存在一个恢复目标是当前地址的**后代**时设为 `true`（`internal/core/address.go:175-183`）。这正是让复合组件能够充当管道的机制 —— 它们知道有子节点需要恢复。
 
-### 3.2 InterruptSignal Tree (`internal/core/interrupt.go`)
+### 3.2 InterruptSignal 树（`internal/core/interrupt.go`）
 
-At the heart of the interrupt mechanism is `InterruptSignal` (`internal/core/interrupt.go:43-49`):
+中断机制的核心是 `InterruptSignal`（`internal/core/interrupt.go:43-49`）：
 
 ```go
 type InterruptSignal struct {
     ID             string               // UUID
-    Address        Address              // hierarchical address
+    Address        Address              // 分层地址
     InterruptInfo  InterruptInfo        // { Info any, IsRootCause bool }
     InterruptState InterruptState       // { State any, LayerSpecificPayload any }
-    Subs           []*InterruptSignal   // child signals (for composite/virtual nodes)
+    Subs           []*InterruptSignal   // 子信号（用于复合/虚拟节点）
 }
 ```
 
-The `Subs` field makes this a tree, not a flat list. A `CompositeInterrupt` (e.g., from a `ToolsNode` with 3 parallel tool calls where 2 interrupt) produces a parent signal with `Subs: [signal_tool_1, signal_tool_2]`. This tree can then be serialized into the checkpoint and reconstructed on resume.
+`Subs` 字段使其成为一棵树而非扁平的列表。`CompositeInterrupt`（例如，来自一个并行运行 3 个工具调用且其中 2 个中断的 `ToolsNode`）产生一个带有 `Subs: [signal_tool_1, signal_tool_2]` 的父信号。这棵树随后可被序列化到检查点中，并在恢复时重建。
 
-Key conversion functions:
-- `SignalToPersistenceMaps` (`internal/core/interrupt.go:327-349`): Flattens the tree into two maps (`id2addr`, `id2state`) for checkpoint storage.
-- `ToInterruptContexts` (`internal/core/interrupt.go:254-294`): Converts the tree into a flat list of user-facing `InterruptCtx` objects (root causes only), each with a `Parent` pointer for tree traversal.
-- `FromInterruptContexts` (`internal/core/interrupt.go:198-243`): Reconstructs the tree from a flat list of `InterruptCtx` objects — used when bridging across execution environments (e.g., ADK agent tools).
+关键转换函数：
+- `SignalToPersistenceMaps`（`internal/core/interrupt.go:327-349`）：将树扁平化为两个映射（`id2addr`、`id2state`），用于检查点存储。
+- `ToInterruptContexts`（`internal/core/interrupt.go:254-294`）：将树转换为面向用户的扁平 `InterruptCtx` 对象列表（仅根因），每个对象带有一个 `Parent` 指针用于树遍历。
+- `FromInterruptContexts`（`internal/core/interrupt.go:198-243`）：从扁平的 `InterruptCtx` 对象列表重建树 —— 用于跨执行环境桥接时（例如 ADK agent 工具）。
 
-### 3.3 Checkpoint Persistence (`compose/checkpoint.go`)
+### 3.3 检查点持久化（`compose/checkpoint.go`）
 
-The `checkpoint` struct (`compose/checkpoint.go:106-117`) captures the full execution snapshot:
+`checkpoint` 结构体（`compose/checkpoint.go:106-117`）捕获完整的执行快照：
 
 ```go
 type checkpoint struct {
-    Channels       map[string]channel          // in-flight channel values
-    Inputs         map[string]any              // pending task inputs
-    State          any                         // graph-level state
-    SkipPreHandler map[string]bool             // pre-handler skip flags
-    RerunNodes     []string                    // nodes that need re-run
-    SubGraphs      map[string]*checkpoint      // nested sub-graph checkpoints
-    InterruptID2Addr  map[string]Address       // flattened interrupt ID → address
-    InterruptID2State map[string]core.InterruptState // flattened interrupt ID → state
+    Channels       map[string]channel          // 在途通道值
+    Inputs         map[string]any              // 待处理任务输入
+    State          any                         // 图级状态
+    SkipPreHandler map[string]bool             // 前置处理器跳过标记
+    RerunNodes     []string                    // 需要重新运行的节点
+    SubGraphs      map[string]*checkpoint      // 嵌套子图检查点
+    InterruptID2Addr  map[string]Address       // 扁平化中断 ID → 地址
+    InterruptID2State map[string]core.InterruptState // 扁平化中断 ID → 状态
 }
 ```
 
-Key design decisions:
-- **Nested SubGraphs**: Each sub-graph node's checkpoint is stored in `SubGraphs[nodeKey]`, allowing recursive nesting. On resume, `forwardCheckPoint` (`compose/checkpoint.go:157-168`) plucks the nested checkpoint and injects it into the child context, deleting it from the parent to "forward only once."
-- **Stream Conversion**: `convertCheckPoint` and `restoreCheckPoint` (`compose/checkpoint.go:272-307`) handle the bidirectional conversion between stream and non-stream values via `streamConverter`, backed by registered `streamConvertPair` entries (`compose/checkpoint.go:309-373`).
-- **State Modification**: `WithStateModifier` (`compose/checkpoint.go:100`) allows injecting a `StateModifier` callback invoked during checkpoint read/write for migration or runtime augmentation.
-- **Checkpoint Migration**: `MigrateCheckpointState` (`compose/checkpoint.go:231-244`) is an advanced utility for upgrading checkpoint schemas across framework versions.
+关键设计决策：
+- **嵌套子图**：每个子图节点的检查点存储在 `SubGraphs[nodeKey]` 中，允许递归嵌套。恢复时，`forwardCheckPoint`（`compose/checkpoint.go:157-168`）取出嵌套检查点并将其注入子图上下文中，同时将其从父图中删除以“仅转发一次”。
+- **流转换**：`convertCheckPoint` 和 `restoreCheckPoint`（`compose/checkpoint.go:272-307`）通过 `streamConverter` 处理流与非流值之间的双向转换，该转换器由注册的 `streamConvertPair` 条目支持（`compose/checkpoint.go:309-373`）。
+- **状态修改**：`WithStateModifier`（`compose/checkpoint.go:100`）允许注入一个 `StateModifier` 回调，在检查点读取/写入时调用，用于迁移或运行时增强。
+- **检查点迁移**：`MigrateCheckpointState`（`compose/checkpoint.go:231-244`）是一个高级工具，用于跨框架版本升级检查点模式。
 
-### 3.4 Resume Context Injection
+### 3.4 恢复上下文注入
 
-The resume data flow has three stages:
+恢复数据流有三个阶段：
 
-**Stage 1 — User provides resume targets**: `Resume(ctx, id)` / `ResumeWithData(ctx, id, data)` / `BatchResumeWithData(ctx, map)` (`compose/resume.go:94-121`) inject a `globalResumeInfo` into the context, mapping interrupt IDs to resume data.
+**阶段 1 —— 用户提供恢复目标**：`Resume(ctx, id)` / `ResumeWithData(ctx, id, data)` / `BatchResumeWithData(ctx, map)`（`compose/resume.go:94-121`）将 `globalResumeInfo` 注入 context，将中断 ID 映射到恢复数据。
 
-**Stage 2 — Checkpoint restores interrupt state**: When the graph loads a checkpoint on resume, `setCheckPointToCtx` (`compose/checkpoint.go:145-148`) calls `core.PopulateInterruptState` (`internal/core/address.go:271-321`) to merge the checkpoint's `InterruptID2Addr` and `InterruptID2State` maps into the existing `globalResumeInfo`. This is how components learn they were interrupted in a prior run.
+**阶段 2 —— 检查点恢复中断状态**：当图在恢复时加载检查点，`setCheckPointToCtx`（`compose/checkpoint.go:145-148`）调用 `core.PopulateInterruptState`（`internal/core/address.go:271-321`）将检查点的 `InterruptID2Addr` 和 `InterruptID2State` 映射合并到现有的 `globalResumeInfo` 中。这就是组件如何得知自己在之前的运行中曾被中断。
 
-**Stage 3 — Address matching distributes state**: As the graph creates tasks, `AppendAddressSegment` (step 3.1 above) matches the new address against the `globalResumeInfo` maps, setting `interruptState` and `isResumeTarget` on each leaf's `addrCtx`.
+**阶段 3 —— 地址匹配分发状态**：当图创建任务时，`AppendAddressSegment`（上述步骤 3.1）将新地址与 `globalResumeInfo` 映射进行匹配，在每个叶子节点的 `addrCtx` 上设置 `interruptState` 和 `isResumeTarget`。
 
-Components read this state using two public APIs (`compose/resume.go:32-78`):
-- `GetInterruptState[T](ctx)` — "Was I interrupted before? Here's my saved state."
-- `GetResumeContext[T](ctx)` — "Am I the resume target? Here's the resume data."
+组件通过两个公开 API 读取此状态（`compose/resume.go:32-78`）：
+- `GetInterruptState[T](ctx)` —— “我之前被中断过吗？这是我保存的状态。”
+- `GetResumeContext[T](ctx)` —— “我是恢复目标吗？这是恢复数据。”
 
-## 4. Source Walkthrough
+## 4. 源码走读
 
-### 4.1 Key Files and Their Roles
+### 4.1 关键文件及其角色
 
-| File | Role |
+| 文件 | 角色 |
 |------|------|
-| `compose/checkpoint.go` | `checkpoint` struct definition, serialization, stream conversion, `MigrateCheckpointState`, `WithCheckPointStore`, `WithCheckPointID`, `WithForceNewRun` |
-| `compose/interrupt.go` | Public interrupt APIs: `Interrupt`, `StatefulInterrupt`, `CompositeInterrupt`, `WrapInterruptAndRerunIfNeeded`; `InterruptInfo` struct; `subGraphInterruptError`; `ExtractInterruptInfo` |
-| `compose/resume.go` | Public resume APIs: `GetInterruptState`, `GetResumeContext`, `Resume`, `ResumeWithData`, `BatchResumeWithData`, `AppendAddressSegment`, `GetCurrentAddress` |
-| `internal/core/address.go` | `Address` / `AddressSegment` types, `AppendAddressSegment` (the core context builder), `PopulateInterruptState`, `BatchResumeWithData`, `GetNextResumptionPoints` |
-| `internal/core/interrupt.go` | `InterruptSignal` tree, `core.Interrupt`, `SignalToPersistenceMaps`, `ToInterruptContexts`, `FromInterruptContexts`, `CheckPointStore` interface |
-| `internal/core/resume.go` | `GetInterruptState`, `GetResumeContext` implementations, `getRunCtx` |
-| `compose/graph_run.go` | `handleInterrupt` (line 502), `handleInterruptWithSubGraphAndRerunNodes` (line 598), `resolveInterruptCompletedTasks` (line 457), `restoreCheckPointState` (line 382), `restoreTasks` (line 777), `createTasks` (line 735) |
-| `compose/graph_call_options.go` | `WithGraphInterrupt` (external cancellation, line 72) |
-| `compose/tool_node.go` | `ToolsNode` composite interrupt handling for parallel tool calls |
+| `compose/checkpoint.go` | `checkpoint` 结构体定义、序列化、流转换、`MigrateCheckpointState`、`WithCheckPointStore`、`WithCheckPointID`、`WithForceNewRun` |
+| `compose/interrupt.go` | 公开中断 API：`Interrupt`、`StatefulInterrupt`、`CompositeInterrupt`、`WrapInterruptAndRerunIfNeeded`；`InterruptInfo` 结构体；`subGraphInterruptError`；`ExtractInterruptInfo` |
+| `compose/resume.go` | 公开恢复 API：`GetInterruptState`、`GetResumeContext`、`Resume`、`ResumeWithData`、`BatchResumeWithData`、`AppendAddressSegment`、`GetCurrentAddress` |
+| `internal/core/address.go` | `Address` / `AddressSegment` 类型，`AppendAddressSegment`（核心上下文构建器），`PopulateInterruptState`，`BatchResumeWithData`，`GetNextResumptionPoints` |
+| `internal/core/interrupt.go` | `InterruptSignal` 树，`core.Interrupt`，`SignalToPersistenceMaps`，`ToInterruptContexts`，`FromInterruptContexts`，`CheckPointStore` 接口 |
+| `internal/core/resume.go` | `GetInterruptState`、`GetResumeContext` 实现，`getRunCtx` |
+| `compose/graph_run.go` | `handleInterrupt`（第 502 行），`handleInterruptWithSubGraphAndRerunNodes`（第 598 行），`resolveInterruptCompletedTasks`（第 457 行），`restoreCheckPointState`（第 382 行），`restoreTasks`（第 777 行），`createTasks`（第 735 行） |
+| `compose/graph_call_options.go` | `WithGraphInterrupt`（外部取消，第 72 行） |
+| `compose/tool_node.go` | 并行工具调用的 `ToolsNode` 复合中断处理 |
 
-### 4.2 Execution Flow: Interrupt
-
-```
-1. Node returns InterruptSignal (via Interrupt/StatefulInterrupt/CompositeInterrupt)
-2. graph_run.resolveInterruptCompletedTasks (line 457) detects the signal
-   - SubGraphInterruptError → stored in tempInfo.subGraphInterrupts[nodeKey]
-   - InterruptSignal with IsRootCause → collected in tempInfo.signals
-   - Rerun node interrupt → stored in tempInfo.interruptRerunNodes
-3. graph_run.handleInterrupt (line 502) or handleInterruptWithSubGraphAndRerunNodes (line 598):
-   a. Constructs checkpoint with Channels, Inputs, State, SkipPreHandler, RerunNodes, SubGraphs
-   b. Calls core.Interrupt(ctx, info, nil, tempInfo.signals) → builds InterruptSignal tree
-   c. Calls SignalToPersistenceMaps → populates cp.InterruptID2Addr, cp.InterruptID2State
-   d. Calls convertCheckPoint → materializes streams
-   e. If subgraph: returns subGraphInterruptError{CheckPoint: cp, Info: intInfo}
-   f. If root: persists cp to CheckPointStore, returns interruptError{Info: intInfo}
-```
-
-### 4.3 Execution Flow: Resume
+### 4.2 执行流程：中断
 
 ```
-1. User calls ResumeWithData(ctx, id, data) → injects globalResumeInfo into ctx
-2. Graph.Invoke(ctx, input, WithCheckPointID(id)) → loads checkpoint from store
-3. setCheckPointToCtx (checkpoint.go:145):
-   a. Calls PopulateInterruptState → merges checkpoint interrupt maps into globalResumeInfo
-   b. Puts checkpoint into ctx under checkPointKey{}
-4. graph_run.restoreCheckPointState (line 382):
-   a. Reads runCtx.isResumeTarget and runCtx.resumeData
-   b. If targeted with data, overwrites checkpoint state
-   c. Calls convertCheckPoint → materializes streams in checkpoint
-5. graph_run.run() (line 109): restores tasks from checkpoint, re-executes graph
-6. createTasks (line 735): for each new task:
-   a. Calls forwardCheckPoint for sub-graph nodes
-   b. Calls AppendAddressSegment → builds hierarchical address → matches resume data
-7. Component receives ctx with interruptState + resumeData set on its addrCtx
-8. Component calls GetInterruptState → sees wasInterrupted=true, retrieves state
-9. Component calls GetResumeContext → sees isResumeTarget=true, retrieves data
+1. 节点返回 InterruptSignal（通过 Interrupt / StatefulInterrupt / CompositeInterrupt）
+2. graph_run.resolveInterruptCompletedTasks（第 457 行）检测到信号
+   - SubGraphInterruptError → 存入 tempInfo.subGraphInterrupts[nodeKey]
+   - 带有 IsRootCause 的 InterruptSignal → 收集到 tempInfo.signals 中
+   - Rerun 节点中断 → 存入 tempInfo.interruptRerunNodes
+3. graph_run.handleInterrupt（第 502 行）或 handleInterruptWithSubGraphAndRerunNodes（第 598 行）：
+   a. 构建包含 Channels、Inputs、State、SkipPreHandler、RerunNodes、SubGraphs 的检查点
+   b. 调用 core.Interrupt(ctx, info, nil, tempInfo.signals) → 构建 InterruptSignal 树
+   c. 调用 SignalToPersistenceMaps → 填充 cp.InterruptID2Addr、cp.InterruptID2State
+   d. 调用 convertCheckPoint → 物化流数据
+   e. 如果是子图：返回 subGraphInterruptError{CheckPoint: cp, Info: intInfo}
+   f. 如果是根图：将 cp 持久化到 CheckPointStore，返回 interruptError{Info: intInfo}
 ```
 
-### 4.4 Sub-graph Interrupt Propagation
+### 4.3 执行流程：恢复
 
 ```
-Sub-graph Node → InterruptSignal
+1. 用户调用 ResumeWithData(ctx, id, data) → 将 globalResumeInfo 注入 ctx
+2. Graph.Invoke(ctx, input, WithCheckPointID(id)) → 从存储加载检查点
+3. setCheckPointToCtx（checkpoint.go:145）：
+   a. 调用 PopulateInterruptState → 将检查点的中断映射合并到 globalResumeInfo 中
+   b. 将检查点放入 ctx 的 checkPointKey{} 键下
+4. graph_run.restoreCheckPointState（第 382 行）：
+   a. 读取 runCtx.isResumeTarget 和 runCtx.resumeData
+   b. 如果是有数据的定向目标，则覆盖检查点状态
+   c. 调用 convertCheckPoint → 物化检查点中的流数据
+5. graph_run.run()（第 109 行）：从检查点恢复任务，重新执行图
+6. createTasks（第 735 行）：对于每个新任务：
+   a. 对子图节点调用 forwardCheckPoint
+   b. 调用 AppendAddressSegment → 构建分层地址 → 匹配恢复数据
+7. 组件接收在其 addrCtx 上设置了 interruptState + resumeData 的 ctx
+8. 组件调用 GetInterruptState → 看到 wasInterrupted=true，获取到状态
+9. 组件调用 GetResumeContext → 看到 isResumeTarget=true，获取到数据
+```
+
+### 4.4 子图中断传播
+
+```
+子图节点 → InterruptSignal
     ↓
-Sub-graph runner.handleInterrupt
-    → returns subGraphInterruptError{CheckPoint, Info, signal}
+子图 runner.handleInterrupt
+    → 返回 subGraphInterruptError{CheckPoint, Info, signal}
     ↓
-Parent graph.resolveInterruptCompletedTasks
-    → detects via isSubGraphInterrupt (interrupt.go:329)
-    → stores in tempInfo.subGraphInterrupts[nodeKey]
-    → collects signal into tempInfo.signals
+父图 resolveInterruptCompletedTasks
+    → 通过 isSubGraphInterrupt 检测（interrupt.go:329）
+    → 存入 tempInfo.subGraphInterrupts[nodeKey]
+    → 将 signal 收集到 tempInfo.signals 中
     ↓
-Parent graph.handleInterruptWithSubGraphAndRerunNodes
+父图 handleInterruptWithSubGraphAndRerunNodes
     → cp.SubGraphs[nodeKey] = subGraphInterruptError.CheckPoint
     → intInfo.SubGraphs[nodeKey] = subGraphInterruptError.Info
-    → calls core.Interrupt with accumulated tempInfo.signals (including sub's)
-    → builds unified InterruptSignal tree with correct parent-child relationships
+    → 使用累积的 tempInfo.signals（包含子图的）调用 core.Interrupt
+    → 构建具有正确父子关系的统一 InterruptSignal 树
 ```
 
-On resume, the nested checkpoint is forwarded via `forwardCheckPoint` (`checkpoint.go:157-168`):
+恢复时，嵌套检查点通过 `forwardCheckPoint` 转发（`checkpoint.go:157-168`）：
+
 ```go
 func forwardCheckPoint(ctx context.Context, nodeKey string) context.Context {
     cp := getCheckPointFromCtx(ctx)
     if subCP, ok := cp.SubGraphs[nodeKey]; ok {
-        delete(cp.SubGraphs, nodeKey) // only forward once
+        delete(cp.SubGraphs, nodeKey) // 仅转发一次
         return context.WithValue(ctx, checkPointKey{}, subCP)
     }
     return context.WithValue(ctx, checkPointKey{}, (*checkpoint)(nil))
 }
 ```
 
-## 5. Patterns and Examples
+## 5. 模式与示例
 
-### 5.1 Simple Interrupt and Resume
+### 5.1 简单中断与恢复
 
-A lambda node that interrupts with typed state and resumes with data:
+一个 lambda 节点，使用类型化状态中断，并使用数据恢复：
 
 ```go
 type myState struct{ OriginalInput string }
@@ -247,7 +248,7 @@ lambda := InvokableLambda(func(ctx context.Context, input string) (string, error
             &myState{OriginalInput: input},
         )
     }
-    // Resumed
+    // 已恢复
     isResume, hasData, data := GetResumeContext[*myData](ctx)
     if isResume && hasData {
         return "resumed: " + data.Message, nil
@@ -256,22 +257,22 @@ lambda := InvokableLambda(func(ctx context.Context, input string) (string, error
 })
 ```
 
-Caller extracts interrupt info and resumes:
+调用方提取中断信息并恢复：
 
 ```go
-// First run → interrupts
+// 首次运行 → 中断
 out, err := graph.Invoke(ctx, "input", WithCheckPointID("cp1"))
 info, _ := ExtractInterruptInfo(err)
 id := info.InterruptContexts[0].ID
 
-// Resume
+// 恢复
 ctx2 := ResumeWithData(context.Background(), id, &myData{Message: "go ahead"})
 out, err = graph.Invoke(ctx2, "", WithCheckPointID("cp1"))
 ```
 
-### 5.2 Composite Component with Multiple Sub-processes
+### 5.2 多子进程的复合组件
 
-A "batch" lambda that fans out N parallel sub-processes, each with its own address segment and independent interrupt/resume cycle:
+一个“批量”lambda，扇出 N 个并行子进程，每个子进程拥有自己的地址段和独立的中断/恢复循环：
 
 ```go
 const PathProcess AddressSegmentType = "process"
@@ -294,18 +295,18 @@ batchLambda := InvokableLambda(func(ctx context.Context, _ string) (map[string]s
 })
 ```
 
-The key pattern: each sub-process gets its own address segment via `AppendAddressSegment`, its own interrupt state, and the parent uses `CompositeInterrupt` to bundle all sub-errors into a tree. The caller sees 3 flat `InterruptCtx`s (root causes) with a shared parent.
+关键模式：每个子进程通过 `AppendAddressSegment` 获得自己的地址段和中断状态，父节点使用 `CompositeInterrupt` 将所有子错误捆绑为一棵树。调用方看到的是 3 个扁平的 `InterruptCtx`（根因），这些根因共享一个父节点。
 
-### 5.3 Graph-within-Lambda Interrupt Propagation
+### 5.3 Lambda 内嵌 Graph 的中断传播
 
-When a `Lambda` node wraps a standalone compiled `Graph`, the inner graph's `runnable` address segment is automatically prepended (`compose/resume.go:131-133`). The lambda acts as a composite node:
+当 `Lambda` 节点包裹一个独立编译的 `Graph` 时，内部图的 `runnable` 地址段会自动前置（`compose/resume.go:131-133`）。lambda 充当复合节点：
 
 ```go
 compositeLambda := InvokableLambda(func(ctx context.Context, input string) (string, error) {
     output, err := compiledInnerGraph.Invoke(ctx, input, WithCheckPointID("inner-cp"))
     if err != nil {
         if _, isInterrupt := ExtractInterruptInfo(err); isInterrupt {
-            // Pass the inner graph's interrupt up, with the lambda's own address
+            // 将内部图的中断向上传递，附带 lambda 自身的地址
             return "", CompositeInterrupt(ctx, "composite interrupt from lambda", nil, err)
         }
         return "", err
@@ -314,15 +315,15 @@ compositeLambda := InvokableLambda(func(ctx context.Context, input string) (stri
 })
 ```
 
-The resulting address: `runnable:root;node:composite_lambda;runnable:inner;node:inner_lambda`
+生成的地址：`runnable:root;node:composite_lambda;runnable:inner;node:inner_lambda`
 
-### 5.4 ReAct-style Re-entry with Tool Interrupts
+### 5.4 带工具中断的 ReAct 风格重入
 
-A common pattern where a `ChatModel` → `ToolsNode` loop interrupts on tool calls, resumes, and the model may call the same tool again — the re-entrant call must have a fresh context (not marked as interrupted). Tests demonstrate this in `compose/resume_test.go:628` (`TestReentryForResumedTools`): on the second invocation, `call_1` is resumed (wasInterrupted=true, isResumeTarget=true), `call_2` re-interrupts (wasInterrupted=true, isResumeTarget=false), and on the third invocation the model creates a new `call_3` (wasInterrupted=false, isResumeTarget=false).
+一种常见模式：`ChatModel` → `ToolsNode` 循环在工具调用时中断，恢复后模型可能再次调用同一工具 —— 重入调用必须拥有新的上下文（不标记为已中断）。测试在 `compose/resume_test.go:628`（`TestReentryForResumedTools`）中演示了这一点：在第二次调用时，`call_1` 被恢复（wasInterrupted=true, isResumeTarget=true），`call_2` 重新中断（wasInterrupted=true, isResumeTarget=false），而在第三次调用时，模型创建一个新的 `call_3`（wasInterrupted=false, isResumeTarget=false）。
 
-### 5.5 Checkpoint Migration
+### 5.5 检查点迁移
 
-When graph state types change, use `MigrateCheckpointState` to transform old checkpoints:
+当图状态类型发生变化时，使用 `MigrateCheckpointState` 转换旧的检查点：
 
 ```go
 newBytes, err := MigrateCheckpointState(oldBytes, serializer, func(state any) (any, bool, error) {
@@ -333,28 +334,28 @@ newBytes, err := MigrateCheckpointState(oldBytes, serializer, func(state any) (a
 })
 ```
 
-The migrate function is applied recursively to `checkpoint.State` and all `SubGraphs`' states (`compose/checkpoint.go:247-269`).
+迁移函数会递归应用于 `checkpoint.State` 和所有 `SubGraphs` 的状态（`compose/checkpoint.go:247-269`）。
 
-## 6. Common Pitfalls
+## 6. 常见陷阱
 
-### 6.1 Forgetting to Call `WrapInterruptAndRerunIfNeeded` for Legacy Errors
+### 6.1 忘记为遗留错误调用 `WrapInterruptAndRerunIfNeeded`
 
-When using the deprecated `InterruptAndRerun` or `NewInterruptAndRerunErr` inside a composite component, the errors must be wrapped with `WrapInterruptAndRerunIfNeeded` (`compose/interrupt.go:78`) before being passed to `CompositeInterrupt`. Without wrapping, the errors lack address context and the interrupt point's address will be empty.
+在复合组件内部使用已废弃的 `InterruptAndRerun` 或 `NewInterruptAndRerunErr` 时，错误必须在传递给 `CompositeInterrupt` 之前用 `WrapInterruptAndRerunIfNeeded`（`compose/interrupt.go:78`）进行包装。如果不包装，错误将缺少地址上下文，中断点的地址将为空。
 
-### 6.2 Not Re-interrupting When `isResumeTarget` is False
+### 6.2 `isResumeTarget` 为 false 时未重新中断
 
-In an explicit targeted resume scenario, if `GetResumeContext` returns `isResumeTarget = false`, the component **must** re-interrupt. Otherwise, the state is lost and the graph continues as if no interruption occurred — potentially producing incorrect results or failing silently. The pattern is:
+在显式定向恢复场景中，如果 `GetResumeContext` 返回 `isResumeTarget = false`，组件**必须**重新中断。否则，状态将丢失，图会像没有发生过中断一样继续运行 —— 可能导致错误结果或静默失败。正确的模式是：
 
 ```go
 isResume, _, _ := GetResumeContext[myData](ctx)
 if !isResume {
-    return "", StatefulInterrupt(ctx, "still waiting", state) // re-interrupt
+    return "", StatefulInterrupt(ctx, "still waiting", state) // 重新中断
 }
 ```
 
-### 6.3 Stream Leak in Callback Handlers
+### 6.3 回调处理器中的流泄漏
 
-When writing callbacks for streaming contexts, the `OnStartWithStreamInput` and `OnEndWithStreamOutput` handlers receive `StreamReader` copies. These copies **must** be closed, otherwise goroutine/memory leaks occur. The pattern is:
+在编写流上下文的回调时，`OnStartWithStreamInput` 和 `OnEndWithStreamOutput` 处理器接收的是 `StreamReader` 的副本。这些副本**必须**关闭，否则会导致 goroutine / 内存泄漏。正确的模式是：
 
 ```go
 func (h *myHandler) OnStartWithStreamInput(ctx context.Context, info *callbacks.RunInfo,
@@ -364,40 +365,40 @@ func (h *myHandler) OnStartWithStreamInput(ctx context.Context, info *callbacks.
 }
 ```
 
-### 6.4 Assuming Sequential Resumption
+### 6.4 假设恢复是顺序进行的
 
-Parallel interrupts (e.g., 3 tool calls all interrupt) can be resumed independently and in any order. Components should not assume that the first resume processes all interrupt points — each must be targeted explicitly, and the batch node must track which sub-processes have completed. See `compose/resume_test.go:375` (`TestMultipleInterruptsAndResumes`) for the correct pattern with `batchState.Results` tracking.
+并行中断（例如 3 个工具调用全部中断）可以独立且以任意顺序恢复。组件不应假定第一次恢复就处理了所有中断点 —— 每个中断点必须显式地被定向，且批量节点必须跟踪哪些子进程已完成。请参阅 `compose/resume_test.go:375`（`TestMultipleInterruptsAndResumes`）了解使用 `batchState.Results` 跟踪的正确模式。
 
-### 6.5 Sub-graph State Not Being Updated
+### 6.5 子图状态未被更新
 
-When a sub-graph node interrupts, its state is inside `info.SubGraphs[nodeKey].State`, not `info.State`. Callers that only check `info.State` will miss sub-graph state changes. Similarly, when resuming, the sub-graph's state is in `cp.SubGraphs[nodeKey].State` and is forwarded via `forwardCheckPoint` — the parent must not overwrite it.
+当子图节点中断时，其状态在 `info.SubGraphs[nodeKey].State` 中，而非 `info.State`。仅检查 `info.State` 的调用方会丢失子图的状态变更。同样，恢复时，子图的状态在 `cp.SubGraphs[nodeKey].State` 中，并通过 `forwardCheckPoint` 转发 —— 父节点不得覆盖它。
 
-### 6.6 Not Registering Types for Serialization
+### 6.6 未注册序列化类型
 
-Custom types used in interrupt state or resume data must be registered with `schema.RegisterName[T](name)` or `schema.Register[T]()`, otherwise checkpoint serialization will fail. Examples in `compose/checkpoint_test.go` use `schema.Register[testStruct]()` and `schema.Register[*testPersistRerunInputState]()`.
+中断状态或恢复数据中使用的自定义类型必须通过 `schema.RegisterName[T](name)` 或 `schema.Register[T]()` 进行注册，否则检查点序列化将失败。`compose/checkpoint_test.go` 中的示例使用了 `schema.Register[testStruct]()` 和 `schema.Register[*testPersistRerunInputState]()`。
 
-### 6.7 Confusing `GetInterruptState` with `GetResumeContext`
+### 6.7 混淆 `GetInterruptState` 与 `GetResumeContext`
 
-`GetInterruptState` answers "was I interrupted before / what was my state?" — it returns true during any resumed run, regardless of whether this specific component is the resume target. `GetResumeContext` answers "am I the explicit resume target / what data was sent to me?" — it returns true only when this specific address was targeted. A component that was interrupted but is not the current resume target must re-interrupt.
+`GetInterruptState` 回答的问题是“我之前被中断过吗 / 我的状态是什么？”—— 它在任何恢复运行中返回 true，无论该特定组件是否是恢复目标。`GetResumeContext` 回答的问题是“我是显式恢复目标吗 / 发送给我的数据是什么？”—— 仅当该特定地址被定向时才返回 true。一个被中断过但不是当前恢复目标的组件必须重新中断。
 
-## 7. What Rive Can Learn
+## 7. Rive 可以借鉴的地方
 
-### 7.1 Execution Point Identity Needs to Be Structural, Not Descriptive
+### 7.1 执行点身份应当是结构性的，而非描述性的
 
-Eino's address is a deterministic chain of typed, ID'd segments built from the graph topology (`compose/resume.go:123-140`). It is not a natural language description or a stack trace. For Rive's dispatch/resume model, this means: a resume point should be identified by `run_id + node_id + dispatch_id + subdispatch_id`, not "the worker that got stuck on the token limit."
+Eino 的地址是从图拓扑构建的类型化、带 ID 段组成的确定性链（`compose/resume.go:123-140`）。它不是自然语言描述或调用栈。对于 Rive 的 dispatch/resume 模型，这意味着：恢复点应由 `run_id + node_id + dispatch_id + subdispatch_id` 来标识，而非“卡在 token 限制上的那个 worker”。
 
-### 7.2 Composite Dispatch-as-Conduit Pattern
+### 7.2 复合 Dispatch 即管道（Conduit）模式
 
-Eino's `isResumeTarget` with `hasData = false` for descendants is a clean pattern for composite components. Rive dispatches that fan out sub-dispatches (equivalent to `ToolsNode` or batch `Lambda`) need the same duality: the dispatch itself can be a resume target, and it must transparently forward resume signals to its children.
+Eino 的 `isResumeTarget` 带 `hasData = false` 用于后代节点，对复合组件来说是一种干净的模式。Rive 中扇出子调度的 dispatch（相当于 `ToolsNode` 或批量 `Lambda`）需要同样的双重性：dispatch 本身可以是恢复目标，同时它必须透明地将恢复信号向下转发给其子节点。
 
-### 7.3 Flat User-Facing Context with Tree State
+### 7.3 面向用户的扁平上下文与树状状态
 
-Eino's `ToInterruptContexts` produces a flat list of root causes (the leaves the user cares about), while `InterruptSignal.Subs` retains the tree structure for correct state persistence and reconstruction. Rive should similarly expose a flat "things to resume" view to humans while keeping the parent-child tree internally for correct state propagation.
+Eino 的 `ToInterruptContexts` 产生一个扁平的根因列表（用户关心的叶子节点），而 `InterruptSignal.Subs` 保留树结构以便正确的状态持久化和重建。Rive 同样应向人类暴露扁平的“需要恢复的事项”视图，同时在内部保留父子树以保证正确的状态传播。
 
-### 7.4 Stream/State Duality Is a Migration Concern
+### 7.4 流 / 状态双重性是迁移关注点
 
-Eino's `convertCheckPoint` / `restoreCheckPoint` pattern for stream materialization is specific to in-process streaming, but the principle generalizes: any ephemeral, one-shot data (streams, connection pools, in-flight RPCs) must be materialized before checkpointing and reattached on resume. Rive dispatches that involve streaming transport should identify analogous ephemeral state that cannot survive a checkpoint boundary.
+Eino 的 `convertCheckPoint` / `restoreCheckPoint` 模式用于流物化，它特定于进程内流式处理，但其中的原则具有普适性：任何临时的、一次性数据（流、连接池、在途 RPC）必须在创建检查点之前物化，并在恢复时重新挂载。涉及流式传输的 Rive dispatch 应识别无法跨越检查点边界的类似临时状态。
 
-### 7.5 Checkpoint Migration as a Framework-Level Concern
+### 7.5 检查点迁移是框架级的关注点
 
-Eino's `MigrateCheckpointState` (`compose/checkpoint.go:231-244`) provides a recursive state migrator that upgrades checkpoint schemas without user code changes. For Rive, long-lived dispatches that persist state (e.g., minutes-to-hours) need the same capability: a framework-level hook that transforms old state shapes into new ones, applied automatically on resume.
+Eino 的 `MigrateCheckpointState`（`compose/checkpoint.go:231-244`）提供了一个递归状态迁移器，可在无需用户修改代码的情况下升级检查点模式。对于 Rive，持久化状态的长时间运行的 dispatch（例如数分钟到数小时）需要同样的能力：一个框架级钩子，将旧的状态形状转换为新的，并在恢复时自动应用。

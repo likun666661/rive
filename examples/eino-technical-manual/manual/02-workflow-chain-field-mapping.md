@@ -1,6 +1,6 @@
-# Chapter 2: Workflow / Chain / Field Mapping Patterns
+# 第二章：Workflow / Chain / 字段映射模式
 
-## 1. Problem
+## 1. 问题
 
 Eino 提供三种编排抽象 — `Graph`、`Workflow`、`Chain` — 开发者需要理解它们的区别和适用场景才能在正确的场景使用正确的工具。核心问题是：
 
@@ -11,7 +11,7 @@ Eino 提供三种编排抽象 — `Graph`、`Workflow`、`Chain` — 开发者�
 
 如果缺少这三层抽象，用户要么在 Graph 里写大量样板代码，要么丢失字段映射的类型安全。
 
-## 2. Why It Is Hard
+## 2. 为什么难
 
 ### 2.1 执行依赖与数据映射是两回事
 
@@ -42,7 +42,7 @@ Chain 的 builder 模式看似简单，但一旦加入 Parallel 或 Branch，前
 
 在 Graph 中，分支的输入数据会自动传递给分支选中的节点。在 Workflow 中，分支**不传递数据**：`WorkflowBranch` (workflow.go:408) 要求分支内部节点显式定义自己的字段映射（workflow.go:415-418）。
 
-## 3. Design Idea
+## 3. 设计思路
 
 Eino 的三层抽象按照"控制力 vs 便利性"的坐标排列：
 
@@ -51,11 +51,11 @@ Eino 的三层抽象按照"控制力 vs 便利性"的坐标排列：
 Graph ────── Workflow ────── Chain
 ```
 
-### 3.1 Graph: 完全控制
+### 3.1 Graph：完全控制
 
 `Graph[I,O]` (`compose/generic_graph.go`) 是最底层的显式有向图。用户通过 `AddEdge` 手动建立边，控制触发模式（`AnyPredecessor` 或 `AllPredecessor`），适合表达复杂的、非常规的拓扑结构（如带环的 Pregel 图）。
 
-### 3.2 Workflow: 声明式依赖 + 字段映射
+### 3.2 Workflow：声明式依赖 + 字段映射
 
 `Workflow[I,O]` (`compose/workflow.go:45`) 包装了 Graph，把"添加边"的思维转变为"声明依赖关系"。核心假设是：节点之间的数据依赖比执行依赖更重要。Workflow 使用 `AllPredecessor` 触发模式，不能用出环。
 
@@ -64,7 +64,7 @@ Workflow 不通过 `AddEdge`，而是通过 `WorkflowNode.AddInput` 来同时建
 - `WithNoDirectDependency`：只有数据流，执行依赖通过其他节点间接保证
 - `AddDependency`：只有执行依赖，没有数据流
 
-### 3.3 Chain: Builder 模式
+### 3.3 Chain：Builder 模式
 
 `Chain[I,O]` (`compose/chain.go:72`) 提供线性 builder API。每个 `AppendX` 自动将新节点与前一个节点（或前一组节点如 Parallel）连接。内部通过 `preNodeKeys` (`compose/chain.go:79`) 追踪当前"尾部"节点集合。
 
@@ -74,7 +74,7 @@ Chain 内置 Parallel（并发）和 Branch（条件分支）支持，但汇聚�
 
 三者最终都编译为 `Runnable[I,O]` (`compose/runnable.go`)，共享同样的运行时执行、callback、state 机制。Workflow 和 Chain 在 `Compile` 阶段被展开为底层 Graph，因此它们的性能没有额外开销。
 
-## 4. Source Walkthrough
+## 4. 源码走读
 
 ### 4.1 Workflow 核心结构
 
@@ -255,9 +255,9 @@ type GraphBranch struct {
 
 `NewGraphBranch` (L145-153) 实现单路径分支，`NewGraphMultiBranch` (L89-107) 实现多路径分支（一个输入可以路由到多个目标节点）。stream 变体 `NewStreamGraphBranch` / `NewStreamGraphMultiBranch` 对 StreamReader 做条件评估。
 
-## 5. Patterns and Examples
+## 5. 模式与示例
 
-### 5.1 Pattern: 简单 Workflow with Field Mapping
+### 5.1 模式：带字段映射的简单 Workflow
 
 从 START 接收含有 `query` 字段的结构体，经过模板渲染和模型调用后输出。
 
@@ -288,7 +288,7 @@ r, _ := w.Compile(ctx)
 result, _ := r.Invoke(ctx, &Input{Query: "你好", UserID: "u1"})
 ```
 
-### 5.2 Pattern: 执行依赖与数据流分离
+### 5.2 模式：执行依赖与数据流分离
 
 `SetupNode` 负责初始化，`MainNode` 需要 `SetupNode` 完成但不需要其数据，`MainNode` 也同时需要原始输入的 `userID`。
 
@@ -305,7 +305,7 @@ mainNode.AddDependency("setup")
 mainNode.AddInput(START, MapFields("UserID", "userID"))
 ```
 
-### 5.3 Pattern: NoDirectDependency — 跨路径数据访问
+### 5.3 模式：NoDirectDependency — 跨路径数据访问
 
 `AuditNode` 需要原始输入的数据但不应该在 `ProcessNode` 的直接依赖链上。它的执行由 `ProcessNode` 间接保证（因为存在另一条路径）。
 
@@ -322,7 +322,7 @@ auditNode.AddInputWithOptions(START, nil, WithNoDirectDependency())
 auditNode.AddInput("process")
 ```
 
-### 5.4 Pattern: Chain with Branch
+### 5.4 模式：带分支的 Chain
 
 根据意图路由到不同的处理路径。
 
@@ -360,7 +360,7 @@ chain.
 r, _ := chain.Compile(ctx)
 ```
 
-### 5.5 Pattern: Chain with Parallel
+### 5.5 模式：带并行的 Chain
 
 并行调用两个模型，然后对比结果。
 
@@ -385,7 +385,7 @@ chain.
 r, _ := chain.Compile(ctx)
 ```
 
-### 5.6 Pattern: Workflow with Branch (Difference from Graph Branch)
+### 5.6 模式：带分支的 Workflow（与 Graph Branch 的区别）
 
 ```go
 w := NewWorkflow[*Input, *Output]()
@@ -408,7 +408,7 @@ w.End().AddInput("pathA", MapFields("Result", "Reply"))
 w.End().AddInput("pathB", MapFields("Result", "Reply"))
 ```
 
-### 5.7 Pattern: Using Compile at Compile Time (Static Values)
+### 5.7 模式：在编译时使用 Compile（静态值）
 
 ```go
 node := w.AddChatTemplateNode("template", chatTemplate)
@@ -421,7 +421,7 @@ node.AddInput(START, MapFields("UserQuery", "user_query"))
 
 `SetStaticValue` 在 `compile` 阶段 (workflow.go:469-507) 通过 `handlerPreNode` 注入一个 mergeValues handler，将静态值合并到节点输入中。
 
-### 5.8 Pattern: Nested Chain in Workflow
+### 5.8 模式：Workflow 中嵌套 Chain
 
 ```go
 // 构建一个子 Chain
@@ -434,7 +434,7 @@ w.AddGraphNode("sub", subChain).
     AddInput(START, MapFields("Query", "Query"))
 ```
 
-## 6. Common Pitfalls
+## 6. 常见陷阱
 
 ### 6.1 混合 Graph 边和 Workflow 映射
 
@@ -483,7 +483,7 @@ node.AddInput("B", MapFields("field2", "f2"))
 
 当字段映射路径中遇到 interface 类型时，`checkAndExtractFieldType` (`field_mapping.go:472-473`) 返回 error（需要请求时检查），此时 `validateFieldMapping` 将其放入 `uncheckedSourcePath`，推迟到请求时通过 `fieldMap` 的实际提取结果进行验证。这意味着带 interface 的字段映射在编译时不会报错，但请求时可能 panic。
 
-## 7. What Rive Can Learn
+## 7. Rive 可借鉴之处
 
 ### 7.1 将执行依赖与数据映射解耦
 
@@ -493,11 +493,11 @@ Eino 的 `WithNoDirectDependency` 和 `AddDependency` 是关键的架构观察�
 - 同时声明"我需要在 Y 之后执行"(执行依赖)
 - 这两者不一定要来自同一个上游节点
 
-### 7.2 Field Mapping Pattern 的适用性
+### 7.2 Field Mapping 模式的适用性
 
 Eino 的 `FieldMapping` 是在 in-process 执行图中做细粒度数据流转。Rive 的 Work DAG 节点通常通过 `output / input key` 传递整个输出，但有些场景（如跨节点合并多个输出、提取嵌套字段）可能需要类似的"字段路径提取"机制。不过这需要在 Rive 的序列化层 (protobuf) 上实现路径提取逻辑，不同于 Eino 的反射方式。
 
-### 7.3 Builder 模式降低入⻔门槛
+### 7.3 Builder 模式降低入门门槛
 
 Eino 的 `Chain` builder 模式使简单的线性 pipeline 不需要写 Graph 样板代码。Rive 可以为常见的编排模式（如串行任务链、条件分支）提供类似的 Builder API，降低用户搭建 DAG 的心智负担。
 
@@ -513,7 +513,7 @@ Eino 的 Workflow 将 `addInputs` 设计为 `[]func() error` 延迟闭包 (`work
 
 `SetStaticValue` 提供了一种在编译时固定值的机制，适合配置参数、系统 prompt 等在运行时不变的数据。Rive 的 dispatch 参数目前全部是动态传入的，增加编译时参数可以减少每次执行的计算开销。
 
-## Summary
+## 总结
 
 | 维度 | Graph | Workflow | Chain |
 |------|-------|----------|-------|

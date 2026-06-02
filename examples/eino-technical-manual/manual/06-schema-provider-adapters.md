@@ -1,271 +1,177 @@
-# Chapter 6: Schema / Provider Adapter Interop
+# 第六章：Schema / Provider 适配器互操作
 
-## 1. Problem
+## 1. 问题
 
-Eino is a multi-provider LLM application framework. A user composes a graph
-that might use OpenAI for chat completion, Claude for reasoning, and Gemini
-for embedding — all in the same pipeline. Each provider speaks a different wire
-format, has a different message structure, different streaming protocol, and
-different response metadata.
+Eino 是一个多 Provider 的 LLM 应用框架。用户组合一个 Graph，可能在同一个流水线中使用 OpenAI 进行 Chat Completion，使用 Claude 进行推理，使用 Gemini 进行 Embedding。每个 Provider 使用不同的线格式，有不同的 Message 结构、不同的流式协议和不同的响应元数据。
 
-If every graph node knows which provider it talks to, switching providers
-requires rewriting every node. If `compose/` (the orchestration engine)
-branches on provider names, the engine is not generic. The core problem: **how
-do you make components from different providers interoperate in a single
-pipeline without any component knowing about the others?**
+如果每个 Graph 节点都知道自己与哪个 Provider 通信，那么切换 Provider 就需要重写每个节点。如果 `compose/`（编排引擎）根据 Provider 名称进行分支，那么引擎就不再是通用的了。核心问题是：**如何让来自不同 Provider 的组件在同一个流水线中互操作，而没有任何组件知道其他组件的存在？**
 
-The schema layer (`schema/`) solves this by defining a canonical data model.
-Provider adapters (in the external `eino-ext` repo) convert their native SDK
-types into canonical types. The composition engine and ADK (`compose/`,
-`adk/`) operate exclusively on canonical types. The critical boundary is the
-component interface — `BaseModel[M]` is parameterized by message type `M`,
-which is sealed to `*schema.Message` and `*schema.AgenticMessage`. The Go
-type system catches mismatches at compile time.
+Schema 层（`schema/`）通过定义一组规范数据模型来解决这个问题。Provider 适配器（在外部仓库 `eino-ext` 中）将其原生 SDK 类型转换为规范类型。组合引擎和 ADK（`compose/`、`adk/`）仅操作规范类型。关键的边界是组件接口——`BaseModel[M]` 通过 Message 类型 `M` 进行参数化，而 `M` 被封闭为 `*schema.Message` 和 `*schema.AgenticMessage`。Go 的类型系统在编译期捕获不匹配的情况。
 
-## 2. Why It Is Hard
+## 2. 为什么困难
 
-### 2.1 Messages Are Provider-Invented, Not Standardised
+### 2.1 Message 是 Provider 各自发明的，没有标准
 
-| Dimension | OpenAI | Claude | Gemini |
+| 维度 | OpenAI | Claude | Gemini |
 |-----------|--------|--------|--------|
-| **Role names** | `"assistant"` | `"assistant"` | `"model"` |
-| **Multimodal parts** | `content: [{type:"text", text:"..."}, {type:"image_url", image_url:{...}}]` | `content: [{type:"text", text:"..."}, {type:"image", source:{...}}]` | `parts: [{text:"..."}, {inlineData:{...}}]` |
-| **Tool calls** | `tool_calls[]` with index-based streaming delta chunks | `tool_use` content blocks inside message content | `functionCall` inside `parts[]` |
-| **Tool results** | Role `"tool"` message with `tool_call_id` | `tool_result` content block in a `user` message | `functionResponse` part in a `user` role |
-| **Reasoning** | `reasoning_tokens` in usage details | Thinking content block | `thought` part |
-| **Response ID** | `response.id` | `message.id` | `candidates[0].content.parts` union |
+| **角色名称** | `"assistant"` | `"assistant"` | `"model"` |
+| **多模态部件** | `content: [{type:"text", text:"..."}, {type:"image_url", image_url:{...}}]` | `content: [{type:"text", text:"..."}, {type:"image", source:{...}}]` | `parts: [{text:"..."}, {inlineData:{...}}]` |
+| **工具调用** | `tool_calls[]`，带有基于索引的流式 delta 块 | `tool_use` 内容块，内嵌在 Message 内容中 | `functionCall`，内嵌在 `parts[]` 中 |
+| **工具结果** | 角色为 `"tool"` 的 Message，带有 `tool_call_id` | `user` Message 中的 `tool_result` 内容块 | `user` 角色中的 `functionResponse` 部件 |
+| **推理** | 用量详情中的 `reasoning_tokens` | Thinking 内容块 | `thought` 部件 |
+| **响应 ID** | `response.id` | `message.id` | `candidates[0].content.parts` 联合体 |
 
-Naively picking one provider's format as the internal schema creates lock-in.
-A canonical schema must accommodate all of these without preferring any.
+朴素地将某个 Provider 的格式选作内部 Schema 会造成锁定。一个规范 Schema 必须能容纳所有这些格式，而不偏向任何一种。
 
-### 2.2 Tool Parameter Schemas Vary by Provider
+### 2.2 工具参数 Schema 因 Provider 而异
 
-Some models accept flat `properties` objects. Others require full JSON Schema
-with `anyOf`, `oneOf`, `$defs`. Some providers use server-side tool search
-where tools are discovered dynamically, not pre-defined. A single parameter
-schema representation must be translatable to every model API's expected format.
+有些模型接受扁平的 `properties` 对象。另一些则需要完整的 JSON Schema，包含 `anyOf`、`oneOf`、`$defs`。有些 Provider 使用服务端工具搜索，工具是动态发现的，而不是预先定义的。一个单一的参数 Schema 表示必须能够转换为每个模型 API 所期望的格式。
 
-### 2.3 Streaming Chunks Merge Differently
+### 2.3 流式块以不同方式合并
 
-Text chunks: simple string concatenation. Tool call chunks: merge by index,
-concatenate JSON fragment arguments. Reasoning chunks: cumulative
-accumulation. Image/audio/video chunks: non-mergeable (each is a standalone
-artifact). The framework must register type-specific concat functions and
-dispatch to them via Go generics at runtime.
+文本块：简单的字符串拼接。工具调用块：按索引合并，拼接 JSON 片段参数。推理块：累积叠加。图像/音频/视频块：不可合并（每个都是独立的产物）。框架必须注册类型特定的 concat 函数，并在运行时通过 Go 泛型派发到这些函数。
 
-### 2.4 Provider Extensions Must Not Leak Into Generic Code
+### 2.4 Provider 扩展不得泄露到通用代码中
 
-Provider A has annotations (OpenAI). Provider B has citations with four
-location types (Claude). Provider C has grounding metadata with search entry
-points (Gemini). A generic graph node should remain unaware of these. Yet a
-specialized component (like a RAG evaluator) must access them. The schema must
-carry provider data without forcing every consumer to type-assert.
+Provider A 有注解（OpenAI）。Provider B 有四种位置类型的引用（Claude）。Provider C 有包含搜索入口点的 Grounding 元数据（Gemini）。通用的 Graph 节点应该对这些一无所知。然而，专门的组件（如 RAG 评估器）必须能访问它们。Schema 必须携带 Provider 数据，而不强制每个消费者进行类型断言。
 
-### 2.5 Serialization Must Survive Graph Interrupt/Resume
+### 2.5 序列化必须在 Graph 中断/恢复时存活
 
-When a graph checkpoints (suspends) and resumes, the intermediate state —
-messages, tool calls, multimodal parts, extension metadata — must survive a
-round-trip through `encoding/gob`. Every canonical type used in state must be
-pre-registered. Types with interface fields or recursive structures need custom
-`GobEncode`/`GobDecode`.
+当 Graph Checkpoint（挂起）并恢复时，中间状态——Message、工具调用、多模态部件、扩展元数据——必须经受住通过 `encoding/gob` 的往返。每个在状态中使用的规范类型都必须预先注册。具有 interface 字段或递归结构的类型需要自定义 `GobEncode`/`GobDecode`。
 
-## 3. Design Idea
+## 3. 设计思想
 
-Eino separates concerns into three layers:
+Eino 将关注点分离为三个层次：
 
 ```
-Provider Adapters (eino-ext)          CONVERT native → canonical
-    │ implements
-Component Interfaces (components/)     GENERIC contracts (BaseModel[M])
-    │ uses types from
-Canonical Schema (schema/)             TYPES (Message, AgenticMessage, StreamReader, ToolInfo)
-    │ includes
-Provider Extensions (schema/openai,    OPTIONAL typed slots on canonical types
+Provider 适配器 (eino-ext)          将原生类型转换为规范类型
+    │ 实现
+组件接口 (components/)              通用合约 (BaseModel[M])
+    │ 使用类型
+规范 Schema (schema/)                类型 (Message, AgenticMessage, StreamReader, ToolInfo)
+    │ 包含
+Provider 扩展 (schema/openai,        规范类型上的可选类型化槽位
  schema/claude, schema/gemini)
 ```
 
-Key design decisions:
+关键设计决策：
 
-1. **Two message models, not one.**
-   - `Message` (`schema/message.go:497`): Classic text + `ToolCalls[]` model.
-     Backward-compatible, channels-based multimodal input/output. Used by
-     `BaseChatModel`.
-   - `AgenticMessage` (`schema/agentic_message.go:71`): ContentBlock-based
-     model with richer type system. Distinguishes FunctionToolCall,
-     ServerToolCall, MCPToolCall, tool search, approval flows. Has typed
-     provider extension slots. Used by `AgenticModel`.
+1. **两种 Message 模型，而非一种。**
+   - `Message` (`schema/message.go:497`)：经典文本 + `ToolCalls[]` 模型。向后兼容，基于 Channel 的多模态输入/输出。由 `BaseChatModel` 使用。
+   - `AgenticMessage` (`schema/agentic_message.go:71`)：基于 ContentBlock 的模型，具有更丰富的类型系统。区分 FunctionToolCall、ServerToolCall、MCPToolCall、工具搜索、审批流。具有类型化的 Provider 扩展槽位。由 `AgenticModel` 使用。
 
-2. **Provider extensions are data types, not implementations.**
-   Each provider directory in `schema/` defines structs that slot into
-   canonical types through typed pointer fields — never `map[string]any`.
-   A component that does not care about provider data simply ignores the
-   nil pointer. A component that does can type-assert.
+2. **Provider 扩展是数据类型，不是实现。**
+   `schema/` 下的每个 Provider 目录定义结构体，通过类型化指针字段嵌入规范类型——绝不使用 `map[string]any`。不关心 Provider 数据的组件只需忽略 nil 指针。关心 Provider 数据的组件可以进行类型断言。
 
-3. **Generic interfaces enforce type safety.**
-   `BaseModel[M messageType]` (`components/model/interface.go:36`) accepts
-   only `*Message` and `*AgenticMessage`. You cannot pass a raw `map` or an
-   arbitrary struct through the framework. The Go compiler enforces this.
+3. **泛型接口强制类型安全。**
+   `BaseModel[M messageType]` (`components/model/interface.go:36`) 只接受 `*Message` 和 `*AgenticMessage`。你不能通过框架传递原始的 `map` 或任意结构体。Go 编译器强制执行这一点。
 
-4. **StreamReader[T] as universal streaming primitive.**
-   `schema/stream.go:168` — not a simple channel wrapper. Supports array
-   backing (zero-overhead from `StreamReaderFromArray`), fan-out via
-   `Copy(n)`, fan-in via `MergeStreamReaders`, and type-safe conversion
-   via `StreamReaderWithConvert`. Provider adapters convert their native
-   SDK streams into `StreamReader[*Message]` or `StreamReader[*AgenticMessage]`.
+4. **StreamReader[T] 作为通用流式基元。**
+   `schema/stream.go:168`——不是一个简单的 Channel 包装器。支持数组后端（`StreamReaderFromArray` 零开销）、通过 `Copy(n)` 扇出、通过 `MergeStreamReaders` 扇入，以及通过 `StreamReaderWithConvert` 进行类型安全转换。Provider 适配器将其原生 SDK 流转换为 `StreamReader[*Message]` 或 `StreamReader[*AgenticMessage]`。
 
-5. **Registered concat dispatch.**
-   `internal.RegisterStreamChunkConcatFunc[T]` (`internal/concat.go:71`)
-   builds a type-indexed dispatch table. When `compose/` needs to merge a
-   stream, it calls `internal.ConcatItems[T]`, which looks up the concat
-   function registered for `T`. This is how `ConcatMessages` and
-   `ConcatAgenticMessages` (which themselves call provider-specific
-   extension concat logic) get wired into the generic stream merge path.
+5. **注册式 Concat 派发。**
+   `internal.RegisterStreamChunkConcatFunc[T]` (`internal/concat.go:71`) 构建一个按类型索引的派发表。当 `compose/` 需要合并一个流时，它调用 `internal.ConcatItems[T]`，后者查找为 `T` 注册的 concat 函数。这就是 `ConcatMessages` 和 `ConcatAgenticMessages`（它们自身调用 Provider 特定的扩展合并逻辑）如何接入通用流合并路径的。
 
-## 4. Source Walkthrough
+## 4. 源码走读
 
-### 4.1 `Message` — The Classic Model (`schema/message.go`)
+### 4.1 `Message`——经典模型 (`schema/message.go`)
 
 ```go
 // schema/message.go:497
 type Message struct {
     Role             RoleType              // Assistant | User | System | Tool
-    Content          string                // plain text
-    UserInputMultiContent []MessageInputPart   // multimodal input from user
-    AssistantGenMultiContent []MessageOutputPart // multimodal output from model
-    ToolCalls        []ToolCall            // assistant: tool calls requested
-    ToolCallID       string                // tool: which call this responds to
-    ToolName         string                // tool: name of the responding tool
+    Content          string                // 纯文本
+    UserInputMultiContent []MessageInputPart   // 来自用户的多模态输入
+    AssistantGenMultiContent []MessageOutputPart // 来自模型的多模态输出
+    ToolCalls        []ToolCall            // assistant：请求的工具调用
+    ToolCallID       string                // tool：此响应对应哪个调用
+    ToolName         string                // tool：响应工具的名称
     ResponseMeta     *ResponseMeta         // finish_reason, usage, logprobs
-    ReasoningContent string                // thinking content
-    Extra            map[string]any        // legacy provider-specific bag
+    ReasoningContent string                // 思考内容
+    Extra            map[string]any        // 遗留的 Provider 特定数据袋
 }
 ```
 
-**ToolCall** (`schema/message.go:132`): `{Index int, ID, Type, Function{Name,
-Arguments string}, Extra}`. `Index` is critical for streaming — delta chunks
-with the same `Index` belong to the same tool call. `Arguments` accumulate as
-JSON fragments across chunks.
+**ToolCall** (`schema/message.go:132`)：`{Index int, ID, Type, Function{Name, Arguments string}, Extra}`。`Index` 对流式处理至关重要——具有相同 `Index` 的 delta 块属于同一个工具调用。`Arguments` 跨块累积 JSON 片段。
 
-**MessageInputPart** (`schema/message.go:207`): typed union via a `Type`
-discriminant — `Text`, `ImageURL`, `AudioURL`, `VideoURL`, `FileURL`,
-`ToolSearchResult`.
+**MessageInputPart** (`schema/message.go:207`)：通过 `Type` 判别符实现的类型联合——`Text`、`ImageURL`、`AudioURL`、`VideoURL`、`FileURL`、`ToolSearchResult`。
 
-**MessageOutputPart** (`schema/message.go:268`): analogous for model outputs —
-`Text`, `Image`, `Audio`, `Video`, `Reasoning`.
+**MessageOutputPart** (`schema/message.go:268`)：模型输出的类比——`Text`、`Image`、`Audio`、`Video`、`Reasoning`。
 
-### 4.2 `AgenticMessage` — The ContentBlock Model (`schema/agentic_message.go`)
+### 4.2 `AgenticMessage`——ContentBlock 模型 (`schema/agentic_message.go`)
 
 ```go
 // schema/agentic_message.go:71
 type AgenticMessage struct {
-    Role         AgenticRoleType             // system | user | assistant (no "tool" role)
-    ContentBlocks []*ContentBlock            // ordered list of typed blocks
-    ResponseMeta *AgenticResponseMeta        // token usage + provider extensions
+    Role         AgenticRoleType             // system | user | assistant（没有 "tool" 角色）
+    ContentBlocks []*ContentBlock            // 类型化块的有序列表
+    ResponseMeta *AgenticResponseMeta        // token 用量 + provider 扩展
     Extra        map[string]any
 }
 ```
 
-**ContentBlock** (`schema/agentic_message.go:102`): tagged union with ~20
-variants, each stored as a nullable pointer. The key innovation is that there
-is no separate "tool result" role — tool calls and results are both content
-blocks within the same message:
+**ContentBlock** (`schema/agentic_message.go:102`)：标记联合体，包含约 20 种变体，每种存储为可空指针。关键创新是没有单独的 "tool result" 角色——工具调用和工具结果都是同一 Message 中的内容块：
 
-- Input blocks: `UserInputText`, `UserInputImage`, `UserInputAudio`,
-  `UserInputVideo`, `UserInputFile`, `ToolSearchResult`
-- Output blocks: `AssistantGenText`, `AssistantGenImage`, `AssistantGenAudio`,
-  `AssistantGenVideo`, `Reasoning`
-- Tool call blocks: `FunctionToolCall`, `ServerToolCall`, `MCPToolCall`
-- Tool result blocks: `FunctionToolResult`, `ServerToolResult`, `MCPToolResult`
-- MCP protocol blocks: `MCPListToolsResult`, `MCPToolApprovalRequest`,
-  `MCPToolApprovalResponse`
+- 输入块：`UserInputText`、`UserInputImage`、`UserInputAudio`、`UserInputVideo`、`UserInputFile`、`ToolSearchResult`
+- 输出块：`AssistantGenText`、`AssistantGenImage`、`AssistantGenAudio`、`AssistantGenVideo`、`Reasoning`
+- 工具调用块：`FunctionToolCall`、`ServerToolCall`、`MCPToolCall`
+- 工具结果块：`FunctionToolResult`、`ServerToolResult`、`MCPToolResult`
+- MCP 协议块：`MCPListToolsResult`、`MCPToolApprovalRequest`、`MCPToolApprovalResponse`
 
-**StreamingMeta** (`schema/agentic_message.go:174`): `{Index int}`. Each
-streaming chunk carries an `Index` in its `ContentBlock.StreamingMeta`. When
-concatenating (in `ConcatAgenticMessages`, line 897), blocks are grouped by
-index and merged via type-specific functions.
+**StreamingMeta** (`schema/agentic_message.go:174`)：`{Index int}`。每个流式块在其 `ContentBlock.StreamingMeta` 中携带一个 `Index`。拼接时（在 `ConcatAgenticMessages` 中，第 897 行），块按索引分组，并通过类型特定的函数合并。
 
-**AgenticResponseMeta** (`schema/agentic_message.go:85`): carries `TokenUsage`
-plus typed provider extension slots:
+**AgenticResponseMeta** (`schema/agentic_message.go:85`)：携带 `TokenUsage` 以及类型化的 Provider 扩展槽位：
 
 ```go
 OpenAIExtension *openai.ResponseMetaExtension
 GeminiExtension *gemini.ResponseMetaExtension
 ClaudeExtension  *claude.ResponseMetaExtension
-Extension       any  // fallback for unknown/custom providers
+Extension       any  // 未知/自定义 provider 的回退
 ```
 
-**AssistantGenText** (`schema/agentic_message.go:234`): also has
-`OpenAIExtension *openai.AssistantGenTextExtension` and `ClaudeExtension
-*claude.AssistantGenTextExtension` for per-text-block annotations/citations.
+**AssistantGenText** (`schema/agentic_message.go:234`)：也具有 `OpenAIExtension *openai.AssistantGenTextExtension` 和 `ClaudeExtension *claude.AssistantGenTextExtension`，用于每个文本块的注解/引用。
 
-### 4.3 `ToolInfo` — Dual-Mode Parameter Schema (`schema/tool.go`)
+### 4.3 `ToolInfo`——双模式参数 Schema (`schema/tool.go`)
 
-`ToolInfo` (`schema/tool.go:128`) describes a tool to the model. The
-critical field is `*ParamsOneOf`, which is exactly one of two modes:
+`ToolInfo` (`schema/tool.go:128`) 向模型描述一个工具。关键字段是 `*ParamsOneOf`，它恰好是以下两种模式之一：
 
-1. **`NewParamsOneOfByParams(map[string]*ParameterInfo)`** (line 283):
-   Lightweight. A flat map of `ParameterInfo{Type, ElemInfo, SubParams, Desc,
-   Enum, Required}`. Supports recursive `ParameterInfo` for nested
-   objects and arrays.
+1. **`NewParamsOneOfByParams(map[string]*ParameterInfo)`** (第 283 行)：轻量级。一个扁平的 `ParameterInfo{Type, ElemInfo, SubParams, Desc, Enum, Required}` 映射。支持递归的 `ParameterInfo` 用于嵌套对象和数组。
 
-2. **`NewParamsOneOfByJSONSchema(*jsonschema.Schema)`** (line 290): Full JSON
-   Schema 2020-12. Used by `utils.InferTool` which auto-generates schema from
-   Go struct tags. Required for `anyOf`, `oneOf`, `$defs`.
+2. **`NewParamsOneOfByJSONSchema(*jsonschema.Schema)`** (第 290 行)：完整的 JSON Schema 2020-12。由 `utils.InferTool` 使用，该函数从 Go 结构体标签自动生成 Schema。对于 `anyOf`、`oneOf`、`$defs` 是必需的。
 
-Conversion: `ParamsOneOf.ToJSONSchema()` (`tool.go:297`) normalizes both
-modes to `*jsonschema.Schema` for passing to model APIs. Most provider
-adapters call this before marshalling tool schemas for their native API.
+转换：`ParamsOneOf.ToJSONSchema()` (`tool.go:297`) 将两种模式标准化为 `*jsonschema.Schema`，以便传递给模型 API。大多数 Provider 适配器在为其原生 API 编组工具 Schema 之前调用此方法。
 
-### 4.4 `StreamReader[T]` — Universal Streaming (`schema/stream.go`)
+### 4.4 `StreamReader[T]`——通用流式 (`schema/stream.go`)
 
-`StreamReader[T]` (`schema/stream.go:168`) is a polymorphic reader with
-five internal backends:
+`StreamReader[T]` (`schema/stream.go:168`) 是一个多态读取器，具有五种内部后端：
 
 ```
-readerTypeStream   → channel-based (Pipe)
-readerTypeArray    → slice-based (StreamReaderFromArray)
-readerTypeMultiStream  → fan-in (MergeStreamReaders)
-readerTypeWithConvert  → element-wise transform (StreamReaderWithConvert)
-readerTypeChild   → fan-out (Copy)
+readerTypeStream   → 基于 Channel (Pipe)
+readerTypeArray    → 基于切片 (StreamReaderFromArray)
+readerTypeMultiStream  → 扇入 (MergeStreamReaders)
+readerTypeWithConvert  → 逐元素转换 (StreamReaderWithConvert)
+readerTypeChild   → 扇出 (Copy)
 ```
 
-Key operations:
+关键操作：
 
-- **`Pipe[T](cap)`** (line 99): Creates a paired `StreamReader` +
-  `StreamWriter`. One sender goroutine calls `sw.Send(chunk, err)`,
-  one receiver calls `sr.Recv()`. Close signals `io.EOF`.
+- **`Pipe[T](cap)`** (第 99 行)：创建一对配对的 `StreamReader` + `StreamWriter`。一个发送者 goroutine 调用 `sw.Send(chunk, err)`，一个接收者调用 `sr.Recv()`。Close 发出 `io.EOF` 信号。
 
-- **`StreamReaderFromArray[T](arr)`** (line 461): Zero-overhead reader backed
-  by a slice. `Recv()` returns elements in order, then `io.EOF`.
+- **`StreamReaderFromArray[T](arr)`** (第 461 行)：由切片支持的零开销读取器。`Recv()` 按顺序返回元素，然后返回 `io.EOF`。
 
-- **`Copy(n int)`** (line 261): Fan-out — creates `n` independent child
-  readers using a linked-list shared buffer. Each child must be closed
-  independently. Used when a stream feeds multiple consumers (callback
-  handlers + downstream nodes).
+- **`Copy(n int)`** (第 261 行)：扇出——使用链表共享缓冲区创建 `n` 个独立的子读取器。每个子读取器必须独立关闭。当流馈送给多个消费者（回调处理器 + 下游节点）时使用。
 
-- **`MergeStreamReaders[T](srs)`** (line 912): Fan-in — interleaves multiple
-  streams into one. Chunks from all sources arrive in arrival order, not
-  source order.
+- **`MergeStreamReaders[T](srs)`** (第 912 行)：扇入——将多个流交错合并为一个。来自所有源的数据块按到达顺序到达，而不是源顺序。
 
-- **`MergeNamedStreamReaders[T](srs, names)`** (line 990): Fan-in with
-  source identification. Emits `SourceEOF` errors with the source name
-  when individual streams end, so consumers can track per-source completion.
+- **`MergeNamedStreamReaders[T](srs, names)`** (第 990 行)：带有源标识的扇入。当单个流结束时，发出带有源名称的 `SourceEOF` 错误，以便消费者跟踪每个源的完成情况。
 
-- **`StreamReaderWithConvert[T,D](sr, convert)`** (line 691): Element-wise
-  transformation. The `convert` function maps `T → (D, error)`. Return
-  `ErrNoValue` to filter an element out of the stream.
+- **`StreamReaderWithConvert[T,D](sr, convert)`** (第 691 行)：逐元素转换。`convert` 函数将 `T → (D, error)` 映射。返回 `ErrNoValue` 以从流中过滤掉某个元素。
 
-**Why polymorphism matters:** If `StreamReader` were always channel-backed,
-`StreamReaderFromArray` would require a goroutine to pump elements. With
-multiple backends, the runtime picks the optimal path. The compose layer
-(`compose/stream_reader.go`) wraps this with an internal `streamReader`
-interface that adds `copy`, `merge`, `mergeWithNames`, `withKey`, and
-`toAnyStreamReader`.
+**为什么多态重要：**如果 `StreamReader` 总是基于 Channel 的，那么 `StreamReaderFromArray` 将需要一个 goroutine 来推送元素。有了多个后端，运行时会选择最优路径。组合层（`compose/stream_reader.go`）用内部的 `streamReader` 接口包装了这一点，该接口添加了 `copy`、`merge`、`mergeWithNames`、`withKey` 和 `toAnyStreamReader`。
 
-### 4.5 Stream Concatenation (`schema/message.go`)
+### 4.5 流拼接 (`schema/message.go`)
 
-When a stream yields partial chunks, the framework must merge them into
-complete messages. This is registered once per type:
+当流产出部分块时，框架必须将它们合并成完整的 Message。这是按类型注册一次的：
 
 ```go
 // schema/message.go:39-46
@@ -278,28 +184,18 @@ func init() {
 }
 ```
 
-`ConcatMessages` (`schema/message.go:1643`):
-- Concatenates `Content` string (plain text accumulation).
-- Concatenates `ReasoningContent`.
-- Merges `ToolCalls` via `concatToolCalls` (line 1283): groups chunks by
-  `Index`, validates consistent ID/Type/Name within each group, concatenates
-  `Arguments` JSON fragments, sorts final calls by index.
-- Merges multimodal content via `concatAssistantMultiContent` /
-  `concatUserMultiContent`.
-- Keeps the last non-nil `ResponseMeta` (finish reason, usage arrive at end).
+`ConcatMessages` (`schema/message.go:1643`)：
+- 拼接 `Content` 字符串（纯文本累积）。
+- 拼接 `ReasoningContent`。
+- 通过 `concatToolCalls`（第 1283 行）合并 `ToolCalls`：按 `Index` 分组块，验证每个组内一致的 ID/Type/Name，拼接 `Arguments` JSON 片段，按索引排序最终调用。
+- 通过 `concatAssistantMultiContent` / `concatUserMultiContent` 合并多模态内容。
+- 保留最后一个非 nil 的 `ResponseMeta`（finish reason、usage 在最后到达）。
 
-`ConcatAgenticMessages` (`schema/agentic_message.go:897`): Groups
-`ContentBlock`s by `StreamingMeta.Index`. Each group is concatenated by
-type-specific functions (`concatAssistantGenTexts`,
-`concatFunctionToolCalls`, etc.). Provider extension slots are merged via
-`concatAgenticResponseMeta` (line 1002), which calls per-provider helpers:
-`openai.ConcatResponseMetaExtensions`, `claude.ConcatResponseMetaExtensions`,
-`gemini.ConcatResponseMetaExtensions`. For the `Extension any` fallback, it
-uses `internal.ConcatSliceValue` (runtime type assertion + append).
+`ConcatAgenticMessages` (`schema/agentic_message.go:897`)：按 `StreamingMeta.Index` 对 `ContentBlock` 分组。每组通过类型特定的函数拼接（`concatAssistantGenTexts`、`concatFunctionToolCalls` 等）。Provider 扩展槽位通过 `concatAgenticResponseMeta`（第 1002 行）合并，后者调用每个 Provider 的辅助函数：`openai.ConcatResponseMetaExtensions`、`claude.ConcatResponseMetaExtensions`、`gemini.ConcatResponseMetaExtensions`。对于 `Extension any` 回退，它使用 `internal.ConcatSliceValue`（运行时类型断言 + append）。
 
-### 4.6 Provider Extensions (`schema/openai/`, `schema/claude/`, `schema/gemini/`)
+### 4.6 Provider 扩展 (`schema/openai/`、`schema/claude/`、`schema/gemini/`)
 
-**OpenAI (`schema/openai/extension.go`):**
+**OpenAI (`schema/openai/extension.go`)：**
 
 ```go
 type ResponseMetaExtension struct {
@@ -313,17 +209,14 @@ type ResponseMetaExtension struct {
 }
 
 type AssistantGenTextExtension struct {
-    Refusal     *OutputRefusal      // content filter refusal reason
-    Annotations []*TextAnnotation    // file citations, URL citations
+    Refusal     *OutputRefusal      // 内容过滤器拒绝原因
+    Annotations []*TextAnnotation    // 文件引用、URL 引用
 }
 ```
 
-`ConcatAssistantGenTextExtensions` (line 116): merges annotations by
-de-duplicating on `Index`, concatenates refusal reasons. `TextAnnotation`
-(line 59) has four location types: `FileCitation`, `URLCitation`, `FilePath`
-(with file ID), and `ContainerFileCitation` (with character offsets).
+`ConcatAssistantGenTextExtensions` (第 116 行)：通过按 `Index` 去重合并注解，拼接拒绝原因。`TextAnnotation` (第 59 行) 有四种位置类型：`FileCitation`、`URLCitation`、`FilePath`（带有文件 ID）和 `ContainerFileCitation`（带有字符偏移量）。
 
-**Claude (`schema/claude/extension.go`):**
+**Claude (`schema/claude/extension.go`)：**
 
 ```go
 type ResponseMetaExtension struct {
@@ -336,16 +229,11 @@ type AssistantGenTextExtension struct {
 }
 ```
 
-`TextCitation` (line 39): typed union of `CitationCharLocation`,
-`CitationPageLocation`, `CitationContentBlockLocation`,
-`CitationWebSearchResultLocation`. Each carries `CitedText`,
-`DocumentTitle`, `DocumentIndex`. Cited position is expressed as character
-offsets, page numbers, content block indices, or web search result indices.
+`TextCitation` (第 39 行)：`CitationCharLocation`、`CitationPageLocation`、`CitationContentBlockLocation`、`CitationWebSearchResultLocation` 的类型化联合。每种都携带 `CitedText`、`DocumentTitle`、`DocumentIndex`。引用位置以字符偏移量、页码、内容块索引或网页搜索结果索引表示。
 
-`ConcatAssistantGenTextExtensions` (line 88): simply appends citations from
-all chunks — citations typically appear in the final chunk, not per-delta.
+`ConcatAssistantGenTextExtensions` (第 88 行)：简单地追加来自所有块的引用——引用通常出现在最终块中，而不是每个 delta。
 
-**Gemini (`schema/gemini/extension.go`):**
+**Gemini (`schema/gemini/extension.go`)：**
 
 ```go
 type ResponseMetaExtension struct {
@@ -354,17 +242,16 @@ type ResponseMetaExtension struct {
 }
 
 type GroundingMetadata struct {
-    GroundingChunks   []*GroundingChunk   // web sources (domain, title, URI)
-    GroundingSupports []*GroundingSupport  // confidence scores, segment info
-    SearchEntryPoint  *SearchEntryPoint    // rendered content, SDK blob
-    WebSearchQueries []string              // follow-up search queries
+    GroundingChunks   []*GroundingChunk   // 网页来源 (domain, title, URI)
+    GroundingSupports []*GroundingSupport  // 置信度分数、段落信息
+    SearchEntryPoint  *SearchEntryPoint    // 渲染的内容、SDK blob
+    WebSearchQueries []string              // 后续搜索查询
 }
 ```
 
-### 4.7 Serialization (`schema/serialization.go`)
+### 4.7 序列化 (`schema/serialization.go`)
 
-Graph checkpoint persistence requires every type used in intermediate state
-to be pre-registered with both `encoding/gob` and a custom serializer:
+Graph Checkpoint 持久化要求中间状态中使用的每种类型都通过 `encoding/gob` 和自定义序列化器预先注册：
 
 ```go
 // schema/serialization.go:27-56
@@ -374,38 +261,23 @@ func init() {
     RegisterName[ToolCall]("_eino_tool_call")
     RegisterName[ResponseMeta]("_eino_response_meta")
     RegisterName[TokenUsage]("_eino_token_usage")
-    // ... ~20 more type registrations
+    // ... 约 20 个其他类型注册
 }
 ```
 
-`RegisterName[T](name)` (`schema/serialization.go:83`): calls
-`gob.RegisterName` and `serialization.GenericRegister[T]`. The `GenericRegister`
-builds a `reflect.Type → name` mapping used by the checkpoint store to
-decode serialized state back into the correct concrete type.
+`RegisterName[T](name)` (`schema/serialization.go:83`)：调用 `gob.RegisterName` 和 `serialization.GenericRegister[T]`。`GenericRegister` 构建一个 `reflect.Type → name` 映射，Checkpoint 存储使用该映射将序列化的状态解码回正确的具体类型。
 
-Types with complex internal structures implement custom gob codecs. For
-example, `ToolInfo` (`tool.go:194`): its `ParamsOneOf` union (either a
-`map[string]*ParameterInfo` or a `*jsonschema.Schema`) is serialized via
-`toolInfoForGob` which JSON-encodes the schema branch into a string field.
+具有复杂内部结构的类型实现自定义 gob 编解码器。例如，`ToolInfo` (`tool.go:194`)：它的 `ParamsOneOf` 联合体（要么是 `map[string]*ParameterInfo` 要么是 `*jsonschema.Schema`）通过 `toolInfoForGob` 序列化，后者将 Schema 分支 JSON 编码为一个字符串字段。
 
-### 4.8 Component-to-Schema Bridge
+### 4.8 组件到 Schema 的桥接
 
-The `compose/component_to_graph_node.go` converts component interfaces into
-graph nodes. Each `to*Node` function wraps the component's methods into a
-`composableRunnable`. The key function `parseExecutorInfoFromComponent`
-(approximately line 50): checks if the component implements `Typer`
-(`GetType()`) and `Checker` (`IsCallbacksEnabled()`), extracting
-metadata that the graph runtime uses to decide when to fire callbacks.
+`compose/component_to_graph_node.go` 将组件接口转换为 Graph 节点。每个 `to*Node` 函数将组件的方法包装为 `composableRunnable`。关键函数 `parseExecutorInfoFromComponent`（大约第 50 行）：检查组件是否实现 `Typer`（`GetType()`）和 `Checker`（`IsCallbacksEnabled()`），提取 Graph 运行时用于决定何时触发回调的元数据。
 
-The graph scheduler never sees component types directly — it sees
-`composableRunnable` with `inputType` and `outputType` fields typed to
-`*schema.Message` or `*schema.AgenticMessage`. This abstraction is why adding
-a new provider model requires only implementing `BaseModel[M]` — no graph
-changes.
+Graph 调度器从不直接看到组件类型——它看到的是 `composableRunnable`，其 `inputType` 和 `outputType` 字段类型化为 `*schema.Message` 或 `*schema.AgenticMessage`。这种抽象就是为什么添加一个新的 Provider 模型只需要实现 `BaseModel[M]`——不需要更改 Graph。
 
-## 5. Patterns and Examples
+## 5. 模式和示例
 
-### 5.1 Building a Multimodal User Message
+### 5.1 构建多模态用户 Message
 
 ```go
 msg := &schema.Message{
@@ -420,10 +292,10 @@ msg := &schema.Message{
 }
 ```
 
-### 5.2 Building Agentic Tool Messages
+### 5.2 构建 Agentic 工具 Message
 
 ```go
-// Assistant message requesting a tool call
+// 请求工具调用的 Assistant Message
 assistantMsg := &schema.AgenticMessage{
     Role: schema.AgenticRoleAssistant,
     ContentBlocks: []*schema.ContentBlock{{
@@ -435,7 +307,7 @@ assistantMsg := &schema.AgenticMessage{
     }},
 }
 
-// User message carrying the tool result (note: no separate "tool" role)
+// 携带工具结果的 User Message（注意：没有单独的 "tool" 角色）
 toolResultMsg := &schema.AgenticMessage{
     Role: schema.AgenticRoleUser,
     ContentBlocks: []*schema.ContentBlock{{
@@ -448,13 +320,9 @@ toolResultMsg := &schema.AgenticMessage{
 }
 ```
 
-Agentic messages differ from classic `Message`: tool results are content
-blocks within a `user` role message, not separate `tool` role messages. This
-maps more naturally to providers like Claude and Gemini where tool results
-are user-turn content, and OpenAI's Responses API where tool results are
-inline.
+Agentic Message 与经典 `Message` 不同：工具结果是 `user` 角色 Message 中的内容块，而不是单独的 `tool` 角色 Message。这更自然地映射到像 Claude 和 Gemini 这样的 Provider（工具结果是 user 回合的内容）以及 OpenAI 的 Responses API（工具结果是内联的）。
 
-### 5.3 Defining a Tool With Nested Parameters
+### 5.3 定义具有嵌套参数的工具
 
 ```go
 tool := &schema.ToolInfo{
@@ -479,7 +347,7 @@ tool := &schema.ToolInfo{
 }
 ```
 
-For complex schemas with `anyOf`/`oneOf`, use `NewParamsOneOfByJSONSchema`:
+对于具有 `anyOf`/`oneOf` 的复杂 Schema，使用 `NewParamsOneOfByJSONSchema`：
 
 ```go
 schema, _ := jsonschema.NewSchemaFromFile("search_schema.json")
@@ -490,7 +358,7 @@ tool := &schema.ToolInfo{
 }
 ```
 
-### 5.4 Converting a Pipe Stream to Array for Testing
+### 5.4 将 Pipe 流转换为数组以进行测试
 
 ```go
 sr, sw := schema.Pipe[*schema.Message](3)
@@ -500,12 +368,12 @@ go func() {
     sw.Send(&schema.Message{Role: schema.Assistant, Content: " World"}, nil)
 }()
 
-// Concatenate stream into a complete message
+// 将流拼接为完整的 Message
 arraysr, _ := schema.StreamReaderWithConvert(sr,
     func(v *schema.Message) (*schema.Message, error) {
         return v, nil
     })
-// Or collect all chunks:
+// 或收集所有块：
 var chunks []*schema.Message
 for {
     chunk, err := sr.Recv()
@@ -516,38 +384,38 @@ complete, _ := schema.ConcatMessages(chunks)
 // complete.Content == "Hello World"
 ```
 
-### 5.5 Fan-Out with Copy for Callback Observation
+### 5.5 使用 Copy 进行扇出以用于回调观察
 
 ```go
-sr, _ := model.Stream(ctx, messages)  // single stream from model
-children := sr.Copy(3)                // original + 2 callback copies
+sr, _ := model.Stream(ctx, messages)  // 来自模型的单一流
+children := sr.Copy(3)                // 原始 + 2 个回调副本
 defer children[0].Close()
 defer children[1].Close()
 defer children[2].Close()
 
-// children[0] → downstream graph node
-// children[1] → timing callback handler
-// children[2] → logging callback handler
+// children[0] → 下游 Graph 节点
+// children[1] → 计时回调处理器
+// children[2] → 日志回调处理器
 ```
 
-### 5.6 Accessing Provider Extension Metadata
+### 5.6 访问 Provider 扩展元数据
 
 ```go
 resp, _ := agenticModel.Generate(ctx, msgs)
 
 if resp.ResponseMeta != nil {
-    // Check OpenAI-specific metadata
+    // 检查 OpenAI 特定的元数据
     if oe := resp.ResponseMeta.OpenAIExtension; oe != nil {
         fmt.Printf("OpenAI response ID: %s, Service tier: %v\n",
             oe.ID, oe.ServiceTier)
     }
 
-    // Check Claude-specific metadata
+    // 检查 Claude 特定的元数据
     if ce := resp.ResponseMeta.ClaudeExtension; ce != nil {
         fmt.Printf("Claude stop reason: %s\n", ce.StopReason)
     }
 
-    // Check Gemini grounding metadata
+    // 检查 Gemini Grounding 元数据
     if ge := resp.ResponseMeta.GeminiExtension; ge != nil {
         if gm := ge.GroundingMeta; gm != nil {
             for _, ch := range gm.GroundingChunks {
@@ -557,7 +425,7 @@ if resp.ResponseMeta != nil {
     }
 }
 
-// Access per-text-block annotations (OpenAI)
+// 访问每个文本块的注解 (OpenAI)
 for _, block := range resp.ContentBlocks {
     if text := block.AssistantGenText; text != nil {
         if oe := text.OpenAIExtension; oe != nil {
@@ -569,129 +437,70 @@ for _, block := range resp.ContentBlocks {
 }
 ```
 
-### 5.7 Registering Custom Types for Checkpoint Persistence
+### 5.7 为 Checkpoint 持久化注册自定义类型
 
 ```go
-// In your component package init()
+// 在你的组件包 init() 中
 func init() {
     schema.RegisterName[*MyState]("_myapp_state")
     schema.RegisterName[MyCustomToolResult]("_myapp_tool_result")
 }
 
-// MyState will now survive graph interrupt/resume
+// MyState 现在将在 Graph 中断/恢复后存活
 ```
 
-## 6. Common Pitfalls
+## 6. 常见陷阱
 
-### 6.1 Confusing Message Model Choice
+### 6.1 混淆 Message 模型的选择
 
-Use `Message` + `BaseChatModel` for classic chat apps with function calling
-(tools). Use `AgenticMessage` + `AgenticModel` for agent apps that need MCP
-tools, server tools, tool search, or structured multimodal outputs. Mixing
-them — passing `*Message` to an `AgenticModel` — is a compile error thanks
-to the type constraint on `BaseModel[M]`.
+对于使用 Function Calling（工具）的经典 Chat 应用，使用 `Message` + `BaseChatModel`。对于需要 MCP 工具、服务端工具、工具搜索或结构化多模态输出的 Agent 应用，使用 `AgenticMessage` + `AgenticModel`。混合使用它们——将 `*Message` 传递给 `AgenticModel`——将因 `BaseModel[M]` 的类型约束而导致编译错误。
 
-### 6.2 Not Closing Stream Copies
+### 6.2 未关闭 Stream 副本
 
-`StreamReader.Copy(n)` creates `n` independent child readers backed by a
-shared buffer. Every child MUST call `Close()` after consumption. If one child
-leaks, the parent's underlying goroutine never terminates. This is the most
-common goroutine leak in Eino graphs. `SetAutomaticClose()` (line 279) helps
-but relies on garbage collection, not deterministic cleanup.
+`StreamReader.Copy(n)` 创建 `n` 个由共享缓冲区支持的独立子读取器。每个子读取器在消费后必须调用 `Close()`。如果有一个子读取器泄漏，父级的基础 goroutine 永远不会终止。这是 Eino Graph 中最常见的 goroutine 泄漏。`SetAutomaticClose()`（第 279 行）有所帮助，但依赖垃圾回收，而非确定性清理。
 
-### 6.3 Assuming Stream Merging Preserves Order
+### 6.3 假设流合并保持顺序
 
-`MergeStreamReaders` interleaves chunks from all sources in arrival order.
-If you need per-source ordering (e.g., concatenate source A's chunks before
-source B's), use `MergeNamedStreamReaders` and track `SourceEOF` errors, or
-collect each source separately and concatenate.
+`MergeStreamReaders` 按到达顺序交错来自所有源的数据块。如果你需要按源排序（例如，先拼接源 A 的数据块，再拼接源 B 的数据块），请使用 `MergeNamedStreamReaders` 并跟踪 `SourceEOF` 错误，或分别收集每个源的数据并进行拼接。
 
-### 6.4 Relying on `Extra` Instead of Extension Slots
+### 6.4 依赖 `Extra` 而非扩展槽位
 
-`Message.Extra` (`map[string]any`) exists but bypasses type safety. If you
-store provider-specific data in `Extra`, downstream code must discover which
-provider produced it and type-assert each value. Use the typed extension
-slots (`OpenAIExtension`, `ClaudeExtension`, `GeminiExtension`) on
-`AgenticResponseMeta` and `AssistantGenText` — the framework's concat
-functions understand them; `map[string]any` concat is last-write-wins.
+`Message.Extra` (`map[string]any`) 存在，但绕过了类型安全。如果你将 Provider 特定数据存储在 `Extra` 中，下游代码必须发现是哪个 Provider 生成的，并对每个值进行类型断言。请使用 `AgenticResponseMeta` 和 `AssistantGenText` 上的类型化扩展槽位（`OpenAIExtension`、`ClaudeExtension`、`GeminiExtension`）——框架的 concat 函数能够理解它们；而 `map[string]any` 的合并是最后写入胜出。
 
-### 6.5 Missing Serialization Registration
+### 6.5 缺少序列化注册
 
-If your graph uses a custom type in state (e.g., a user-defined aggregator
-struct), and you enable checkpointing without calling
-`schema.RegisterName[T]("_name")` in an `init()`, the checkpoint store will
-fail at encode/decode time with an opaque gob error. Every type that crosses
-the interrupt/resume boundary must be pre-registered.
+如果你的 Graph 在状态中使用了自定义类型（例如，用户定义的聚合器结构体），并且你在启用 Checkpoint 时没有在 `init()` 中调用 `schema.RegisterName[T]("_name")`，Checkpoint 存储将在编码/解码时报出晦涩的 gob 错误。每个跨过中断/恢复边界的类型都必须预先注册。
 
-### 6.6 Mixing ParamsOneOf Modes
+### 6.6 混合 ParamsOneOf 模式
 
-A `ToolInfo` can have exactly one `ParamsOneOf` mode — either `params` or
-`jsonschema`, not both. If you construct with `NewParamsOneOfByParams` and
-then overwrite the `ParamsOneOf` field with a `NewParamsOneOfByJSONSchema`,
-both pointers live in the struct but `ToJSONSchema()` only checks
-`p.params != nil` first (line 302), so the JSON Schema branch is silently
-ignored.
+一个 `ToolInfo` 只能有一种 `ParamsOneOf` 模式——要么 `params` 要么 `jsonschema`，不能两者兼有。如果你用 `NewParamsOneOfByParams` 构造，然后用 `NewParamsOneOfByJSONSchema` 覆盖 `ParamsOneOf` 字段，两个指针都存在于结构体中，但 `ToJSONSchema()` 首先检查 `p.params != nil`（第 302 行），所以 JSON Schema 分支会被静默忽略。
 
-### 6.7 Streaming Tool Calls Without Index
+### 6.7 流式工具调用缺少 Index
 
-In streaming, `ToolCall.Index` identifies which tool call a delta chunk
-belongs to. If a provider adapter sets `Index = 0` for every chunk of every
-tool call, `concatToolCalls` merges all chunks into one (invalid) call.
-Ensure each distinct tool call gets a unique `Index`, and increments
-correctly across the stream.
+在流式处理中，`ToolCall.Index` 标识一个 delta 块属于哪个工具调用。如果 Provider 适配器为每个工具调用的每个块都设置 `Index = 0`，`concatToolCalls` 会将所有块合并为一个（无效的）调用。确保每个不同的工具调用获得唯一的 `Index`，并在整个流中正确递增。
 
-## 7. What Rive Can Learn
+## 7. Rive 可以借鉴的地方
 
-### 7.1 Canonical Schema as Integration Surface
+### 7.1 规范 Schema 作为集成面
 
-Eino's `schema/` package is the single source of truth for all data types
-that flow between components. Provider packages in `eino-ext` depend on
-`schema/` (not vice versa). This is the Dependency Inversion Principle
-applied to data: high-level modules define the data types; low-level
-implementations conform to them. Rive's plugin system should define a
-canonical schema package that plugins import — not a per-plugin data
-format.
+Eino 的 `schema/` 包是组件之间流动的所有数据类型的单一真实来源。`eino-ext` 中的 Provider 包依赖 `schema/`（而不是反过来）。这是应用于数据的依赖倒置原则：高层模块定义数据类型；低层实现遵循它们。Rive 的插件系统应该定义一个插件导入的规范 Schema 包——而不是每个插件一个数据格式。
 
-### 7.2 Typed Extension Slots Over Generic Maps
+### 7.2 类型化扩展槽位优于通用 Map
 
-The `ResponseMeta.OpenAIExtension *openai.ResponseMetaExtension` pattern
-(with nil = absent) is strictly better than `Extra map[string]any`. It gives
-the concat functions a typed contract (they know exactly how to merge), it
-gives the compiler something to check, and it gives IDE autocomplete concrete
-fields. Rive should favor typed optional struct fields over generic extension
-bags for plugin-specific data.
+`ResponseMeta.OpenAIExtension *openai.ResponseMetaExtension` 模式（nil = 不存在）严格优于 `Extra map[string]any`。它给 concat 函数提供了一个类型化合约（它们确切知道如何合并），给编译器提供了可检查的内容，给 IDE 自动补全提供了具体字段。Rive 应该优先使用类型化可选结构体字段，而不是通用扩展袋来存储插件特定数据。
 
-### 7.3 Type-Constraint Sealing for Generics
+### 7.3 泛型的类型约束封闭
 
-`type messageType interface { *schema.Message | *schema.AgenticMessage }`
-uses a Go 1.18+ union constraint to seal `BaseModel[M]` to exactly two
-concrete types. This prevents a third-party from passing `BaseModel[MyType]`
-through the framework, which would break graph compilation. Rive can use
-similar union constraints to seal its own generic execution interfaces.
+`type messageType interface { *schema.Message | *schema.AgenticMessage }` 使用 Go 1.18+ 的联合约束将 `BaseModel[M]` 封闭为恰好两种具体类型。这防止第三方通过框架传递 `BaseModel[MyType]`，后者会破坏 Graph 编译。Rive 可以使用类似的联合约束来封闭自己的泛型执行接口。
 
-### 7.4 Registered Dispatch Tables for Extensibility
+### 7.4 注册式派发表用于可扩展性
 
-`internal.RegisterStreamChunkConcatFunc[T]` builds a `reflect.Type → func`
-map. When the compose layer encounters a stream of type `T`, it calls
-`internal.ConcatItems[T]`, which dispatches to the registered concat
-function — without knowing what `T` is. This is the Go-generics equivalent
-of a plugin registry. Rive can use this pattern for its own extensible
-operations (serialization, validation, merging) where new types need to
-register handlers without modifying the core engine.
+`internal.RegisterStreamChunkConcatFunc[T]` 构建一个 `reflect.Type → func` 映射。当组合层遇到类型为 `T` 的流时，它调用 `internal.ConcatItems[T]`，后者派发到已注册的 concat 函数——而无需知道 `T` 是什么。这是 Go 泛型中等价于插件注册表的模式。Rive 可以在其自身的可扩展操作（序列化、验证、合并）中使用此模式，这些操作需要新类型注册处理器而无需修改核心引擎。
 
-### 7.5 Streaming Abstraction Polymorphism
+### 7.5 流式抽象多态
 
-`StreamReader[T]` switching between channel, array, multi-stream, and
-convert backends is more sophisticated than a simple `chan`. The compose
-layer's `streamReader` internal interface further adds copy/merge/withKey.
-Rive's streaming primitives should similarly hide backend differences —
-making `StreamReader` behave the same whether data comes from a live
-goroutine, a pre-computed array, or a merge of multiple sources.
+`StreamReader[T]` 在 Channel、数组、多流和转换后端之间切换，比简单的 `chan` 更为复杂。组合层的内部 `streamReader` 接口进一步添加了 copy/merge/withKey。Rive 的流式基元应同样隐藏后端差异——使 `StreamReader` 无论是来自活跃的 goroutine、预计算的数组还是多个源的合并，行为都保持一致。
 
-### 7.6 Bidirectional Message Model Compatibility
+### 7.6 双向 Message 模型兼容性
 
-Having both `Message` and `AgenticMessage` creates a migration path: existing
-graphs built on `BaseChatModel` continue to work; new graphs adopt
-`AgenticModel` with richer semantics. The two models coexist because they
-share the `messageType` constraint. Rive should design its data model
-evolution with similar graceful coexistence — not a breaking migration.
+同时拥有 `Message` 和 `AgenticMessage` 创建了一条迁移路径：基于 `BaseChatModel` 构建的现有 Graph 继续工作；新的 Graph 采用语义更丰富的 `AgenticModel`。两种模型共存是因为它们共享 `messageType` 约束。Rive 应该设计其数据模型演进时具有类似的优雅共存——而不是破坏性迁移。

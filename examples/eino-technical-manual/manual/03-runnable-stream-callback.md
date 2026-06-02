@@ -1,8 +1,8 @@
-# 03 — Runnable / Stream / Callback Runtime Patterns
+# 03 — Runnable / Stream / Callback 运行时模式
 
-## 1. Problem
+## 1. 面临的问题
 
-Eino's graph compilation output is `Runnable[I, O]` — a single interface that unifies four data flow patterns:
+Eino 图编译的产出是 `Runnable[I, O]` —— 一个统一了四种数据流模式的单一接口：
 
 ```go
 // compose/runnable.go:32-37
@@ -14,59 +14,59 @@ type Runnable[I, O any] interface {
 }
 ```
 
-Every node in an Eino graph — whether it is a ChatModel, a Retriever, a Lambda, or a nested sub-Graph — is compiled into `composableRunnable` and executed through one of these four modes. The runtime must:
+Eino 图中的每个节点 —— 无论是 ChatModel、Retriever、Lambda 还是嵌套子图 —— 都被编译为 `composableRunnable`，并通过这四种模式之一执行。运行时必须：
 
-1. Accept components that implement only a subset of these four methods (e.g., a model that only exposes `Generate` and `Stream`) and automatically derive the missing methods.
-2. Fire callbacks at the right lifecycle moments, without the component author writing callback dispatch manually.
-3. Handle stream copying correctly — fanning out a single stream to N concurrent consumers (downstream nodes + callback handlers) without deadlocks or goroutine leaks.
-4. Convert component-level abstractions (`BaseChatModel`, `Retriever`, `ChatTemplate`, etc.) into uniform graph nodes so the graph scheduler does not need to know component-specific internals.
+1. 接受只实现了这四种方法子集的组件（例如只暴露 `Generate` 和 `Stream` 的模型），并自动推导出缺失的方法。
+2. 在正确的生命周期节点触发回调（callback），而无需组件作者手动编写回调分发逻辑。
+3. 正确处理流的复制（stream copying）—— 将单个流扇出到 N 个并发消费者（下游节点 + 回调处理器），不会出现死锁或 goroutine 泄漏。
+4. 将组件级的抽象（`BaseChatModel`、`Retriever`、`ChatTemplate` 等）转换为统一的图节点，使图调度器无需了解组件特定的内部细节。
 
-If any of these is done wrong, the graph either silently drops stream data, leaks goroutines, fires callbacks with stale context, or panics on a type mismatch.
+以上任何一点如果处理不当，图执行要么静默丢弃流数据，要么泄漏 goroutine，要么使用过期的上下文触发回调，要么因类型不匹配而 panic。
 
-## 2. Why It Is Hard
+## 2. 为什么这么难
 
-**Multi-mode downgrade is combinatorially complex.** With four methods (I, S, C, T) and arbitrary subsets that a component may implement, the runtime needs `4 * 3 = 12` downgrade functions. Getting the priority right matters: invoking via Transform is cheaper than invoking via Stream (one stream conversion vs. two), and invoking via Stream is cheaper than invoking via Collect (one concat vs. two). The allocation order in `newRunnablePacker` (`compose/runnable.go:336-400`) is carefully chosen and documented nowhere except in code.
+**多模式降级组合爆炸。** 四种方法（I、S、C、T）以及组件可能实现的任意子集，意味着运行时需要 `4 * 3 = 12` 个降级函数。优先级顺序很重要：通过 Transform 调用比通过 Stream 调用更廉价（一次流转换 vs 两次），通过 Stream 调用比通过 Collect 调用更廉价（一次 concat vs 两次）。`newRunnablePacker`（`compose/runnable.go:336-400`）中的分配顺序是经过精心选择的，但除了代码本身没有任何文档记录。
 
-**Stream copying has subtle ownership semantics.** `schema.StreamReader.Copy` (`schema/stream.go:261-275`) fans out a single source into N independent child readers using a linked-list-based shared buffer (`parentStreamReader` + `childStreamReader`, lines 784-898). Each child MUST `Close()` its reader after consuming. If any child fails to close, the parent never closes the original reader, leaking the underlying channel goroutine. Callback handlers automatically receive copies via `OnStartWithStreamInputHandle` / `OnEndWithStreamOutputHandle` (`internal/callbacks/inject.go:163-193`) — if the handler forgets to close its copy, the entire pipeline leaks.
+**流复制具有微妙的所属权语义。** `schema.StreamReader.Copy`（`schema/stream.go:261-275`）使用基于链表结构的共享缓冲区（`parentStreamReader` + `childStreamReader`，第 784-898 行）将单个源扇出为 N 个独立的子 reader。每个子 reader 在消费后**必须**调用 `Close()`。如果任何子 reader 未关闭，父 reader 就永远不会关闭原始 reader，从而导致底层 channel goroutine 泄漏。回调处理器通过 `OnStartWithStreamInputHandle` / `OnEndWithStreamOutputHandle`（`internal/callbacks/inject.go:163-193`）自动接收流副本 —— 如果处理器忘记关闭自己的副本，整个管线就会泄漏。
 
-**Callback context chains are handler-isolated, not globally ordered.** Each handler receives the context returned by the previous timing of the *same* handler, but context does NOT flow from one handler to the next (`callbacks/interface.go:67-71`). Handlers that mutate context with `context.WithValue` and assume the next handler sees it will be surprised.
+**回调上下文链是处理器隔离的，而非全局有序的。** 每个处理器接收到的是**同一个**处理器的上一个阶段返回的上下文，但上下文不会从一个处理器流向另一个处理器（`callbacks/interface.go:67-71`）。如果某个处理器通过 `context.WithValue` 修改上下文并假设下一个处理器能看到它，那它一定会感到意外。
 
-**Component-to-node conversion must reconcile two runtime models.** Components like `BaseChatModel` (`components/model/interface.go`) have `Generate` + `Stream`, while the graph engine speaks `Invoke`/`Stream`/`Collect`/`Transform` via `composableRunnable`. The conversion must also set up `executorMeta` — component category, implementation type, and whether the component self-reports callbacks — so the graph runtime can correctly decide when to fire `OnStart`/`OnEnd` and when to skip.
+**组件到节点的转换必须协调两种运行时模型。** 像 `BaseChatModel`（`components/model/interface.go`）这样的组件拥有 `Generate` + `Stream`，而图引擎通过 `composableRunnable` 使用 `Invoke`/`Stream`/`Collect`/`Transform`。转换还必须设置 `executorMeta` —— 包括组件类别、实现类型，以及组件是否自行上报回调 —— 以便图运行时正确决定何时触发 `OnStart`/`OnEnd`，以及何时跳过。
 
-## 3. Design Idea
+## 3. 设计思路
 
-Eino splits this into four cooperating layers:
+Eino 将此问题拆分为四个协作层：
 
-**Layer 1: Runnable interface + packer.** `compose/runnable.go` defines `Runnable[I,O]` and `composableRunnable`, the internal wrapper that every graph node is compiled into. `runnablePacker` takes the raw function pointers (`Invoke`, `Stream`, `Collect`, `Transform`) from a component and fills in missing methods via automatic downgrade.
+**第一层：Runnable 接口 + packer。** `compose/runnable.go` 定义了 `Runnable[I,O]` 和 `composableRunnable`，即每个图节点编译后的内部包装。`runnablePacker` 接收组件的原始函数指针（`Invoke`、`Stream`、`Collect`、`Transform`），并通过自动降级填充缺失的方法。
 
-**Layer 2: Stream primitives.** `schema/stream.go` provides `StreamReader`/`StreamWriter` (based on goroutine channels), `Copy` for fan-out, `MergeStreamReaders` for fan-in, and `StreamReaderWithConvert` for type conversion on the fly. `compose/stream_reader.go` wraps this with an internal `streamReader` interface that `composableRunnable` works with — adding `close()`, `copy(n)`, `merge()`, `mergeWithNames()`, `withKey()`, and `toAnyStreamReader()`.
+**第二层：流原语。** `schema/stream.go` 提供了 `StreamReader`/`StreamWriter`（基于 goroutine channel）、用于扇出的 `Copy`、用于扇入的 `MergeStreamReaders`，以及用于类型转换的 `StreamReaderWithConvert`。`compose/stream_reader.go` 将其包装为内部的 `streamReader` 接口供 `composableRunnable` 使用 —— 增加了 `close()`、`copy(n)`、`merge()`、`mergeWithNames()`、`withKey()` 和 `toAnyStreamReader()`。
 
-**Layer 3: Callback engine.** `callbacks/` exposes the public `Handler` interface with five timings. `internal/callbacks/` manages per-invocation handler lists, dispatches timings, and enforces `TimingChecker` to skip unnecessary stream copies. The machinery lives in `compose/utils.go` (`invokeWithCallbacks`, `streamWithCallbacks`, etc.) which wraps each execution mode with `runWithCallbacks`.
+**第三层：回调引擎。** `callbacks/` 暴露了包含五个阶段的公开 `Handler` 接口。`internal/callbacks/` 管理每次调用的处理器列表，分发各个阶段，并强制执行 `TimingChecker` 以跳过不必要的流复制。其机制位于 `compose/utils.go`（`invokeWithCallbacks`、`streamWithCallbacks` 等），每个执行模式都通过 `runWithCallbacks` 进行包装。
 
-**Layer 4: Component-to-node bridge.** `compose/component_to_graph_node.go` provides one function per component type (`toChatModelNode`, `toRetrieverNode`, `toToolsNode`, etc.). Each calls `toComponentNode`, which builds `executorMeta` via `parseExecutorInfoFromComponent` (checking for `components.Typer` and `callbacks.Checker`) and wraps the component's methods into `composableRunnable` via `runnableLambda`.
+**第四层：组件到节点的桥接。** `compose/component_to_graph_node.go` 为每种组件类型提供了一个函数（`toChatModelNode`、`toRetrieverNode`、`toToolsNode` 等）。每个函数调用 `toComponentNode`，后者通过 `parseExecutorInfoFromComponent` 构建 `executorMeta`（检查 `components.Typer` 和 `callbacks.Checker`），并通过 `runnableLambda` 将组件的方法包装为 `composableRunnable`。
 
-The key insight: **the graph scheduler never sees components — it only sees `composableRunnable`**. This makes the scheduler generic over all component types, and makes callback/recovery logic reusable across the entire system.
+核心洞察：**图调度器从不直接接触组件 —— 它只接触 `composableRunnable`**。这使得调度器对所有组件类型保持通用，回调/恢复逻辑因此可以在整个系统中复用。
 
-## 4. Source Walkthrough
+## 4. 源码走读
 
-### 4.1 Runnable and automatic downgrade (`compose/runnable.go`)
+### 4.1 Runnable 与自动降级（`compose/runnable.go`）
 
-The core function is `newRunnablePacker` (line 336). It takes at most four function pointers (some may be nil) and fills in all four methods. The priority cascade for each method:
+核心函数是 `newRunnablePacker`（第 336 行）。它最多接收四个函数指针（有些可能为 nil），并填充全部四个方法。每个方法的优先级级联如下：
 
-- **Invoke**: prefer native I, else `invokeByStream` (line 194: call Stream, concat stream reader), else `invokeByCollect` (line 205: wrap input as array stream, call Collect), else `invokeByTransform` (line 213: array stream → Transform → concat output stream).
-- **Stream**: prefer native S, else `streamByTransform` (line 226: array stream input → Transform), else `streamByInvoke` (line 234: Invoke → wrap output as array stream), else `streamByCollect` (line 245: array stream input → Collect → wrap output as array stream).
-- **Collect**: prefer native C, else `collectByTransform` (Transform → concat output), else `collectByInvoke` (concat input → Invoke), else `collectByStream` (concat input → Stream → concat output).
-- **Transform**: prefer native T, else `transformByStream` (concat input → Stream), else `transformByCollect` (Collect → wrap output as array stream), else `transformByInvoke` (concat input → Invoke → wrap output as array stream).
+- **Invoke**：优先使用原生 I，否则 `invokeByStream`（第 194 行：调用 Stream，合并 stream reader），否则 `invokeByCollect`（第 205 行：将输入包装为数组流，调用 Collect），否则 `invokeByTransform`（第 213 行：数组流 → Transform → 合并输出流）。
+- **Stream**：优先使用原生 S，否则 `streamByTransform`（第 226 行：数组流输入 → Transform），否则 `streamByInvoke`（第 234 行：Invoke → 将输出包装为数组流），否则 `streamByCollect`（第 245 行：数组流输入 → Collect → 将输出包装为数组流）。
+- **Collect**：优先使用原生 C，否则 `collectByTransform`（Transform → 合并输出），否则 `collectByInvoke`（合并输入 → Invoke），否则 `collectByStream`（合并输入 → Stream → 合并输出）。
+- **Transform**：优先使用原生 T，否则 `transformByStream`（合并输入 → Stream），否则 `transformByCollect`（Collect → 将输出包装为数组流），否则 `transformByInvoke`（合并输入 → Invoke → 将输出包装为数组流）。
 
-Each downgrade function is documented by name alone — there is no additional commentary beyond the function signature. The correctness relies on `concatStreamReader` (`compose/stream_concat.go:50-88`), which consumes all chunks from a `StreamReader`, concatenates them via `internal.ConcatItems` (which dispatches to type-specific concat funcs registered by `RegisterStreamChunkConcatFunc`, line 44), and **always closes the reader** (line 51: `defer sr.Close()`).
+每个降级函数仅通过名称进行文档说明 —— 函数签名之外没有任何额外注释。其正确性依赖于 `concatStreamReader`（`compose/stream_concat.go:50-88`），该函数消费 `StreamReader` 中的所有数据块，通过 `internal.ConcatItems` 将它们拼接起来（后者分发到由 `RegisterStreamChunkConcatFunc` 注册的类型特定的 concat 函数，第 44 行），并**始终关闭 reader**（第 51 行：`defer sr.Close()`）。
 
-**Important detail**: if a component only implements `Stream()` but the user calls `Invoke()`, the runtime calls `invokeByStream` which calls `Stream` then `concatStreamReader`. If the stream type has no registered concat function, `internal.ConcatItems` falls back to returning the last chunk — which works for "incremental update" types like `schema.Message` (each chunk is a complete message that supersedes the previous one).
+**重要细节**：如果组件只实现了 `Stream()` 但用户调用了 `Invoke()`，运行时会调用 `invokeByStream`，后者先调用 `Stream`，再调用 `concatStreamReader`。如果该流类型没有注册 concat 函数，`internal.ConcatItems` 会回退到返回最后一个数据块 —— 这对于像 `schema.Message` 这样的"增量更新"类型是有效的（每个数据块都是覆盖前一个的完整消息）。
 
-`composableRunnable` (line 46) stores only two internal execution functions (`i invoke` and `t transform`), plus metadata (`inputType`, `outputType`, `optionType`, `isPassthrough`, `meta`, `nodeInfo`). The other two modes (Stream, Collect) are derived from these two at graph runtime via `toGenericRunnable` (line 402).
+`composableRunnable`（第 46 行）只存储了两个内部执行函数（`i invoke` 和 `t transform`），外加元数据（`inputType`、`outputType`、`optionType`、`isPassthrough`、`meta`、`nodeInfo`）。另外两种模式（Stream、Collect）在图运行时通过 `toGenericRunnable`（第 402 行）从这两个函数派生。
 
-### 4.2 Stream reader internals (`compose/stream_reader.go`)
+### 4.2 流 reader 内部实现（`compose/stream_reader.go`）
 
-The internal `streamReader` interface (line 26) wraps `schema.StreamReader` to add operations needed by the compose runtime:
+内部的 `streamReader` 接口（第 26 行）包装了 `schema.StreamReader`，增加了 compose 运行时所需的操作：
 
 ```go
 type streamReader interface {
@@ -81,55 +81,55 @@ type streamReader interface {
 }
 ```
 
-`packStreamReader` / `unpackStreamReader` (lines 111-128) convert between the typed `*schema.StreamReader[T]` and the untyped `streamReader` using a generic wrapper `streamReaderPacker[T]`. The `copy` method (line 45) delegates to `sr.Copy(n)` and re-wraps each copy. The `merge` method (line 79) calls `schema.MergeStreamReaders`. The `withKey` method (line 95) uses `schema.StreamReaderWithConvert` to map each chunk `T` into `map[string]any{key: T}`.
+`packStreamReader` / `unpackStreamReader`（第 111-128 行）使用泛型包装 `streamReaderPacker[T]` 在带类型的 `*schema.StreamReader[T]` 和不带类型的 `streamReader` 之间转换。`copy` 方法（第 45 行）委托给 `sr.Copy(n)` 并重新包装每个副本。`merge` 方法（第 79 行）调用 `schema.MergeStreamReaders`。`withKey` 方法（第 95 行）使用 `schema.StreamReaderWithConvert` 将每个数据块 `T` 映射为 `map[string]any{key: T}`。
 
-The `unpackStreamReader` function has special handling for interface types (line 121-127): if `T` is an interface, it converts the stream to `*StreamReader[any]` first, then wraps it with a typed conversion back to `T`. This allows runtime type erasure to work correctly when the graph has nodes with dynamically-typed outputs.
+`unpackStreamReader` 函数对接口类型有特殊处理（第 121-127 行）：如果 `T` 是接口，它先将流转换为 `*StreamReader[any]`，然后用带类型的转换包装回 `T`。这使得当图中存在动态类型输出的节点时，运行时类型擦除能够正确工作。
 
-### 4.3 Stream concatenation (`compose/stream_concat.go`)
+### 4.3 流拼接（`compose/stream_concat.go`）
 
-`concatStreamReader[T]` (line 50) is the workhorse behind every downgrade that needs to collapse a stream into a single value. It:
+`concatStreamReader[T]`（第 50 行）是每次需要将流折叠为单个值的降级操作的核心。它执行以下步骤：
 
-1. Defers `sr.Close()` (line 51) — critical for resource cleanup.
-2. Loops with `sr.Recv()` until `io.EOF`.
-3. Skips `SourceEOF` errors from merged streams (line 62: `schema.GetSourceName(err)` — useful when a multi-stream merge signals per-source completion).
-4. Accumulates all chunks into a slice.
-5. If the slice is empty, returns `emptyStreamConcatErr`.
-6. If there is exactly one chunk, returns it directly (no concat overhead).
-7. Otherwise, calls `internal.ConcatItems(items)` to build the final value.
+1. 延迟执行 `sr.Close()`（第 51 行）—— 对资源清理至关重要。
+2. 循环调用 `sr.Recv()` 直到 `io.EOF`。
+3. 跳过来自合并流的 `SourceEOF` 错误（第 62 行：`schema.GetSourceName(err)` —— 当多流合并发出每个源的完成信号时很有用）。
+4. 将所有数据块累积到一个切片中。
+5. 如果切片为空，返回 `emptyStreamConcatErr`。
+6. 如果恰好只有一个数据块，直接返回（无 concat 开销）。
+7. 否则，调用 `internal.ConcatItems(items)` 构建最终值。
 
-The public `RegisterStreamChunkConcatFunc[T]` (line 44) lets users register custom concat logic for their types. Registration is not thread-safe and must be done at program init. The doc example shows concatenating a struct by taking the latest value of one field and summing another — a pattern typical of streaming token aggregation.
+公开的 `RegisterStreamChunkConcatFunc[T]`（第 44 行）允许用户为其类型注册自定义的 concat 逻辑。注册不是线程安全的，必须在程序初始化时完成。文档示例展示了如何通过取一个字段的最新值并对另一个字段求和来拼接结构体 —— 这是流式 token 聚合中的典型模式。
 
-### 4.4 Callback interface (`callbacks/interface.go` + `internal/callbacks/interface.go`)
+### 4.4 回调接口（`callbacks/interface.go` + `internal/callbacks/interface.go`）
 
-**Public `RunInfo`** (`callbacks/interface.go:41`): three fields:
-- `Name`: graph node name from `compose.WithNodeName`, or empty for standalone components that haven't called `InitCallbacks`.
-- `Type`: implementation identity (e.g. `"OpenAI"`) from `components.Typer`; falls back to reflection-derived type name.
-- `Component`: category constant from `components.Component` (e.g. `ComponentOfChatModel`, `ComponentOfRetriever`). Fixed to `"Graph"`/`"Chain"`/`"Workflow"` for graph-level invocations, `"Lambda"` for lambdas.
+**公开的 `RunInfo`**（`callbacks/interface.go:41`）：三个字段：
+- `Name`：来自 `compose.WithNodeName` 的图节点名称，未调用 `InitCallbacks` 的独立组件则为空。
+- `Type`：来自 `components.Typer` 的实现标识（如 `"OpenAI"`）；回退为反射推导的类型名。
+- `Component`：来自 `components.Component` 的类别常量（如 `ComponentOfChatModel`、`ComponentOfRetriever`）。对于图级调用固定为 `"Graph"`/`"Chain"`/`"Workflow"`，Lambda 为 `"Lambda"`。
 
-**Five callback timings** (`callbacks/interface.go:114-134`):
-| Constant | When | Input/Output |
+**五个回调阶段**（`callbacks/interface.go:114-134`）：
+| 常量 | 时机 | 输入/输出 |
 |---|---|---|
-| `TimingOnStart` | Before component runs | `CallbackInput` (value) |
-| `TimingOnEnd` | After component succeeds | `CallbackOutput` (value) |
-| `TimingOnError` | Component returns error | `error` |
-| `TimingOnStartWithStreamInput` | Component receives stream input (Collect/Transform) | `*StreamReader[CallbackInput]` (copy) |
-| `TimingOnEndWithStreamOutput` | Component produces stream output (Stream/Transform) | `*StreamReader[CallbackOutput]` (copy) |
+| `TimingOnStart` | 组件运行前 | `CallbackInput`（值） |
+| `TimingOnEnd` | 组件成功后 | `CallbackOutput`（值） |
+| `TimingOnError` | 组件返回错误 | `error` |
+| `TimingOnStartWithStreamInput` | 组件接收流输入（Collect/Transform） | `*StreamReader[CallbackInput]`（副本） |
+| `TimingOnEndWithStreamOutput` | 组件产生流输出（Stream/Transform） | `*StreamReader[CallbackOutput]`（副本） |
 
-**`TimingChecker`** (`callbacks/interface.go:136-145`): an optional interface on handlers. The framework calls `Needed(ctx, info, timing)` before each timing to decide whether to allocate stream copies and goroutines. Handlers built with `HandlerBuilder` (`callbacks/handler_builder.go`) automatically implement `TimingChecker` — `Needed` returns `true` only for the functions the user explicitly set.
+**`TimingChecker`**（`callbacks/interface.go:136-145`）：处理器上的可选接口。框架在每个阶段前调用 `Needed(ctx, info, timing)` 来决定是否需要分配流副本和 goroutine。通过 `HandlerBuilder`（`callbacks/handler_builder.go`）构建的处理器会自动实现 `TimingChecker` —— `Needed` 只在用户显式设置函数时才返回 `true`。
 
-**Internal engine** (`internal/callbacks/inject.go`): the function `On[T]` (line 74) is the single dispatch entry point for all timings. It:
-1. Pulls the `manager` from context.
-2. Collects handlers that need this timing (filtered via `TimingChecker`).
-3. Calls the `Handle[T]` function with the handlers list.
-4. Returns the updated context and (possibly copied) value.
+**内部引擎**（`internal/callbacks/inject.go`）：函数 `On[T]`（第 74 行）是所有阶段的统一分发入口。它：
+1. 从上下文中拉取 `manager`。
+2. 收集需要此阶段的处理器（通过 `TimingChecker` 过滤）。
+3. 使用处理器列表调用 `Handle[T]` 函数。
+4. 返回更新后的上下文和（可能已复制的）值。
 
-Stream handlers (`OnStartWithStreamInputHandle`, `OnEndWithStreamOutputHandle`, lines 163-193) use `OnWithStreamHandle` (line 143), which calls `cpy(len(handlers) + 1)` to create N+1 copies of the input stream — N for the handlers and 1 for the actual consumer. **Each handler receives its own private copy** and must close it.
+流处理器（`OnStartWithStreamInputHandle`、`OnEndWithStreamOutputHandle`，第 163-193 行）使用 `OnWithStreamHandle`（第 143 行），后者调用 `cpy(len(handlers) + 1)` 创建 N+1 份输入流的副本 —— N 份给处理器，1 份给实际消费者。**每个处理器接收到自己的私有副本**，并且必须关闭它。
 
-**Global vs. per-invocation handlers** (`internal/callbacks/manager.go`): `manager` holds both `globalHandlers` (set once at program init via `AppendGlobalHandlers`) and `handlers` (set per graph invocation via `compose.WithCallbacks`). Global handlers run first (higher priority for instrumentation that must observe everything).
+**全局 vs 每次调用的处理器**（`internal/callbacks/manager.go`）：`manager` 同时持有 `globalHandlers`（程序初始化时通过 `AppendGlobalHandlers` 一次性设置）和 `handlers`（每次图调用时通过 `compose.WithCallbacks` 设置）。全局处理器优先执行（对于必须观测一切的仪表化功能具有更高优先级）。
 
-### 4.5 Callback wrapping in compose (`compose/utils.go`)
+### 4.5 compose 中的回调包装（`compose/utils.go`）
 
-`runWithCallbacks` (line 100) is the generic wrapper:
+`runWithCallbacks`（第 100 行）是通用的包装器：
 
 ```go
 func runWithCallbacks[I, O, TOption any](r func(...) (O, error),
@@ -147,18 +147,18 @@ func runWithCallbacks[I, O, TOption any](r func(...) (O, error),
 }
 ```
 
-The four mode-specific wrappers are:
+四种模式特定的包装器为：
 
-- `invokeWithCallbacks`: onStart (value) → Invoke → onEnd (value)
-- `streamWithCallbacks`: onStart (value) → Stream → onEndWithStreamOutput (stream)
-- `collectWithCallbacks`: onStartWithStreamInput (stream) → Collect → onEnd (value)
-- `transformWithCallbacks`: onStartWithStreamInput (stream) → Transform → onEndWithStreamOutput (stream)
+- `invokeWithCallbacks`：onStart（值）→ Invoke → onEnd（值）
+- `streamWithCallbacks`：onStart（值）→ Stream → onEndWithStreamOutput（流）
+- `collectWithCallbacks`：onStartWithStreamInput（流）→ Collect → onEnd（值）
+- `transformWithCallbacks`：onStartWithStreamInput（流）→ Transform → onEndWithStreamOutput（流）
 
-`initGraphCallbacks` / `initNodeCallbacks` (lines 152-207) set up `RunInfo` in context before each node executes. They check `executorMeta.component` for the component category and `executorMeta.componentImplType` for the implementation type. Per-node callbacks can be scoped via `compose.WithCallbacks` with `NodePath` filtering (lines 188-200).
+`initGraphCallbacks` / `initNodeCallbacks`（第 152-207 行）在每个节点执行前在上下文中设置 `RunInfo`。它们检查 `executorMeta.component` 获取组件类别，检查 `executorMeta.componentImplType` 获取实现类型。每个节点的回调可以通过带有 `NodePath` 过滤的 `compose.WithCallbacks` 进行范围限定（第 188-200 行）。
 
-### 4.6 Component-to-graph-node conversion (`compose/component_to_graph_node.go`)
+### 4.6 组件到图节点的转换（`compose/component_to_graph_node.go`）
 
-Every component type has a dedicated conversion function. For example, `toChatModelNode` (line 93):
+每种组件类型都有专用的转换函数。例如 `toChatModelNode`（第 93 行）：
 
 ```go
 func toChatModelNode(node model.BaseChatModel, opts ...GraphAddNodeOpt) (*graphNode, *graphAddNodeOpts) {
@@ -167,57 +167,57 @@ func toChatModelNode(node model.BaseChatModel, opts ...GraphAddNodeOpt) (*graphN
         components.ComponentOfChatModel,
         node.Generate,  // Invoke
         node.Stream,    // Stream
-        nil,            // Collect (not implemented)
-        nil,            // Transform (not implemented)
+        nil,            // Collect（未实现）
+        nil,            // Transform（未实现）
         opts...)
 }
 ```
 
-`toComponentNode` (line 29) does three things:
-1. Calls `parseExecutorInfoFromComponent` (`compose/graph_node.go:151-163`) to build `executorMeta` — sets `component`, `componentImplType` (from `components.GetType`), and `isComponentCallbackEnabled` (from `components.IsCallbacksEnabled`).
-2. Calls `runnableLambda` with the four method pointers, which invokes `newRunnablePacker` — filling in the missing Collect/Transform via automatic downgrade (Collect via `collectByStream`, Transform via `transformByStream`).
-3. Calls `toNode` to wrap everything into a `graphNode` struct.
+`toComponentNode`（第 29 行）做三件事：
+1. 调用 `parseExecutorInfoFromComponent`（`compose/graph_node.go:151-163`）构建 `executorMeta` —— 设置 `component`、`componentImplType`（来自 `components.GetType`）和 `isComponentCallbackEnabled`（来自 `components.IsCallbacksEnabled`）。
+2. 使用四个方法指针调用 `runnableLambda`，后者调用 `newRunnablePacker` —— 通过自动降级填充缺失的 Collect/Transform（Collect 通过 `collectByStream`，Transform 通过 `transformByStream`）。
+3. 调用 `toNode` 将所有内容包装为 `graphNode` 结构体。
 
-**Critical detail on `isComponentCallbackEnabled`**: the `runnableLambda` call passes `!meta.isComponentCallbackEnabled` as the `enableCallback` flag (line 41). This flag is inverted — if a component says "I handle my own callbacks" (via `callbacks.Checker`), the compose layer does NOT wrap the component's methods with `runWithCallbacks`. Otherwise, compose wraps them. This prevents double-firing of callbacks.
+**关于 `isComponentCallbackEnabled` 的关键细节**：`runnableLambda` 调用将 `!meta.isComponentCallbackEnabled` 作为 `enableCallback` 标志传入（第 41 行）。该标志是取反的 —— 如果组件说"我自己处理回调"（通过 `callbacks.Checker`），compose 层就**不**会用 `runWithCallbacks` 包装组件的方法。否则，compose 会包装它们。这防止了回调的重复触发。
 
-The passthrough node (`toPassthroughNode`, line 186) is a zero-cost identity node — its `Invoke` returns input unchanged and its `Transform` returns the input stream unchanged. It is used by graph compilation to insert synthetic nodes for routing.
+透传节点（`toPassthroughNode`，第 186 行）是一个零开销的恒等节点 —— 其 `Invoke` 原样返回输入，`Transform` 原样返回输入流。它被图编译用于插入合成的路由节点。
 
-### 4.7 Callback context lifecycle (`internal/callbacks/inject.go`)
+### 4.7 回调上下文生命周期（`internal/callbacks/inject.go`）
 
-The `On[T]` dispatch function (line 74) has a subtle `start` parameter:
+`On[T]` 分发函数（第 74 行）有一个微妙的 `start` 参数：
 
-- When `start = true` (first timing of an execution): the manager's `runInfo` is consumed and stored into context via `CtxRunInfoKey`. This prevents re-dispatch on nested calls.
-- When `start = false` (subsequent timings): if the manager still has `runInfo` (because `EnsureRunInfo` was called by a sub-component), it is used; otherwise it is fetched from `CtxRunInfoKey` in context.
+- 当 `start = true`（执行的第一个阶段）时：manager 的 `runInfo` 被消费并存储到上下文中（通过 `CtxRunInfoKey`）。这防止了在嵌套调用上的重复分发。
+- 当 `start = false`（后续阶段）时：如果 manager 仍然有 `runInfo`（因为子组件调用了 `EnsureRunInfo`），则使用它；否则从上下文中的 `CtxRunInfoKey` 获取。
 
-This mechanism ensures that when a sub-graph node calls `EnsureRunInfo` to provide its own `RunInfo`, subsequent callback timings inside that node use the sub-graph's `RunInfo`, not the parent's.
+该机制确保当子图节点调用 `EnsureRunInfo` 提供自己的 `RunInfo` 时，该节点内部后续的回调阶段使用子图的 `RunInfo`，而非父图的。
 
-## 5. Patterns and Examples
+## 5. 模式与示例
 
-### Pattern 1: Component with only Invoke
+### 模式 1：只有 Invoke 的组件
 
-A Retriever implements only `Retrieve` (which maps to Invoke). Eino wraps it:
-
-```
-Invoke  → native Retrieve
-Stream  → invokeByStream      // call Retrieve, wrap result as array stream
-Collect → collectByInvoke      // concat input stream, call Retrieve
-Transform → transformByInvoke  // concat input stream, call Retrieve, wrap as array stream
-```
-
-The graph user can call `.Stream()` on this node and it works, even though the retriever never implemented streaming.
-
-### Pattern 2: ChatModel with Invoke + Stream
-
-`BaseChatModel` has both `Generate` (Invoke) and `Stream`. The missing Collect and Transform are derived:
+Retriever 只实现了 `Retrieve`（映射到 Invoke）。Eino 将其包装为：
 
 ```
-Collect → collectByStream   // concat input, Stream, concat output
-Transform → transformByStream // concat input, Stream
+Invoke   → 原生 Retrieve
+Stream   → invokeByStream       // 调用 Retrieve，将结果包装为数组流
+Collect  → collectByInvoke      // 合并输入流，调用 Retrieve
+Transform → transformByInvoke   // 合并输入流，调用 Retrieve，包装为数组流
 ```
 
-This means a ChatModel node can receive stream input (from an upstream streaming prompt chain) and produce stream output. The concat in `collectByStream` is the price of bridging non-streaming input to streaming output.
+图的用户可以对这样的节点调用 `.Stream()` 并且能正常工作，即使 retriever 从未实现流式功能。
 
-### Pattern 3: HandlerBuilder for per-timing callbacks
+### 模式 2：拥有 Invoke + Stream 的 ChatModel
+
+`BaseChatModel` 同时拥有 `Generate`（Invoke）和 `Stream`。缺失的 Collect 和 Transform 被派生：
+
+```
+Collect   → collectByStream     // 合并输入，Stream，合并输出
+Transform → transformByStream   // 合并输入，Stream
+```
+
+这意味着 ChatModel 节点可以接收流输入（来自上游的流式 prompt 链）并产生流输出。`collectByStream` 中的 concat 操作是桥接非流式输入到流式输出的代价。
+
+### 模式 3：使用 HandlerBuilder 为每个阶段编写回调
 
 ```go
 handler := callbacks.NewHandlerBuilder().
@@ -228,33 +228,33 @@ handler := callbacks.NewHandlerBuilder().
         return ctx
     }).
     OnEndWithStreamOutputFn(func(ctx context.Context, info *callbacks.RunInfo, output *schema.StreamReader[callbacks.CallbackOutput]) context.Context {
-        defer output.Close() // REQUIRED
+        defer output.Close() // 必须执行
         for {
             chunk, err := output.Recv()
             if errors.Is(err, io.EOF) { break }
-            // accumulate token counts from stream
+            // 从流中累积 token 计数
         }
         return ctx
     }).
     Build()
 ```
 
-The `HandlerBuilder.Build()` call (`callbacks/handler_builder.go:161`) returns a `handlerImpl` that implements `TimingChecker` — `Needed` returns true only for `OnStartFn` and `OnEndWithStreamOutputFn` in this example, skipping the other three timings with zero overhead.
+`HandlerBuilder.Build()` 调用（`callbacks/handler_builder.go:161`）返回一个 `handlerImpl`，它实现了 `TimingChecker` —— 在此示例中，`Needed` 只对 `OnStartFn` 和 `OnEndWithStreamOutputFn` 返回 true，另外三种阶段以零开销跳过。
 
-### Pattern 4: Global handlers for cross-cutting concerns
+### 模式 4：全局处理器处理横切关注点
 
 ```go
 func init() {
     callbacks.AppendGlobalHandlers(
-        tracingHandler,   // always runs first
-        metricsHandler,   // always runs second
+        tracingHandler,   // 总是首先执行
+        metricsHandler,   // 总是第二执行
     )
 }
 ```
 
-Global handlers are processed BEFORE per-invocation handlers in the `On` dispatch function (`internal/callbacks/inject.go:95`). This means distributed tracing sees every component invocation regardless of what handlers the application code passes.
+全局处理器在 `On` 分发函数中**先于**每次调用的处理器执行（`internal/callbacks/inject.go:95`）。这意味着分布式追踪能看到每个组件的每次调用，无论应用代码传入了什么处理器。
 
-### Pattern 5: Path-scoped callbacks
+### 模式 5：路径范围限定的回调
 
 ```go
 r.Invoke(ctx, input,
@@ -264,48 +264,48 @@ r.Invoke(ctx, input,
 )
 ```
 
-The `initNodeCallbacks` function (`compose/utils.go:190-200`) matches the `NodePath` against the current node key. If the path matches, the handler is appended; otherwise the node reuses the existing handlers from context via `ReuseHandlers`.
+`initNodeCallbacks` 函数（`compose/utils.go:190-200`）将 `NodePath` 与当前节点 key 进行匹配。如果路径匹配，则追加该处理器；否则节点通过 `ReuseHandlers` 复用上下文中已有的处理器。
 
-## 6. Common Pitfalls
+## 6. 常见陷阱
 
-### Pitfall 1: Leaking stream readers in callback handlers
+### 陷阱 1：回调处理器中泄漏 stream reader
 
-The most dangerous bug. `OnEndWithStreamOutput` and `OnStartWithStreamInput` handlers receive a **private copy** of the stream. If the handler does not close this copy, `parentStreamReader.close()` (`schema/stream.go:868-881`) never increments its `closedNum`, so the original stream is never closed, and the goroutine in `toStream()` (line 747-778) leaks forever.
+这是最危险的问题。`OnEndWithStreamOutput` 和 `OnStartWithStreamInput` 处理器接收流的**私有副本**。如果处理器不关闭该副本，`parentStreamReader.close()`（`schema/stream.go:868-881`）永远不会递增其 `closedNum`，因此原始流永远不会被关闭，`toStream()`（第 747-778 行）中的 goroutine 将永远泄漏。
 
-**Fix**: always `defer sr.Close()` in stream handlers. The `HandlerBuilder` docstrings (`callbacks/handler_builder.go:141, 153`) explicitly warn about this.
+**修复方法**：在流处理器中始终使用 `defer sr.Close()`。`HandlerBuilder` 的文档字符串（`callbacks/handler_builder.go:141, 153`）明确警告了这一点。
 
-### Pitfall 2: Assuming callback handler ordering
+### 陷阱 2：假设回调处理器的执行顺序
 
-Context does NOT flow between different handlers. Each handler's `OnStart` → `OnEnd` chain is independent. If handler A sets a value via `context.WithValue` and handler B expects to read it, handler B will get nil.
+上下文不**会**在不同处理器之间流动。每个处理器的 `OnStart` → `OnEnd` 链是独立的。如果处理器 A 通过 `context.WithValue` 设置了一个值，而处理器 B 期望能够读取它，处理器 B 会得到 nil。
 
-**Fix**: use a single handler for serial state, or use global state that is safe for concurrent access.
+**修复方法**：对串行状态使用单个处理器，或使用安全的全局并发状态。
 
-### Pitfall 3: Mutating callback input/output values
+### 陷阱 3：修改回调输入/输出值
 
-The `OnStart` and `OnEnd` handlers receive pointers to the same objects used by other nodes and handlers (`direct assignment, not a deep copy` — `callbacks/interface.go:82-84`). Mutating these values causes data races in concurrent graph execution.
+`OnStart` 和 `OnEnd` 处理器接收的指针指向与其他节点和处理器使用的**同一个对象**（直接赋值，而非深拷贝 —— `callbacks/interface.go:82-84`）。修改这些值会在并发的图执行中导致数据竞争。
 
-### Pitfall 4: Forgetting to register stream concat functions
+### 陷阱 4：忘记注册流 concat 函数
 
-If a component only implements `Stream()` and the user calls `Invoke()`, the runtime uses `concatStreamReader` to collapse the stream. If no concat function was registered for the chunk type, `internal.ConcatItems` falls back to the last chunk. For types that do not follow the "last chunk is the final answer" semantics (e.g., a streaming numeric counter where each chunk is a delta), this produces garbage.
+如果组件只实现了 `Stream()` 而用户调用了 `Invoke()`，运行时会使用 `concatStreamReader` 来折叠流。如果没有为数据块类型注册 concat 函数，`internal.ConcatItems` 会回退到最后一个数据块。对于不遵循"最后一个数据块即为最终答案"语义的类型（例如流式数字计数器，其中每个数据块是一个增量），这会产生错误的结果。
 
-**Fix**: call `compose.RegisterStreamChunkConcatFunc` at init for custom chunk types.
+**修复方法**：在 init 时对自定义数据块类型调用 `compose.RegisterStreamChunkConcatFunc`。
 
-### Pitfall 5: Double-firing callbacks through nested graph and component
+### 陷阱 5：嵌套图和组件导致回调重复触发
 
-If a ChatModel implementation self-implements callback dispatch via `callbacks.Checker`, but the compose layer also wraps it with `runWithCallbacks`, each timing fires twice. Eino prevents this via `isComponentCallbackEnabled` in `executorMeta` — but only if the component correctly implements `Checker`.
+如果 ChatModel 的实现通过 `callbacks.Checker` 自行实现了回调分发，但 compose 层又通过 `runWithCallbacks` 对其进行了包装，每个阶段都会触发两次。Eino 通过 `executorMeta` 中的 `isComponentCallbackEnabled` 来防止这一点 —— 但前提是组件正确实现了 `Checker`。
 
-### Pitfall 6: Stream copy before Recv
+### 陷阱 6：在 Copy 之后进行 Recv
 
-`StreamReader.Copy()` **must** be called before the first `Recv()`. The original reader becomes unusable after Copy. The `copyStreamReaders` function (`schema/stream.go:792-821`) replaces the original reader with a `parentStreamReader` that lazily fetches from the source — but this replacement is irreversible. If the caller tries to `Recv()` on the original after Copy, it panics.
+`StreamReader.Copy()` **必须**在第一次 `Recv()` 之前调用。原始 reader 在 Copy 之后就会变得不可用。`copyStreamReaders` 函数（`schema/stream.go:792-821`）将原始 reader 替换为一个惰性从源获取数据的 `parentStreamReader` —— 但此替换是不可逆的。如果调用方在 Copy 之后尝试对原始 reader 调用 `Recv()`，会直接 panic。
 
-## 7. What Rive Can Learn
+## 7. Rive 可以学到什么
 
-**Stable execution addresses, not function calls.** Eino's `RunInfo` (Name + Type + Component) forms a stable identity for every execution point in the graph. Rive could adopt a similar structured identity: `{dispatchId, workerId, executionAttempt}` rather than relying on natural language descriptions to identify nodes.
+**稳定的执行地址，而非函数调用。** Eino 的 `RunInfo`（Name + Type + Component）为图中的每个执行点构成了一个稳定的标识。Rive 可以采用类似的结构化标识：`{dispatchId, workerId, executionAttempt}`，而不是依赖自然语言描述来识别节点。
 
-**Stream lifecycle = resource lifecycle.** Eino treats stream readers as resources with mandatory close semantics. The callback engine creates N+1 copies and assigns exactly one to each consumer. Rive's dispatch protocol could benefit from a similar model for streaming data between workers: explicit copy-on-fork, mandatory close acknowledgments, and automatic cleanup when a consumer fails to close.
+**流生命周期 = 资源生命周期。** Eino 将 stream reader 视为具有强制关闭语义的资源。回调引擎创建 N+1 个副本，并为每个消费者精确分配一个。Rive 的分发协议可以从类似的流式数据模型在 worker 之间传输中受益：显式的 fork 时复制、强制的关闭确认、以及消费者未能关闭时的自动清理。
 
-**Automatic capability downgrade as a migration strategy.** Eino's downgrade matrix allows components to evolve independently — a component can add `Stream()` support without updating every caller. Rive workers could similarly advertise capability levels (`supports_streaming`, `supports_resume`) and the protocol could automatically bridge between different capability levels.
+**自动能力降级作为迁移策略。** Eino 的降级矩阵允许组件独立演化 —— 一个组件可以添加 `Stream()` 支持而无需更新每一个调用方。Rive 的 worker 同样可以声明能力级别（`supports_streaming`、`supports_resume`），协议可以自动桥接不同的能力级别。
 
-**TimingChecker as cost model.** Eino skips stream copies and allocations when a handler doesn't need a timing. Rive could apply the same idea to observability: workers declare which lifecycle events they want to observe, and the protocol omits instrumentation overhead for unsubscribed events.
+**TimingChecker 作为成本模型。** Eino 在处理器不需要某个阶段时跳过流复制和分配。Rive 可以将同样的思路应用于可观测性：worker 声明它们想要观测哪些生命周期事件，协议对未订阅的事件省略仪表化开销。
 
-**Component-agnostic scheduling.** Eino's scheduler never sees `ChatModel` or `Retriever` — it only sees `composableRunnable`. This allows new component types to be added without touching the scheduler. Rive could similarly define a uniform work-unit interface so the scheduler does not need to understand SQL queries, Python scripts, or API calls.
+**组件无关的调度。** Eino 的调度器从不接触 `ChatModel` 或 `Retriever` —— 它只接触 `composableRunnable`。这使得可以在不触及调度器的情况下添加新的组件类型。Rive 同样可以定义统一的工作单元接口，使调度器无需理解 SQL 查询、Python 脚本或 API 调用。
