@@ -19,7 +19,8 @@ use rive::facts::{protocol_from_fact, FactDisplay, FactListDisplay, FactListProt
 use rive::output::{Envelope, ErrorEnvelope};
 use rive::runner::{
     CodexRunner, CodexRunnerInput, OpenCodeRunner, OpenCodeRunnerInput, OrchestratorRunner,
-    OrchestratorRunnerInput, SchedulerRunInput, SchedulerService,
+    OrchestratorRunnerInput, SchedulerResumeInput, SchedulerRunInput, SchedulerService,
+    SchedulerStatusInput,
 };
 use rive::snapshot::{
     read_manifest, CaptureDisplay, CaptureOptions, CaptureProtocol, LocalFsEvidenceWorkspace,
@@ -394,6 +395,32 @@ enum SchedulerCommands {
         max_parallel: usize,
         #[arg(long = "acceptance-mode", default_value = "manual")]
         acceptance_mode: String,
+        #[arg(long = "workspace-mode", default_value = "shared")]
+        workspace_mode: String,
+        #[arg(long = "opencode-bin")]
+        opencode_bin: Option<PathBuf>,
+        #[arg(long = "timeout-seconds", default_value_t = 300)]
+        timeout_seconds: u64,
+    },
+    Status {
+        #[arg(long = "run")]
+        scheduler_run_id: Option<String>,
+        #[arg(long = "root")]
+        root_work_node_id: Option<String>,
+    },
+    Resume {
+        #[arg(long = "run")]
+        scheduler_run_id: Option<String>,
+        #[arg(long = "root")]
+        root_work_node_id: Option<String>,
+        #[arg(long = "worker")]
+        workers: Vec<String>,
+        #[arg(long = "command-id")]
+        command_id: String,
+        #[arg(long = "max-parallel")]
+        max_parallel: Option<usize>,
+        #[arg(long = "acceptance-mode")]
+        acceptance_mode: Option<String>,
         #[arg(long = "workspace-mode", default_value = "shared")]
         workspace_mode: String,
         #[arg(long = "opencode-bin")]
@@ -1326,6 +1353,76 @@ fn run() -> Result<()> {
                         protocol.root_work.state
                     ),
                     "trace_note": "Debug trace is for Rive diagnostics only; scheduler success is based on Work DAG projection.",
+                });
+                print_json(&Envelope::new(protocol, display))
+            }
+            SchedulerCommands::Status {
+                scheduler_run_id,
+                root_work_node_id,
+            } => {
+                let workspace = find_workspace(&std::env::current_dir()?)
+                    .map_err(|_| anyhow!("workspace not initialized"))?;
+                let store = EventStore::open(&workspace.db_path())?;
+                store.init_schema()?;
+                let trace_store = DebugTraceStore::open(&workspace.db_path())?;
+                trace_store.init_schema()?;
+                let snapshot_store = LocalSnapshotStore::new(&workspace);
+                let scheduler =
+                    SchedulerService::new(&workspace, &store, &trace_store, &snapshot_store);
+                let protocol = scheduler.status(SchedulerStatusInput {
+                    scheduler_run_id,
+                    root_work_node_id,
+                })?;
+                let display = serde_json::json!({
+                    "summary": format!(
+                        "Scheduler status root {} {}",
+                        protocol.root_work.work_node_id,
+                        protocol.root_work.state
+                    ),
+                    "trace_note": "Debug trace is for Rive diagnostics only; scheduler status is based on Work DAG and scheduler ledgers.",
+                });
+                print_json(&Envelope::new(protocol, display))
+            }
+            SchedulerCommands::Resume {
+                scheduler_run_id,
+                root_work_node_id,
+                workers,
+                command_id,
+                max_parallel,
+                acceptance_mode,
+                workspace_mode,
+                opencode_bin,
+                timeout_seconds,
+            } => {
+                let workspace = find_workspace(&std::env::current_dir()?)
+                    .map_err(|_| anyhow!("workspace not initialized"))?;
+                let store = EventStore::open(&workspace.db_path())?;
+                store.init_schema()?;
+                let trace_store = DebugTraceStore::open(&workspace.db_path())?;
+                trace_store.init_schema()?;
+                let snapshot_store = LocalSnapshotStore::new(&workspace);
+                let scheduler =
+                    SchedulerService::new(&workspace, &store, &trace_store, &snapshot_store);
+                let protocol = scheduler.resume(SchedulerResumeInput {
+                    scheduler_run_id,
+                    root_work_node_id,
+                    workers,
+                    command_id,
+                    max_parallel,
+                    acceptance_mode,
+                    workspace_mode,
+                    opencode_bin,
+                    timeout_seconds,
+                })?;
+                let display = serde_json::json!({
+                    "summary": format!(
+                        "Scheduler resume {} ended {} with root {} {}",
+                        protocol.scheduler.scheduler_run_id,
+                        protocol.scheduler.state,
+                        protocol.scheduler.root_work_node_id,
+                        protocol.root_work.state
+                    ),
+                    "trace_note": "Debug trace is for Rive diagnostics only; resume success is based on Work DAG projection.",
                 });
                 print_json(&Envelope::new(protocol, display))
             }

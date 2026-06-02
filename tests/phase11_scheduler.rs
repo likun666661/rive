@@ -334,6 +334,35 @@ fn scheduler_command(temp: &TempDir, fake: &Path, root: &str, command_id: &str) 
     scheduler_command_with_mode(temp, fake, root, command_id, "auto-reported")
 }
 
+fn scheduler_resume_command(
+    temp: &TempDir,
+    fake: &Path,
+    scheduler_run_id: &str,
+    command_id: &str,
+    acceptance_mode: &str,
+) -> Command {
+    let mut command = rive_cmd();
+    command
+        .current_dir(temp.path())
+        .arg("scheduler")
+        .arg("resume")
+        .arg("--run")
+        .arg(scheduler_run_id)
+        .arg("--worker")
+        .arg("worker-a")
+        .arg("--worker")
+        .arg("worker-b")
+        .arg("--command-id")
+        .arg(command_id)
+        .arg("--acceptance-mode")
+        .arg(acceptance_mode)
+        .arg("--opencode-bin")
+        .arg(fake)
+        .arg("--timeout-seconds")
+        .arg("10");
+    command
+}
+
 fn write_scheduler_worker(path: &Path) {
     let rive_bin = env!("CARGO_BIN_EXE_rive");
     let team_bin = env!("CARGO_BIN_EXE_team");
@@ -1011,4 +1040,156 @@ fn branch_scheduler_auto_committed_commits_then_accepts() {
         )
         .unwrap();
     assert_eq!(committed, 1);
+}
+
+#[test]
+fn scheduler_resume_supersedes_stale_attempt_and_reruns_node() {
+    let temp = init_workspace();
+    add_worker(&temp, "worker-a");
+    add_worker(&temp, "worker-b");
+    let root = create_work(&temp, "phase13-resume-root", "root");
+    let a = create_work(&temp, "phase13-resume-a", "A");
+    add_edge(
+        &temp,
+        "decomposes-to",
+        &root,
+        &a,
+        "edge-phase13-resume-root-a",
+    );
+
+    let no_report = temp.path().join("fake-opencode-resume-no-report");
+    write_no_report_worker(&no_report);
+    let failed = run_json_expect_error(&mut scheduler_command_with_mode(
+        &temp,
+        &no_report,
+        &root,
+        "phase13-resume-crashed",
+        "manual",
+    ));
+    assert_eq!(failed["protocol"]["code"], "dispatch_not_reported");
+
+    let conn = Connection::open(temp.path().join(".rive/rive.db")).unwrap();
+    let scheduler_run_id: String = conn
+        .query_row(
+            "select scheduler_run_id from scheduler_runs where command_id='phase13-resume-crashed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let node_run_id: String = conn
+        .query_row(
+            "select node_run_id from scheduler_node_runs where scheduler_run_id=?1",
+            [&scheduler_run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let old_dispatch_id: String = conn
+        .query_row(
+            "select dispatch_id from scheduler_node_runs where node_run_id=?1",
+            [&node_run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "update scheduler_runs set state='running', completed_at=null where scheduler_run_id=?1",
+        [&scheduler_run_id],
+    )
+    .unwrap();
+    conn.execute(
+        "update scheduler_node_runs set state='running', completed_at=null where node_run_id=?1",
+        [&node_run_id],
+    )
+    .unwrap();
+    drop(conn);
+
+    let worker = temp.path().join("fake-opencode-resume-worker");
+    write_scheduler_worker(&worker);
+    let resumed = run_json(&mut scheduler_resume_command(
+        &temp,
+        &worker,
+        &scheduler_run_id,
+        "phase13-resume-command",
+        "manual",
+    ));
+    assert_eq!(resumed["protocol"]["scheduler"]["state"], "waiting_review");
+    assert_eq!(resumed["protocol"]["scheduler"]["child_executed"], true);
+    assert_eq!(
+        inspect_work(&temp, &a)["protocol"]["projection"]["state"],
+        "reviewable"
+    );
+
+    let new_scheduler_run_id = resumed["protocol"]["scheduler"]["scheduler_run_id"]
+        .as_str()
+        .unwrap();
+    let status = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("scheduler")
+            .arg("status")
+            .arg("--run")
+            .arg(new_scheduler_run_id),
+    );
+    assert_eq!(status["protocol"]["root_work"]["state"], "blocked");
+    assert_eq!(
+        status["protocol"]["active_node_runs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert!(status["protocol"]["waiting_review_nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|node| node.as_str() == Some(&a)));
+
+    let conn = Connection::open(temp.path().join(".rive/rive.db")).unwrap();
+    let old_node_state: String = conn
+        .query_row(
+            "select state from scheduler_node_runs where node_run_id=?1",
+            [&node_run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_node_state, "superseded");
+    let old_dispatch_state: String = conn
+        .query_row(
+            "select state from dispatches where dispatch_id=?1",
+            [&old_dispatch_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_dispatch_state, "cancelled");
+    let reported_dispatches: i64 = conn
+        .query_row(
+            "select count(*) from dispatches where state='reported'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reported_dispatches, 1);
+}
+
+#[test]
+fn scheduler_status_can_inspect_root_without_scheduler_run() {
+    let temp = init_workspace();
+    let root = create_work(&temp, "phase13-status-root", "root");
+    let status = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("scheduler")
+            .arg("status")
+            .arg("--root")
+            .arg(&root),
+    );
+    assert!(status["protocol"]["scheduler"].is_null());
+    assert_eq!(status["protocol"]["root_work"]["work_node_id"], root);
+    assert_eq!(status["protocol"]["root_work"]["state"], "ready");
+    assert_eq!(
+        status["protocol"]["active_node_runs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
 }

@@ -2166,6 +2166,28 @@ impl EventStore {
         }
     }
 
+    pub fn latest_scheduler_run_for_root(
+        &self,
+        root_work_node_id: &str,
+    ) -> Result<Option<SchedulerRunRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT scheduler_run_id, command_id, root_work_node_id, runner, max_parallel,
+                   acceptance_mode, request_hash, state, created_at, completed_at
+            FROM scheduler_runs
+            WHERE root_work_node_id = ?1
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![root_work_node_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_scheduler_run(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn update_scheduler_run_state(
         &self,
         input: &UpdateSchedulerRunStateInput,

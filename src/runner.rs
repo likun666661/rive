@@ -20,8 +20,8 @@ use crate::debug_trace::{
     install_codex_hook, install_opencode_plugin, DebugTraceStore, TraceListFilter,
 };
 use crate::dispatch::{
-    agent_protocol, dispatch_protocol, AddAgentInput, CreateDispatchInput, CreateDispatchOutcome,
-    DispatchService,
+    agent_protocol, dispatch_protocol, AddAgentInput, CancelDispatchCommand, CreateDispatchInput,
+    CreateDispatchOutcome, DispatchService,
 };
 use crate::facts::ActorEnv;
 use crate::store::{
@@ -86,6 +86,25 @@ pub struct SchedulerRunInput {
     pub workspace_mode: String,
     pub opencode_bin: Option<PathBuf>,
     pub timeout_seconds: u64,
+}
+
+#[derive(Debug)]
+pub struct SchedulerResumeInput {
+    pub scheduler_run_id: Option<String>,
+    pub root_work_node_id: Option<String>,
+    pub workers: Vec<String>,
+    pub command_id: String,
+    pub max_parallel: Option<usize>,
+    pub acceptance_mode: Option<String>,
+    pub workspace_mode: String,
+    pub opencode_bin: Option<PathBuf>,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug)]
+pub struct SchedulerStatusInput {
+    pub scheduler_run_id: Option<String>,
+    pub root_work_node_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -226,6 +245,17 @@ pub struct SchedulerRunResponseProtocol {
     pub completed_nodes: Vec<String>,
     pub waiting_review_nodes: Vec<String>,
     pub stalled_nodes: Vec<String>,
+    pub usage_summary: Option<crate::debug_trace::TraceUsageTotals>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SchedulerStatusResponseProtocol {
+    pub scheduler: Option<SchedulerRunProtocol>,
+    pub root_work: WorkProjectionProtocol,
+    pub node_runs: Vec<SchedulerNodeRunProtocol>,
+    pub active_node_runs: Vec<SchedulerNodeRunProtocol>,
+    pub waiting_review_nodes: Vec<String>,
+    pub unfinished_nodes: Vec<String>,
     pub usage_summary: Option<crate::debug_trace::TraceUsageTotals>,
 }
 
@@ -748,6 +778,325 @@ impl<'a> SchedulerService<'a> {
         })
     }
 
+    pub fn status(&self, input: SchedulerStatusInput) -> Result<SchedulerStatusResponseProtocol> {
+        self.event_store.init_work_schema()?;
+        let requested_root = input.root_work_node_id.clone();
+        let scheduler_run =
+            self.resolve_scheduler_run(input.scheduler_run_id, requested_root.clone())?;
+        let root_work_node_id = requested_root
+            .or_else(|| {
+                scheduler_run
+                    .as_ref()
+                    .map(|run| run.root_work_node_id.clone())
+            })
+            .as_ref()
+            .ok_or_else(|| anyhow!("scheduler root or run is required"))?
+            .clone();
+        self.scheduler_status_response(scheduler_run, &root_work_node_id)
+    }
+
+    pub fn resume(&self, input: SchedulerResumeInput) -> Result<SchedulerRunResponseProtocol> {
+        self.event_store.init_work_schema()?;
+        if input.command_id.trim().is_empty() {
+            return Err(anyhow!("missing command id"));
+        }
+        if input.timeout_seconds == 0 {
+            return Err(anyhow!("runner timeout must be greater than zero"));
+        }
+        if let Some(existing) = self
+            .event_store
+            .get_scheduler_run_by_command_id(&input.command_id)?
+        {
+            return self.scheduler_run_response(existing, false, "replayed");
+        }
+        let source_run = self.resolve_scheduler_run(
+            input.scheduler_run_id.clone(),
+            input.root_work_node_id.clone(),
+        )?;
+        let root_work_node_id = input
+            .root_work_node_id
+            .clone()
+            .or_else(|| source_run.as_ref().map(|run| run.root_work_node_id.clone()))
+            .ok_or_else(|| anyhow!("scheduler root or run is required"))?;
+        let runner = source_run
+            .as_ref()
+            .map(|run| run.runner.clone())
+            .unwrap_or_else(|| "opencode".to_string());
+        let max_parallel = input
+            .max_parallel
+            .or_else(|| {
+                source_run
+                    .as_ref()
+                    .and_then(|run| usize::try_from(run.max_parallel).ok())
+            })
+            .unwrap_or(1);
+        let acceptance_mode = input
+            .acceptance_mode
+            .clone()
+            .or_else(|| source_run.as_ref().map(|run| run.acceptance_mode.clone()))
+            .unwrap_or_else(|| "manual".to_string());
+        let acceptance = AcceptanceMode::parse(&acceptance_mode)?;
+        let workspace_mode = WorkspaceMode::parse(&input.workspace_mode)?;
+        if workspace_mode == WorkspaceMode::Worktree {
+            backend_from_env().ensure_available(self.workspace)?;
+        }
+        let workers = self.resolve_workers(&input.workers)?;
+        let stale_nodes =
+            self.supersede_active_attempts(&root_work_node_id, source_run.as_ref())?;
+        let worker_ids = workers
+            .iter()
+            .map(|worker| worker.agent_id.clone())
+            .collect::<Vec<_>>();
+        let request_hash = scheduler_request_hash(SchedulerRequestHashInput {
+            root_work_node_id: &root_work_node_id,
+            runner: &runner,
+            worker_ids: &worker_ids,
+            max_parallel,
+            acceptance_mode: acceptance.as_str(),
+            workspace_mode: workspace_mode.as_str(),
+            timeout_seconds: input.timeout_seconds,
+            binary: input.opencode_bin.as_deref(),
+        });
+        let inserted =
+            self.event_store
+                .insert_scheduler_run_idempotent(&InsertSchedulerRunInput {
+                    scheduler_run_id: prefixed_id("sched"),
+                    command_id: input.command_id.clone(),
+                    root_work_node_id: root_work_node_id.clone(),
+                    runner: runner.clone(),
+                    max_parallel: max_parallel as i64,
+                    acceptance_mode: acceptance.as_str().to_string(),
+                    request_hash,
+                    state: "running".to_string(),
+                    created_at: Utc::now(),
+                })?;
+        let (mut scheduler_run, idempotency_status, should_execute) = match inserted {
+            IdempotencyResolution::Inserted(run) => (run, "inserted", true),
+            IdempotencyResolution::Replayed(run) => (run, "replayed", false),
+            IdempotencyResolution::Conflict(_) => return Err(anyhow!("idempotency conflict")),
+        };
+        let mut child_executed = false;
+        if should_execute {
+            match self.execute_scheduler_with_initial_nodes(
+                &scheduler_run,
+                &workers,
+                &SchedulerRunInput {
+                    root_work_node_id,
+                    runner,
+                    workers: input.workers,
+                    command_id: input.command_id,
+                    max_parallel,
+                    acceptance_mode,
+                    workspace_mode: input.workspace_mode,
+                    opencode_bin: input.opencode_bin,
+                    timeout_seconds: input.timeout_seconds,
+                },
+                acceptance,
+                workspace_mode,
+                stale_nodes,
+            ) {
+                Ok(state) => {
+                    scheduler_run = self.event_store.update_scheduler_run_state(
+                        &UpdateSchedulerRunStateInput {
+                            scheduler_run_id: scheduler_run.scheduler_run_id.clone(),
+                            state,
+                            completed_at: Some(Utc::now()),
+                        },
+                    )?;
+                    child_executed = !self
+                        .event_store
+                        .list_scheduler_node_runs_for_scheduler(&scheduler_run.scheduler_run_id)?
+                        .is_empty();
+                }
+                Err(err) => {
+                    let _ = self.event_store.update_scheduler_run_state(
+                        &UpdateSchedulerRunStateInput {
+                            scheduler_run_id: scheduler_run.scheduler_run_id.clone(),
+                            state: "failed".to_string(),
+                            completed_at: Some(Utc::now()),
+                        },
+                    )?;
+                    return Err(err);
+                }
+            }
+        }
+        self.scheduler_run_response(scheduler_run, child_executed, idempotency_status)
+    }
+
+    fn scheduler_run_response(
+        &self,
+        scheduler_run: SchedulerRunRecord,
+        child_executed: bool,
+        idempotency_status: &'static str,
+    ) -> Result<SchedulerRunResponseProtocol> {
+        let work_service = WorkService::new(self.workspace, self.event_store, self.blob_store);
+        let node_runs = self
+            .event_store
+            .list_scheduler_node_runs_for_scheduler(&scheduler_run.scheduler_run_id)?;
+        let completed_nodes = node_runs
+            .iter()
+            .filter(|run| matches!(run.state.as_str(), "accepted" | "reported"))
+            .map(|run| run.work_node_id.clone())
+            .collect::<Vec<_>>();
+        let waiting_review_nodes = self.waiting_review_nodes(&scheduler_run.root_work_node_id)?;
+        let stalled_nodes = if matches!(scheduler_run.state.as_str(), "stalled" | "failed") {
+            self.ready_or_blocked_nodes(&scheduler_run.root_work_node_id)?
+        } else {
+            Vec::new()
+        };
+        let root_work = work_service.inspect_projection(&scheduler_run.root_work_node_id)?;
+        let usage_summary = self.usage_summary_for_runs(&node_runs)?;
+        Ok(SchedulerRunResponseProtocol {
+            scheduler: scheduler_run_protocol(&scheduler_run, child_executed, idempotency_status),
+            root_work,
+            launched_nodes: node_runs.iter().map(scheduler_node_run_protocol).collect(),
+            completed_nodes,
+            waiting_review_nodes,
+            stalled_nodes,
+            usage_summary,
+        })
+    }
+
+    fn scheduler_status_response(
+        &self,
+        scheduler_run: Option<SchedulerRunRecord>,
+        root_work_node_id: &str,
+    ) -> Result<SchedulerStatusResponseProtocol> {
+        let work_service = WorkService::new(self.workspace, self.event_store, self.blob_store);
+        let node_runs = if let Some(run) = &scheduler_run {
+            self.event_store
+                .list_scheduler_node_runs_for_scheduler(&run.scheduler_run_id)?
+        } else {
+            Vec::new()
+        };
+        let reachable = work_service
+            .inspect_graph(root_work_node_id)?
+            .reachable_nodes
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut active_node_runs = Vec::new();
+        for node_id in &reachable {
+            active_node_runs.extend(
+                self.event_store
+                    .list_active_scheduler_node_runs_for_work_node(node_id)?,
+            );
+        }
+        let root_work = work_service.inspect_projection(root_work_node_id)?;
+        let waiting_review_nodes = self.waiting_review_nodes(root_work_node_id)?;
+        let unfinished_nodes = self.ready_or_blocked_nodes(root_work_node_id)?;
+        let usage_summary = self.usage_summary_for_runs(&node_runs)?;
+        Ok(SchedulerStatusResponseProtocol {
+            scheduler: scheduler_run
+                .as_ref()
+                .map(|run| scheduler_run_protocol(run, false, "status")),
+            root_work,
+            node_runs: node_runs.iter().map(scheduler_node_run_protocol).collect(),
+            active_node_runs: active_node_runs
+                .iter()
+                .map(scheduler_node_run_protocol)
+                .collect(),
+            waiting_review_nodes,
+            unfinished_nodes,
+            usage_summary,
+        })
+    }
+
+    fn resolve_scheduler_run(
+        &self,
+        scheduler_run_id: Option<String>,
+        root_work_node_id: Option<String>,
+    ) -> Result<Option<SchedulerRunRecord>> {
+        match (scheduler_run_id, root_work_node_id) {
+            (Some(run_id), _) => self
+                .event_store
+                .get_scheduler_run(&run_id)?
+                .ok_or_else(|| anyhow!("scheduler run not found: {run_id}"))
+                .map(Some),
+            (None, Some(root)) => self.event_store.latest_scheduler_run_for_root(&root),
+            (None, None) => Err(anyhow!("scheduler root or run is required")),
+        }
+    }
+
+    fn supersede_active_attempts(
+        &self,
+        root_work_node_id: &str,
+        source_run: Option<&SchedulerRunRecord>,
+    ) -> Result<Vec<WorkNodeRecord>> {
+        let work_service = WorkService::new(self.workspace, self.event_store, self.blob_store);
+        let reachable = work_service
+            .inspect_graph(root_work_node_id)?
+            .reachable_nodes
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut retry_nodes = BTreeMap::new();
+        for node_id in reachable {
+            for run in self
+                .event_store
+                .list_active_scheduler_node_runs_for_work_node(&node_id)?
+            {
+                if let Some(source) = source_run {
+                    if run.scheduler_run_id != source.scheduler_run_id {
+                        continue;
+                    }
+                }
+                if let Some(dispatch_id) = &run.dispatch_id {
+                    if let Some(dispatch) = self.event_store.get_dispatch(dispatch_id)? {
+                        if matches!(dispatch.state, DispatchState::Reported) {
+                            self.event_store.update_scheduler_node_run(
+                                &UpdateSchedulerNodeRunInput {
+                                    node_run_id: run.node_run_id.clone(),
+                                    dispatch_id: run.dispatch_id.clone(),
+                                    worker_run_id: run.worker_run_id.clone(),
+                                    state: "reported".to_string(),
+                                    completed_at: Some(Utc::now()),
+                                },
+                            )?;
+                            continue;
+                        }
+                        if matches!(dispatch.state, DispatchState::Open | DispatchState::Blocked) {
+                            let dispatch_service = DispatchService::new(
+                                self.workspace,
+                                self.event_store,
+                                self.blob_store,
+                            );
+                            let _ = dispatch_service.cancel_dispatch(CancelDispatchCommand {
+                                command_id: format!(
+                                    "scheduler-resume:{}:cancel:{}",
+                                    root_work_node_id, run.node_run_id
+                                ),
+                                dispatch_id: dispatch.dispatch_id,
+                                reason: "scheduler resume superseded stale attempt".to_string(),
+                            })?;
+                        }
+                    }
+                }
+                self.event_store
+                    .update_scheduler_node_run(&UpdateSchedulerNodeRunInput {
+                        node_run_id: run.node_run_id,
+                        dispatch_id: run.dispatch_id,
+                        worker_run_id: run.worker_run_id,
+                        state: "superseded".to_string(),
+                        completed_at: Some(Utc::now()),
+                    })?;
+                if let Some(node) = self.event_store.get_work_node(&node_id)? {
+                    retry_nodes.insert(node.work_node_id.clone(), node);
+                }
+            }
+        }
+        if let Some(source) = source_run {
+            if matches!(source.state.as_str(), "running" | "stalled" | "failed") {
+                let _ =
+                    self.event_store
+                        .update_scheduler_run_state(&UpdateSchedulerRunStateInput {
+                            scheduler_run_id: source.scheduler_run_id.clone(),
+                            state: "superseded".to_string(),
+                            completed_at: Some(Utc::now()),
+                        })?;
+            }
+        }
+        Ok(retry_nodes.into_values().collect())
+    }
+
     fn execute_scheduler(
         &self,
         scheduler_run: &SchedulerRunRecord,
@@ -756,8 +1105,41 @@ impl<'a> SchedulerService<'a> {
         acceptance_mode: AcceptanceMode,
         workspace_mode: WorkspaceMode,
     ) -> Result<String> {
+        self.execute_scheduler_with_initial_nodes(
+            scheduler_run,
+            workers,
+            input,
+            acceptance_mode,
+            workspace_mode,
+            Vec::new(),
+        )
+    }
+
+    fn execute_scheduler_with_initial_nodes(
+        &self,
+        scheduler_run: &SchedulerRunRecord,
+        workers: &[AgentRecord],
+        input: &SchedulerRunInput,
+        acceptance_mode: AcceptanceMode,
+        workspace_mode: WorkspaceMode,
+        initial_nodes: Vec<WorkNodeRecord>,
+    ) -> Result<String> {
         let work_service = WorkService::new(self.workspace, self.event_store, self.blob_store);
         let mut worker_index = 0usize;
+        if !initial_nodes.is_empty() {
+            for chunk in initial_nodes.chunks(input.max_parallel) {
+                let batch = chunk
+                    .iter()
+                    .cloned()
+                    .map(|node| {
+                        let worker = workers[worker_index % workers.len()].clone();
+                        worker_index += 1;
+                        (node, worker)
+                    })
+                    .collect::<Vec<_>>();
+                self.run_node_batch(scheduler_run, batch, input, acceptance_mode, workspace_mode)?;
+            }
+        }
         let mut made_progress = true;
         while made_progress {
             made_progress = false;
