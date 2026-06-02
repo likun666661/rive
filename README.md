@@ -33,3 +33,7 @@ Rive 是本地优先 agent team runtime 的体系文档。
 ## Agent Skill
 
 - [Rive agent skill](./skills/rive/SKILL.md) — 给 Codex / OpenCode 等外部 agent 读取的 Rive 操作手册，用来把用户目标组织成 Work DAG、调度 worker、集成 worktree ref，并按 ledger/projection 回报结果。
+
+## Examples
+
+- [Eino technical manual dogfood](./examples/eino-technical-manual/) — 用 Rive Work DAG + OpenCode workers 阅读 CloudWeGo Eino 代码并产出技术手册的真实 dogfood 示例。
