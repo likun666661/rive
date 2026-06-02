@@ -633,7 +633,7 @@ impl<'a> SchedulerService<'a> {
         let acceptance_mode = AcceptanceMode::parse(&input.acceptance_mode)?;
         let workspace_mode = WorkspaceMode::parse(&input.workspace_mode)?;
         self.event_store.init_work_schema()?;
-        if workspace_mode == WorkspaceMode::BranchFs {
+        if workspace_mode == WorkspaceMode::Worktree {
             backend_from_env().ensure_available(self.workspace)?;
         }
         let work_service = WorkService::new(self.workspace, self.event_store, self.blob_store);
@@ -889,7 +889,7 @@ impl<'a> SchedulerService<'a> {
                 work_node_id: node.work_node_id.clone(),
                 dispatch_id: dispatch.dispatch_id.clone(),
             })?;
-            if workspace_mode == WorkspaceMode::BranchFs {
+            if workspace_mode == WorkspaceMode::Worktree {
                 let backend = backend_from_env();
                 let branch = BranchService::new(self.workspace, self.event_store)
                     .create_workspace(
@@ -1241,14 +1241,14 @@ impl AcceptanceMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkspaceMode {
     Shared,
-    BranchFs,
+    Worktree,
 }
 
 impl WorkspaceMode {
     fn parse(value: &str) -> Result<Self> {
         match value {
             "shared" => Ok(Self::Shared),
-            "branchfs" => Ok(Self::BranchFs),
+            "worktree" => Ok(Self::Worktree),
             _ => Err(anyhow!("workspace mode not supported: {value}")),
         }
     }
@@ -1256,7 +1256,7 @@ impl WorkspaceMode {
     fn as_str(self) -> &'static str {
         match self {
             Self::Shared => "shared",
-            Self::BranchFs => "branchfs",
+            Self::Worktree => "worktree",
         }
     }
 }
@@ -1391,7 +1391,7 @@ fn scheduler_task_body(
     let branch_section = branch_ref
         .map(|branch_ref| {
             format!(
-                "\nBranch workspace:\n- ref: {branch_ref}\n- This worker is running in an isolated branch workspace.\n- Use `--workspace-ref \"$RIVE_BRANCH_REF\"` when reporting.\n- Do not call branchfs commit or abort directly.\n"
+                "\nWorktree workspace:\n- ref: {branch_ref}\n- This worker is running in an isolated git worktree workspace.\n- Use `--workspace-ref \"$RIVE_WORKSPACE_REF\"` when reporting.\n- Do not call git worktree remove or merge directly.\n"
             )
         })
         .unwrap_or_default();
@@ -2454,8 +2454,10 @@ fn apply_common_env(command: &mut Command, input: &RunnerProcessInput<'_>) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(branch_ref) = input.branch_ref {
+        command.env("RIVE_WORKSPACE_REF", branch_ref);
         command.env("RIVE_BRANCH_REF", branch_ref);
     } else {
+        command.env_remove("RIVE_WORKSPACE_REF");
         command.env_remove("RIVE_BRANCH_REF");
     }
 }

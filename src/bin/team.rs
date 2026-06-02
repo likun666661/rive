@@ -866,12 +866,12 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
         ("work_node_not_reviewable", false, "inspect_projection")
     } else if lower.contains("work node not found") {
         ("work_node_not_found", false, "fix_arguments")
-    } else if lower.contains("branch not found") {
-        ("branch_not_found", false, "inspect_branch")
+    } else if lower.contains("worktree not found") {
+        ("worktree_not_found", false, "inspect_branch")
     } else if lower.contains("branch not pending") {
         ("branch_not_pending", false, "inspect_branch")
-    } else if lower.contains("branch ref not committed") {
-        ("branch_ref_not_committed", false, "inspect_branch")
+    } else if lower.contains("worktree ref not committed") {
+        ("worktree_ref_not_committed", false, "inspect_branch")
     } else if lower.contains("work graph not closed") {
         ("work_graph_not_closed", false, "inspect_projection")
     } else if lower.contains("invalid work note kind") {

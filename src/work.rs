@@ -418,7 +418,10 @@ impl<'a, S: SnapshotStore> WorkService<'a, S> {
             if input.require_committed_branch
                 && self.has_uncommitted_branch_ref(&input.work_node_id)?
             {
-                return Err(anyhow!("branch ref not committed: {}", input.work_node_id));
+                return Err(anyhow!(
+                    "worktree ref not committed: {}",
+                    input.work_node_id
+                ));
             }
         }
         self.update_node_status(input, "active", true, "work.node.accepted")

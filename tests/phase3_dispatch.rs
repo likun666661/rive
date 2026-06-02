@@ -183,7 +183,7 @@ fn worker_can_report_assigned_dispatch_with_evidence() {
 #[test]
 fn invalid_branch_workspace_ref_is_rejected_before_fact_write() {
     let fixture = fixture();
-    let dispatch_id = create_dispatch(&fixture.temp, "create-invalid-branch-ref");
+    let dispatch_id = create_dispatch(&fixture.temp, "create-invalid-worktree-ref");
     let snapshot_id = capture_snapshot(&fixture.temp);
 
     let error = run_json_expect_error(
@@ -199,13 +199,13 @@ fn invalid_branch_workspace_ref_is_rejected_before_fact_write() {
             .arg("--snapshot")
             .arg(&snapshot_id)
             .arg("--workspace-ref")
-            .arg("branchfs:missing:branch")
+            .arg("git-worktree:missing:branch")
             .arg("--command-id")
-            .arg("report-invalid-branch-ref")
+            .arg("report-invalid-worktree-ref")
             .arg("--stdin"),
-        Some("Done with invalid branch ref.\n"),
+        Some("Done with invalid worktree ref.\n"),
     );
-    assert_eq!(error["protocol"]["code"], "branch_not_found");
+    assert_eq!(error["protocol"]["code"], "worktree_not_found");
 
     let show = run_json(
         rive_cmd()

@@ -51,6 +51,42 @@ fn init_workspace() -> TempDir {
     temp
 }
 
+fn init_git_workspace() -> TempDir {
+    let temp = TempDir::new().unwrap();
+    run_git(&temp, ["init"]);
+    fs::write(temp.path().join(".gitignore"), ".rive/\n").unwrap();
+    fs::write(temp.path().join("base.txt"), "base\n").unwrap();
+    run_git(&temp, ["add", ".gitignore", "base.txt"]);
+    run_git(
+        &temp,
+        [
+            "-c",
+            "user.name=Rive Test",
+            "-c",
+            "user.email=rive@example.test",
+            "commit",
+            "-m",
+            "base",
+        ],
+    );
+    run_json(rive_cmd().arg("init").arg(temp.path()));
+    temp
+}
+
+fn run_git<const N: usize>(temp: &TempDir, args: [&str; N]) {
+    let output = Command::new("git")
+        .current_dir(temp.path())
+        .args(args)
+        .output()
+        .expect("git should run");
+    assert!(
+        output.status.success(),
+        "git failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn write_executable(path: &Path, content: &str) {
     fs::write(path, content).unwrap();
     let mut permissions = fs::metadata(path).unwrap().permissions();
@@ -148,7 +184,19 @@ fn branch_commit(temp: &TempDir, integration_id: &str, command_id: &str) -> Valu
     run_json(
         rive_cmd()
             .current_dir(temp.path())
-            .env("RIVE_BRANCH_BACKEND", "local-fake")
+            .env("RIVE_WORKSPACE_BACKEND", "local-fake")
+            .arg("branch")
+            .arg("commit")
+            .arg(integration_id)
+            .arg("--command-id")
+            .arg(command_id),
+    )
+}
+
+fn branch_commit_default(temp: &TempDir, integration_id: &str, command_id: &str) -> Value {
+    run_json(
+        rive_cmd()
+            .current_dir(temp.path())
             .arg("branch")
             .arg("commit")
             .arg(integration_id)
@@ -161,7 +209,7 @@ fn branch_abort(temp: &TempDir, integration_id: &str, command_id: &str) -> Value
     run_json(
         rive_cmd()
             .current_dir(temp.path())
-            .env("RIVE_BRANCH_BACKEND", "local-fake")
+            .env("RIVE_WORKSPACE_BACKEND", "local-fake")
             .arg("branch")
             .arg("abort")
             .arg(integration_id)
@@ -265,19 +313,19 @@ fn branch_scheduler_command(
     acceptance_mode: &str,
 ) -> Command {
     let mut command = scheduler_command_with_mode(temp, fake, root, command_id, acceptance_mode);
-    command.arg("--workspace-mode").arg("branchfs");
-    command.env("RIVE_BRANCH_BACKEND", "local-fake");
+    command.arg("--workspace-mode").arg("worktree");
+    command.env("RIVE_WORKSPACE_BACKEND", "local-fake");
     command
 }
 
-fn real_branchfs_scheduler_command_without_path(
+fn real_worktree_scheduler_command_without_path(
     temp: &TempDir,
     fake: &Path,
     root: &str,
     command_id: &str,
 ) -> Command {
     let mut command = scheduler_command_with_mode(temp, fake, root, command_id, "manual");
-    command.arg("--workspace-mode").arg("branchfs");
+    command.arg("--workspace-mode").arg("worktree");
     command.env("PATH", "/nonexistent");
     command
 }
@@ -336,12 +384,12 @@ fn write_branch_worker(path: &Path) {
         &format!(
             r#"#!/bin/sh
 set -eu
-test -n "$RIVE_BRANCH_REF"
+test -n "$RIVE_WORKSPACE_REF"
 test -n "$RIVE_STATE_WORKSPACE"
 printf '%s\n' "$RIVE_WORKSPACE" >> "$RIVE_STATE_WORKSPACE/.rive/phase12-branch-paths.txt"
-printf 'parent=%s\nstate=%s\nbranch=%s\n' "$RIVE_STATE_WORKSPACE" "$RIVE_STATE_WORKSPACE" "$RIVE_BRANCH_REF" > "$RIVE_WORKSPACE/phase12-branch-result.txt"
+printf 'parent=%s\nstate=%s\nbranch=%s\n' "$RIVE_STATE_WORKSPACE" "$RIVE_STATE_WORKSPACE" "$RIVE_WORKSPACE_REF" > "$RIVE_WORKSPACE/phase12-branch-result.txt"
 SNAPSHOT_ID=$("{rive_bin}" snapshot capture --path "$RIVE_WORKSPACE/phase12-branch-result.txt" --label phase12-branch-worker --agent "$RIVE_AGENT_ID" --dispatch "$RIVE_DISPATCH_ID" | sed -n 's/.*"snapshot_id": "\([^"]*\)".*/\1/p' | head -n 1)
-printf 'branch worker done\n' | "{team_bin}" report --dispatch "$RIVE_DISPATCH_ID" --status done --snapshot "$SNAPSHOT_ID" --workspace-ref "$RIVE_BRANCH_REF" --command-id "phase12-report-$RIVE_RUN_ID" --stdin >/dev/null
+printf 'worktree worker done\n' | "{team_bin}" report --dispatch "$RIVE_DISPATCH_ID" --status done --snapshot "$SNAPSHOT_ID" --workspace-ref "$RIVE_WORKSPACE_REF" --command-id "phase12-report-$RIVE_RUN_ID" --stdin >/dev/null
 printf '{{"type":"step_finish","tokens":{{"input":5,"output":3,"reasoning":0,"cache":{{"read":1}},"total":9}}}}\n'
 "#
         ),
@@ -356,12 +404,12 @@ fn write_branch_modify_delete_worker(path: &Path) {
         &format!(
             r#"#!/bin/sh
 set -eu
-test -n "$RIVE_BRANCH_REF"
+test -n "$RIVE_WORKSPACE_REF"
 test -n "$RIVE_STATE_WORKSPACE"
 printf 'modified in branch\n' > "$RIVE_WORKSPACE/modify-me.txt"
 rm "$RIVE_WORKSPACE/delete-me.txt"
 SNAPSHOT_ID=$("{rive_bin}" snapshot capture --path "$RIVE_WORKSPACE/modify-me.txt" --label phase12-branch-modify-delete --agent "$RIVE_AGENT_ID" --dispatch "$RIVE_DISPATCH_ID" | sed -n 's/.*"snapshot_id": "\([^"]*\)".*/\1/p' | head -n 1)
-printf 'branch worker modified and deleted\n' | "{team_bin}" report --dispatch "$RIVE_DISPATCH_ID" --status done --snapshot "$SNAPSHOT_ID" --workspace-ref "$RIVE_BRANCH_REF" --command-id "phase12-moddel-report-$RIVE_RUN_ID" --stdin >/dev/null
+printf 'worktree worker modified and deleted\n' | "{team_bin}" report --dispatch "$RIVE_DISPATCH_ID" --status done --snapshot "$SNAPSHOT_ID" --workspace-ref "$RIVE_WORKSPACE_REF" --command-id "phase12-moddel-report-$RIVE_RUN_ID" --stdin >/dev/null
 "#
         ),
     );
@@ -662,7 +710,7 @@ fn branch_scheduler_manual_creates_pending_integration_without_parent_write() {
     );
     assert!(!temp.path().join("phase12-branch-result.txt").exists());
     let paths = fs::read_to_string(temp.path().join(".rive/phase12-branch-paths.txt")).unwrap();
-    assert!(paths.contains(".rive/branches/"));
+    assert!(paths.contains(".rive/worktrees/"));
     let conn = Connection::open(temp.path().join(".rive/rive.db")).unwrap();
     let pending: i64 = conn
         .query_row(
@@ -675,29 +723,96 @@ fn branch_scheduler_manual_creates_pending_integration_without_parent_write() {
 }
 
 #[test]
-fn branch_scheduler_real_backend_missing_is_stable_error() {
-    let temp = init_workspace();
+fn worktree_scheduler_uses_real_git_worktree_and_commit_applies_patch() {
+    let temp = init_git_workspace();
     add_worker(&temp, "worker-a");
     add_worker(&temp, "worker-b");
-    let root = create_work(&temp, "phase12-missing-branchfs-root", "root");
-    let a = create_work(&temp, "phase12-missing-branchfs-a", "A");
+    let root = create_work(&temp, "phase12-real-worktree-root", "root");
+    let a = create_work(&temp, "phase12-real-worktree-a", "A");
     add_edge(
         &temp,
         "decomposes-to",
         &root,
         &a,
-        "edge-phase12-missing-branchfs-root-a",
+        "edge-phase12-real-worktree-root-a",
     );
-    let fake = temp.path().join("fake-opencode-missing-branchfs");
+    let fake = temp.path().join("fake-opencode-real-worktree");
     write_branch_worker(&fake);
 
-    let error = run_json_expect_error(&mut real_branchfs_scheduler_command_without_path(
+    let mut command =
+        scheduler_command_with_mode(&temp, &fake, &root, "phase12-real-worktree", "manual");
+    command.arg("--workspace-mode").arg("worktree");
+    let response = run_json(&mut command);
+    assert_eq!(response["protocol"]["scheduler"]["state"], "waiting_review");
+    assert_eq!(
+        inspect_work(&temp, &a)["protocol"]["projection"]["state"],
+        "reviewable"
+    );
+    assert!(!temp.path().join("phase12-branch-result.txt").exists());
+
+    let paths = fs::read_to_string(temp.path().join(".rive/phase12-branch-paths.txt")).unwrap();
+    assert!(paths.contains(".rive/worktrees/"));
+    let conn = Connection::open(temp.path().join(".rive/rive.db")).unwrap();
+    let (integration_id, branch_path, backend): (String, String, String) = conn
+        .query_row(
+            "select i.integration_id, b.branch_path, b.backend from branch_integrations i join branch_workspaces b on b.branch_id=i.branch_id order by i.created_at limit 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(backend, "git-worktree");
+    assert!(Path::new(&branch_path).exists());
+    drop(conn);
+
+    let commit = branch_commit_default(&temp, &integration_id, "phase12-real-worktree-commit");
+    assert_eq!(commit["protocol"]["integration"]["state"], "committed");
+    assert!(commit["protocol"]["integration"]["commit_ref"]
+        .as_str()
+        .unwrap()
+        .starts_with("git-worktree-apply:"));
+    let parent_result = fs::read_to_string(temp.path().join("phase12-branch-result.txt")).unwrap();
+    assert!(parent_result.contains("parent="));
+    assert!(parent_result.contains("state="));
+    assert!(parent_result.contains(&format!(
+        "branch={}",
+        commit["protocol"]["integration"]["branch_ref"]
+            .as_str()
+            .unwrap()
+    )));
+    assert!(!Path::new(&branch_path).exists());
+
+    let accepted = accept_work_require_branch(&temp, &a, "phase12-real-worktree-accept");
+    assert_eq!(accepted["protocol"]["status_input"], "active");
+    assert_eq!(
+        inspect_work(&temp, &a)["protocol"]["projection"]["state"],
+        "done"
+    );
+}
+
+#[test]
+fn branch_scheduler_real_backend_missing_is_stable_error() {
+    let temp = init_workspace();
+    add_worker(&temp, "worker-a");
+    add_worker(&temp, "worker-b");
+    let root = create_work(&temp, "phase12-missing-worktree-root", "root");
+    let a = create_work(&temp, "phase12-missing-worktree-a", "A");
+    add_edge(
+        &temp,
+        "decomposes-to",
+        &root,
+        &a,
+        "edge-phase12-missing-worktree-root-a",
+    );
+    let fake = temp.path().join("fake-opencode-missing-worktree");
+    write_branch_worker(&fake);
+
+    let error = run_json_expect_error(&mut real_worktree_scheduler_command_without_path(
         &temp,
         &fake,
         &root,
-        "phase12-branchfs-missing",
+        "phase12-worktree-missing",
     ));
-    assert_eq!(error["protocol"]["code"], "branch_backend_unavailable");
+    assert_eq!(error["protocol"]["code"], "worktree_backend_unavailable");
     assert_eq!(
         inspect_work(&temp, &a)["protocol"]["projection"]["state"],
         "ready"
@@ -730,7 +845,7 @@ fn branch_commit_is_required_before_guarded_accept() {
     ));
     let blocked =
         accept_work_require_branch_expect_error(&temp, &a, "phase12-accept-before-commit");
-    assert_eq!(blocked["protocol"]["code"], "branch_ref_not_committed");
+    assert_eq!(blocked["protocol"]["code"], "worktree_ref_not_committed");
 
     let integration_id = first_branch_integration_id(&temp);
     let commit = branch_commit(&temp, &integration_id, "phase12-branch-commit");
@@ -823,7 +938,7 @@ fn branch_reject_and_abort_are_explicit_terminal_events() {
         accept_work_require_branch_expect_error(&temp, &a, "phase12-accept-after-reject");
     assert_eq!(
         still_blocked["protocol"]["code"],
-        "branch_ref_not_committed"
+        "worktree_ref_not_committed"
     );
 
     let root2 = create_work(&temp, "phase12-abort-root", "root abort");

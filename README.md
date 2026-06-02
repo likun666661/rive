@@ -27,5 +27,5 @@ Rive 是本地优先 agent team runtime 的体系文档。
 21. [Phase 10 Orchestrator Sandbox / Graph Hygiene / Usage 测试计划](./docs/21-phase10-orchestrator-sandbox-graph-hygiene-usage-test-plan.md)
 22. [Phase 11 Work DAG Scheduler 设计](./docs/22-phase11-work-dag-scheduler-design.md)
 23. [Phase 11 Work DAG Scheduler 测试计划](./docs/23-phase11-work-dag-scheduler-test-plan.md)
-24. [Phase 12 BranchFS Workspace Branch / Ref Integration 设计](./docs/24-phase12-branchfs-ref-integration-design.md)
-25. [Phase 12 BranchFS Workspace Branch / Ref Integration 测试计划](./docs/25-phase12-branchfs-ref-integration-test-plan.md)
+24. [Phase 12 Git worktree Workspace Branch / Ref Integration 设计](./docs/24-phase12-worktree-ref-integration-design.md)
+25. [Phase 12 Git worktree Workspace Branch / Ref Integration 测试计划](./docs/25-phase12-worktree-ref-integration-test-plan.md)

@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -59,7 +60,7 @@ pub struct LocalFakeBranchBackend;
 
 impl LocalFakeBranchBackend {
     fn branches_root(workspace: &Workspace) -> PathBuf {
-        workspace.rive_dir().join("branches")
+        workspace.rive_dir().join("worktrees")
     }
 }
 
@@ -98,7 +99,7 @@ impl BranchWorkspaceBackend for LocalFakeBranchBackend {
             run_id: run_id.to_string(),
             branch_name: branch_name.clone(),
             branch_path,
-            branch_ref: format!("branchfs:{}:{}", workspace_id(workspace), branch_name),
+            branch_ref: format!("git-worktree:{}:{}", workspace_id(workspace), branch_name),
         })
     }
 
@@ -131,77 +132,115 @@ impl BranchWorkspaceBackend for LocalFakeBranchBackend {
 }
 
 #[derive(Debug, Clone)]
-pub struct BranchFsBackend {
+pub struct GitWorktreeBackend {
     pub binary: PathBuf,
 }
 
-impl Default for BranchFsBackend {
+impl Default for GitWorktreeBackend {
     fn default() -> Self {
         Self {
-            binary: PathBuf::from("branchfs"),
+            binary: PathBuf::from("git"),
         }
     }
 }
 
-impl BranchFsBackend {
-    fn mount_root(workspace: &Workspace) -> PathBuf {
-        branchfs_runtime_root(workspace).join("mount")
+impl GitWorktreeBackend {
+    fn worktrees_root(workspace: &Workspace) -> PathBuf {
+        workspace.rive_dir().join("worktrees")
     }
 
-    fn storage_root(workspace: &Workspace) -> PathBuf {
-        branchfs_runtime_root(workspace).join("storage")
-    }
-
-    fn run_branchfs(&self, args: &[String]) -> Result<()> {
-        let output = Command::new(&self.binary)
+    fn run_git<I, S>(&self, cwd: &Path, args: I) -> Result<std::process::Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        Command::new(&self.binary)
+            .current_dir(cwd)
             .args(args)
             .output()
             .map_err(|err| {
                 if err.kind() == std::io::ErrorKind::NotFound {
-                    anyhow!("branch backend unavailable: branchfs not found")
+                    anyhow!("worktree backend unavailable: git not found")
                 } else {
-                    anyhow!("branchfs launch failed: {err}")
+                    anyhow!("git launch failed: {err}")
                 }
-            })?;
+            })
+    }
+
+    fn run_git_checked<I, S>(&self, cwd: &Path, args: I, error_prefix: &str) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let output = self.run_git(cwd, args)?;
         if !output.status.success() {
             return Err(anyhow!(
-                "branch mount failed: {}",
+                "{error_prefix}: {}",
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
         Ok(())
     }
+
+    fn git_root(&self, workspace: &Workspace) -> Result<PathBuf> {
+        let output = self.run_git(
+            &workspace.root,
+            ["rev-parse", "--show-toplevel"].iter().copied(),
+        )?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "worktree backend unavailable: workspace is not a git repository"
+            ));
+        }
+        let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let root = PathBuf::from(root)
+            .canonicalize()
+            .with_context(|| "canonicalize git root")?;
+        if root != workspace.root {
+            return Err(anyhow!(
+                "worktree backend unavailable: Rive workspace must be git root for worktree mode"
+            ));
+        }
+        Ok(root)
+    }
+
+    fn cleanup_worktree(
+        &self,
+        workspace: &Workspace,
+        branch: &BranchWorkspaceRecord,
+    ) -> Result<()> {
+        let branch_path = PathBuf::from(&branch.branch_path);
+        let _ = self.run_git_checked(
+            &workspace.root,
+            [
+                "worktree",
+                "remove",
+                "--force",
+                branch_path.to_string_lossy().as_ref(),
+            ],
+            "worktree remove failed",
+        );
+        let _ = self.run_git_checked(
+            &workspace.root,
+            ["branch", "-D", &branch.branch_name],
+            "worktree branch delete failed",
+        );
+        if branch_path.exists() {
+            fs::remove_dir_all(&branch_path)
+                .with_context(|| format!("remove worktree {}", branch_path.display()))?;
+        }
+        Ok(())
+    }
 }
 
-impl BranchWorkspaceBackend for BranchFsBackend {
+impl BranchWorkspaceBackend for GitWorktreeBackend {
     fn backend_name(&self) -> &'static str {
-        "branchfs"
+        "git-worktree"
     }
 
     fn ensure_available(&self, workspace: &Workspace) -> Result<()> {
-        let mount = Self::mount_root(workspace);
-        let storage = Self::storage_root(workspace);
-        if mount.join(".branchfs_ctl").exists() {
-            return Ok(());
-        }
-        fs::create_dir_all(&mount)?;
-        fs::create_dir_all(&storage)?;
-        self.run_branchfs(&[
-            "mount".to_string(),
-            "--base".to_string(),
-            workspace.root.display().to_string(),
-            "--storage".to_string(),
-            storage.display().to_string(),
-            mount.display().to_string(),
-        ])
-        .map_err(|err| {
-            let text = err.to_string();
-            if text.contains("branch backend unavailable") {
-                anyhow!(text)
-            } else {
-                anyhow!("branch mount failed: {text}")
-            }
-        })
+        self.git_root(workspace)?;
+        Ok(())
     }
 
     fn create_branch(
@@ -215,17 +254,24 @@ impl BranchWorkspaceBackend for BranchFsBackend {
         self.ensure_available(workspace)?;
         let branch_id = prefixed_id("branch");
         let branch_name = branch_name(run_id, work_node_id);
-        let mount = Self::mount_root(workspace);
-        let storage = Self::storage_root(workspace);
-        self.run_branchfs(&[
-            "create".to_string(),
-            branch_name.clone(),
-            mount.display().to_string(),
-            "--storage".to_string(),
-            storage.display().to_string(),
-        ])
-        .map_err(|err| anyhow!("branch create failed: {err}"))?;
-        let branch_path = mount.join(format!("@{branch_name}"));
+        let branch_path = Self::worktrees_root(workspace).join(&branch_name);
+        if branch_path.exists() {
+            fs::remove_dir_all(&branch_path)
+                .with_context(|| format!("remove stale worktree {}", branch_path.display()))?;
+        }
+        fs::create_dir_all(Self::worktrees_root(workspace))?;
+        self.run_git_checked(
+            &workspace.root,
+            [
+                "worktree",
+                "add",
+                "-b",
+                &branch_name,
+                branch_path.to_string_lossy().as_ref(),
+                "HEAD",
+            ],
+            "worktree create failed",
+        )?;
         Ok(BranchWorkspace {
             branch_id,
             backend: self.backend_name().to_string(),
@@ -235,7 +281,7 @@ impl BranchWorkspaceBackend for BranchFsBackend {
             run_id: run_id.to_string(),
             branch_name: branch_name.clone(),
             branch_path,
-            branch_ref: format!("branchfs:{}:{}", workspace_id(workspace), branch_name),
+            branch_ref: format!("git-worktree:{}:{}", workspace_id(workspace), branch_name),
         })
     }
 
@@ -246,39 +292,78 @@ impl BranchWorkspaceBackend for BranchFsBackend {
     ) -> Result<BranchCommitResult> {
         self.ensure_available(workspace)?;
         let branch_path = PathBuf::from(&branch.branch_path);
-        let before = file_digest_map(&workspace.root)?;
-        fs::write(branch_path.join(".branchfs_ctl"), b"commit")
-            .map_err(|err| anyhow!("branch commit failed: {err}"))?;
-        let after = file_digest_map(&workspace.root)?;
-        let mut changed_files = before
-            .keys()
-            .chain(after.keys())
-            .filter(|path| before.get(*path) != after.get(*path))
-            .cloned()
+        if !branch_path.is_dir() {
+            return Err(anyhow!("worktree not found: {}", branch.branch_id));
+        }
+        self.run_git_checked(&branch_path, ["add", "-N", "."], "worktree diff failed")?;
+        let changed_output = self.run_git(&branch_path, ["diff", "--name-only", "HEAD"])?;
+        if !changed_output.status.success() {
+            return Err(anyhow!(
+                "worktree diff failed: {}",
+                String::from_utf8_lossy(&changed_output.stderr)
+            ));
+        }
+        let mut changed_files = String::from_utf8_lossy(&changed_output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
             .collect::<Vec<_>>();
         changed_files.sort();
         changed_files.dedup();
+
+        let patch_output = self.run_git(&branch_path, ["diff", "--binary", "HEAD"])?;
+        if !patch_output.status.success() {
+            return Err(anyhow!(
+                "worktree diff failed: {}",
+                String::from_utf8_lossy(&patch_output.stderr)
+            ));
+        }
+        if !patch_output.stdout.is_empty() {
+            let mut apply = Command::new(&self.binary)
+                .current_dir(&workspace.root)
+                .arg("apply")
+                .arg("--whitespace=nowarn")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|err| anyhow!("worktree commit failed: {err}"))?;
+            apply
+                .stdin
+                .as_mut()
+                .ok_or_else(|| anyhow!("worktree commit failed: missing stdin"))?
+                .write_all(&patch_output.stdout)?;
+            let output = apply.wait_with_output()?;
+            if !output.status.success() {
+                return Err(anyhow!(
+                    "worktree commit failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+        }
+        self.cleanup_worktree(workspace, branch)?;
+        let commit_hash = sha256_hex(&patch_output.stdout);
         Ok(BranchCommitResult {
-            commit_ref: format!("branchfs-commit:{}", branch.branch_name),
+            commit_ref: format!("git-worktree-apply:{}:{}", branch.branch_name, commit_hash),
             changed_files,
         })
     }
 
     fn abort(&self, workspace: &Workspace, branch: &BranchWorkspaceRecord) -> Result<()> {
         self.ensure_available(workspace)?;
-        let branch_path = PathBuf::from(&branch.branch_path);
-        fs::write(branch_path.join(".branchfs_ctl"), b"abort")
-            .map_err(|err| anyhow!("branch abort failed: {err}"))
+        self.cleanup_worktree(workspace, branch)
+            .map_err(|err| anyhow!("worktree abort failed: {err}"))
     }
 }
 
 pub fn backend_from_env() -> Box<dyn BranchWorkspaceBackend + Send + Sync> {
-    match std::env::var("RIVE_BRANCH_BACKEND")
-        .unwrap_or_else(|_| "branchfs".to_string())
+    match std::env::var("RIVE_WORKSPACE_BACKEND")
+        .unwrap_or_else(|_| "git-worktree".to_string())
         .as_str()
     {
         "local-fake" => Box::new(LocalFakeBranchBackend),
-        _ => Box::new(BranchFsBackend::default()),
+        _ => Box::new(GitWorktreeBackend::default()),
     }
 }
 
@@ -368,8 +453,8 @@ impl<'a> BranchService<'a> {
                     })?;
             return Ok(Some(integration));
         }
-        if workspace_ref.starts_with("branchfs:") {
-            return Err(anyhow!("branch not found: {workspace_ref}"));
+        if is_managed_workspace_ref(workspace_ref) {
+            return Err(anyhow!("worktree not found: {workspace_ref}"));
         }
         Ok(None)
     }
@@ -379,14 +464,14 @@ impl<'a> BranchService<'a> {
         dispatch_id: &str,
         workspace_ref: &str,
     ) -> Result<()> {
-        if !workspace_ref.starts_with("branchfs:") {
+        if !is_managed_workspace_ref(workspace_ref) {
             return Ok(());
         }
         self.store.init_work_schema()?;
         let branch = self
             .store
             .get_branch_workspace_by_ref(workspace_ref)?
-            .ok_or_else(|| anyhow!("branch not found: {workspace_ref}"))?;
+            .ok_or_else(|| anyhow!("worktree not found: {workspace_ref}"))?;
         if branch.dispatch_id != dispatch_id {
             return Err(anyhow!(
                 "branch integration conflict: {} belongs to dispatch {}",
@@ -724,10 +809,8 @@ fn workspace_id(workspace: &Workspace) -> String {
     format!("workspace:{}", workspace.root.display())
 }
 
-fn branchfs_runtime_root(workspace: &Workspace) -> PathBuf {
-    std::env::temp_dir()
-        .join("rive-branchfs")
-        .join(sha256_hex(workspace.root.to_string_lossy().as_bytes()))
+fn is_managed_workspace_ref(workspace_ref: &str) -> bool {
+    workspace_ref.starts_with("git-worktree:")
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

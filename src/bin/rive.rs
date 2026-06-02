@@ -1369,18 +1369,18 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
         ("invalid_acceptance_mode", "fix_arguments")
     } else if lower.contains("workspace mode not supported") {
         ("workspace_mode_not_supported", "fix_arguments")
-    } else if lower.contains("branch backend unavailable") {
-        ("branch_backend_unavailable", "fix_installation")
-    } else if lower.contains("branch mount failed") {
-        ("branch_mount_failed", "fix_installation")
-    } else if lower.contains("branch create failed") {
-        ("branch_create_failed", "inspect_backend")
-    } else if lower.contains("branch commit failed") {
-        ("branch_commit_failed", "inspect_backend")
-    } else if lower.contains("branch abort failed") {
-        ("branch_abort_failed", "inspect_backend")
-    } else if lower.contains("branch ref not committed") {
-        ("branch_ref_not_committed", "inspect_branch")
+    } else if lower.contains("worktree backend unavailable") {
+        ("worktree_backend_unavailable", "fix_installation")
+    } else if lower.contains("worktree create failed") {
+        ("worktree_create_failed", "inspect_backend")
+    } else if lower.contains("worktree commit failed") {
+        ("worktree_commit_failed", "inspect_backend")
+    } else if lower.contains("worktree abort failed") {
+        ("worktree_abort_failed", "inspect_backend")
+    } else if lower.contains("worktree ref not committed") {
+        ("worktree_ref_not_committed", "inspect_branch")
+    } else if lower.contains("worktree not found") {
+        ("worktree_not_found", "inspect_branch")
     } else if lower.contains("branch not pending") {
         ("branch_not_pending", "inspect_branch")
     } else if lower.contains("branch integration conflict") {
