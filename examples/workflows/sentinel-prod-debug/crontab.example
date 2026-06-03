@@ -1,0 +1,28 @@
+# Run Sentinel/Rive every 30 minutes.
+#
+# Install example:
+#   crontab examples/workflows/sentinel-prod-debug/crontab.example
+#
+# Adjust paths for the VM before installing.
+
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+
+RIVE_BIN=/opt/rive/bin/rive
+CODEX_BIN=/usr/local/bin/codex
+RIVE_SENTINEL_WORKSPACE=/srv/mono-meta
+RIVE_SENTINEL_WORKFLOW_PACKAGE=/opt/rive/examples/workflows/sentinel-prod-debug
+RIVE_SENTINEL_WORKER=sentinel-codex-worker
+RIVE_SENTINEL_ENV=prd
+RIVE_SENTINEL_SINCE=30m
+RIVE_SENTINEL_SLACK_CHANNEL=#alerts
+RIVE_SENTINEL_MAX_PARALLEL=3
+RIVE_SENTINEL_TIMEOUT_SECONDS=1800
+SENTINEL_BIN_DIR=/srv/mono-meta/users/kunli/sentinel/cli/bin
+
+# Enable only after the final report is published at a URL Slack can open.
+# RIVE_SENTINEL_NOTIFY_SLACK=1
+# SENTINEL_REPORT_BASE_URL=https://internal.example.com/mono-meta
+# SENTINEL_SLACK_SCRIPT=/srv/mono-meta/users/kunli/sentinel/slack-notify.sh
+
+*/30 * * * * /opt/rive/examples/workflows/sentinel-prod-debug/run-sentinel-cron.sh >> /var/log/rive-sentinel-cron.log 2>&1
