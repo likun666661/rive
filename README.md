@@ -29,6 +29,7 @@ Rive 是本地优先 agent team runtime 的体系文档。
 23. [Phase 11 Work DAG Scheduler 测试计划](./docs/23-phase11-work-dag-scheduler-test-plan.md)
 24. [Phase 12 Git worktree Workspace Branch / Ref Integration 设计](./docs/24-phase12-worktree-ref-integration-design.md)
 25. [Phase 12 Git worktree Workspace Branch / Ref Integration 测试计划](./docs/25-phase12-worktree-ref-integration-test-plan.md)
+26. [Phase 13 Reusable Workflow Template 计划](./docs/26-reusable-workflow-template-plan.md)
 
 ## Agent Skill
 
