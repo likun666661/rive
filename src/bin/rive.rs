@@ -406,6 +406,10 @@ enum SchedulerCommands {
         workspace_mode: String,
         #[arg(long = "opencode-bin")]
         opencode_bin: Option<PathBuf>,
+        #[arg(long = "codex-bin")]
+        codex_bin: Option<PathBuf>,
+        #[arg(long = "trust-project")]
+        trust_project: bool,
         #[arg(long = "timeout-seconds", default_value_t = 300)]
         timeout_seconds: u64,
     },
@@ -432,6 +436,10 @@ enum SchedulerCommands {
         workspace_mode: String,
         #[arg(long = "opencode-bin")]
         opencode_bin: Option<PathBuf>,
+        #[arg(long = "codex-bin")]
+        codex_bin: Option<PathBuf>,
+        #[arg(long = "trust-project")]
+        trust_project: bool,
         #[arg(long = "timeout-seconds", default_value_t = 300)]
         timeout_seconds: u64,
     },
@@ -473,6 +481,10 @@ enum WorkflowCommands {
         workspace_mode: String,
         #[arg(long = "opencode-bin")]
         opencode_bin: Option<PathBuf>,
+        #[arg(long = "codex-bin")]
+        codex_bin: Option<PathBuf>,
+        #[arg(long = "trust-project")]
+        trust_project: bool,
         #[arg(long = "timeout-seconds", default_value_t = 300)]
         timeout_seconds: u64,
     },
@@ -1370,6 +1382,8 @@ fn run() -> Result<()> {
                 acceptance_mode,
                 workspace_mode,
                 opencode_bin,
+                codex_bin,
+                trust_project,
                 timeout_seconds,
             } => {
                 let workspace = find_workspace(&std::env::current_dir()?)
@@ -1390,7 +1404,9 @@ fn run() -> Result<()> {
                     acceptance_mode,
                     workspace_mode,
                     opencode_bin,
+                    codex_bin,
                     timeout_seconds,
+                    trust_project,
                 })?;
                 let display = serde_json::json!({
                     "summary": format!(
@@ -1440,6 +1456,8 @@ fn run() -> Result<()> {
                 acceptance_mode,
                 workspace_mode,
                 opencode_bin,
+                codex_bin,
+                trust_project,
                 timeout_seconds,
             } => {
                 let workspace = find_workspace(&std::env::current_dir()?)
@@ -1460,7 +1478,9 @@ fn run() -> Result<()> {
                     acceptance_mode,
                     workspace_mode,
                     opencode_bin,
+                    codex_bin,
                     timeout_seconds,
+                    trust_project,
                 })?;
                 let display = serde_json::json!({
                     "summary": format!(
@@ -1555,6 +1575,8 @@ fn run() -> Result<()> {
                 acceptance_mode,
                 workspace_mode,
                 opencode_bin,
+                codex_bin,
+                trust_project,
                 timeout_seconds,
             } => {
                 let workspace = find_workspace(&std::env::current_dir()?)
@@ -1566,7 +1588,7 @@ fn run() -> Result<()> {
                 let scheduler_request = if no_scheduler {
                     None
                 } else {
-                    if runner != "opencode" {
+                    if !matches!(runner.as_str(), "opencode" | "codex") {
                         return Err(anyhow!("scheduler runner not supported: {runner}"));
                     }
                     if workers.is_empty() {
@@ -1603,6 +1625,8 @@ fn run() -> Result<()> {
                         workspace_mode,
                         timeout_seconds,
                         opencode_bin: opencode_bin.clone(),
+                        codex_bin: codex_bin.clone(),
+                        trust_project,
                     })
                 };
                 let mut protocol = service.run(WorkflowRunInput {
@@ -1632,7 +1656,9 @@ fn run() -> Result<()> {
                             acceptance_mode: request.acceptance_mode,
                             workspace_mode: request.workspace_mode,
                             opencode_bin: request.opencode_bin,
+                            codex_bin: request.codex_bin,
                             timeout_seconds: request.timeout_seconds,
+                            trust_project: request.trust_project,
                         }) {
                             Ok(scheduler_protocol) => {
                                 protocol = service.attach_scheduler(

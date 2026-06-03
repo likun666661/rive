@@ -95,6 +95,25 @@ printf '{"final":"RIVE_WORKFLOW_FAKE_OK"}\n'
     );
 }
 
+fn write_fake_codex_reporter(path: &Path) {
+    write_executable(
+        path,
+        r#"#!/bin/sh
+set -eu
+STATE="${RIVE_STATE_WORKSPACE:-$RIVE_WORKSPACE}"
+COUNT_FILE="$STATE/workflow-codex-scheduler-invocations.txt"
+if [ -f "$COUNT_FILE" ]; then COUNT=$(cat "$COUNT_FILE"); else COUNT=0; fi
+COUNT=$((COUNT + 1))
+printf '%s\n' "$COUNT" > "$COUNT_FILE"
+RESULT="$RIVE_WORKSPACE/workflow-codex-node-$COUNT.txt"
+printf 'RIVE_WORKFLOW_CODEX_NODE_%s_OK\n' "$COUNT" > "$RESULT"
+SNAPSHOT_ID=$(rive snapshot capture --path "$RESULT" --label workflow-fake-codex-worker --agent "$RIVE_AGENT_ID" --dispatch "$RIVE_DISPATCH_ID" | sed -n 's/.*"snapshot_id": "\([^"]*\)".*/\1/p' | head -n 1)
+printf 'workflow fake codex worker done\n' | team report --dispatch "$RIVE_DISPATCH_ID" --status done --snapshot "$SNAPSHOT_ID" --artifact-ref "file:workflow-codex-node-$COUNT.txt" --command-id "workflow-codex-report-$RIVE_RUN_ID" --stdin >/dev/null
+printf '{"final":"RIVE_WORKFLOW_FAKE_CODEX_OK"}\n'
+"#,
+    );
+}
+
 fn write_workflow_package(temp: &TempDir) -> std::path::PathBuf {
     let package = temp.path().join("workflow-package");
     fs::create_dir_all(package.join("prompts")).unwrap();
@@ -215,6 +234,11 @@ fn db_count(temp: &TempDir, table: &str) -> i64 {
         row.get(0)
     })
     .unwrap()
+}
+
+fn db_text(temp: &TempDir, sql: &str) -> String {
+    let conn = Connection::open(temp.path().join(".rive/rive.db")).unwrap();
+    conn.query_row(sql, [], |row| row.get(0)).unwrap()
 }
 
 fn import_workflow(temp: &TempDir, path: &Path, command_id: &str) -> Value {
@@ -512,6 +536,78 @@ fn workflow_run_can_execute_scheduler_and_replay_without_relaunch() {
             .arg(&fake),
     );
     assert_eq!(conflict["protocol"]["code"], "idempotency_conflict");
+}
+
+#[test]
+fn workflow_run_can_execute_codex_scheduler_with_fake_binary() {
+    let temp = init_workspace();
+    add_worker(&temp, "codex-worker");
+    let package = write_workflow_package(&temp);
+    import_workflow(&temp, &package, "wf-import-codex-scheduler");
+    let fake = temp.path().join("fake-codex-workflow");
+    write_fake_codex_reporter(&fake);
+
+    let run = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("workflow")
+            .arg("run")
+            .arg("test.workflow")
+            .arg("--param")
+            .arg("slack_channel=#alerts")
+            .arg("--command-id")
+            .arg("wf-run-codex-scheduler")
+            .arg("--runner")
+            .arg("codex")
+            .arg("--worker")
+            .arg("codex-worker")
+            .arg("--acceptance-mode")
+            .arg("auto-reported")
+            .arg("--codex-bin")
+            .arg(&fake)
+            .arg("--trust-project")
+            .arg("--timeout-seconds")
+            .arg("10"),
+    );
+    assert_eq!(run["protocol"]["state"], "completed");
+    assert_eq!(run["protocol"]["root_projection"]["state"], "done");
+    assert_eq!(run["protocol"]["scheduler"]["state"], "completed");
+    assert_eq!(
+        db_text(&temp, "SELECT runner FROM scheduler_runs LIMIT 1"),
+        "codex"
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join("workflow-codex-scheduler-invocations.txt")).unwrap(),
+        "2\n"
+    );
+
+    let replay = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("workflow")
+            .arg("run")
+            .arg("test.workflow")
+            .arg("--param")
+            .arg("slack_channel=#alerts")
+            .arg("--command-id")
+            .arg("wf-run-codex-scheduler")
+            .arg("--runner")
+            .arg("codex")
+            .arg("--worker")
+            .arg("codex-worker")
+            .arg("--acceptance-mode")
+            .arg("auto-reported")
+            .arg("--codex-bin")
+            .arg(&fake)
+            .arg("--trust-project")
+            .arg("--timeout-seconds")
+            .arg("10"),
+    );
+    assert_eq!(replay["protocol"]["idempotency_status"], "replayed");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("workflow-codex-scheduler-invocations.txt")).unwrap(),
+        "2\n"
+    );
 }
 
 #[test]

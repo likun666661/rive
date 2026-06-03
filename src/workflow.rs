@@ -179,6 +179,8 @@ pub struct WorkflowSchedulerRequest {
     pub workspace_mode: String,
     pub timeout_seconds: u64,
     pub opencode_bin: Option<PathBuf>,
+    pub codex_bin: Option<PathBuf>,
+    pub trust_project: bool,
 }
 
 pub struct WorkflowService<'a, B: SnapshotStore> {

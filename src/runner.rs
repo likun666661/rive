@@ -85,7 +85,9 @@ pub struct SchedulerRunInput {
     pub acceptance_mode: String,
     pub workspace_mode: String,
     pub opencode_bin: Option<PathBuf>,
+    pub codex_bin: Option<PathBuf>,
     pub timeout_seconds: u64,
+    pub trust_project: bool,
 }
 
 #[derive(Debug)]
@@ -98,7 +100,9 @@ pub struct SchedulerResumeInput {
     pub acceptance_mode: Option<String>,
     pub workspace_mode: String,
     pub opencode_bin: Option<PathBuf>,
+    pub codex_bin: Option<PathBuf>,
     pub timeout_seconds: u64,
+    pub trust_project: bool,
 }
 
 #[derive(Debug)]
@@ -648,9 +652,7 @@ impl<'a> SchedulerService<'a> {
     }
 
     pub fn run(&self, input: SchedulerRunInput) -> Result<SchedulerRunResponseProtocol> {
-        if input.runner != "opencode" {
-            return Err(anyhow!("scheduler runner not supported: {}", input.runner));
-        }
+        let runner = RunnerKind::parse(&input.runner)?;
         if input.command_id.trim().is_empty() {
             return Err(anyhow!("missing command id"));
         }
@@ -687,7 +689,8 @@ impl<'a> SchedulerService<'a> {
             acceptance_mode: acceptance_mode.as_str(),
             workspace_mode: workspace_mode.as_str(),
             timeout_seconds: input.timeout_seconds,
-            binary: input.opencode_bin.as_deref(),
+            binary: scheduler_binary_for_runner(&runner, &input),
+            trust_project: input.trust_project,
         });
         let inserted =
             self.event_store
@@ -822,6 +825,7 @@ impl<'a> SchedulerService<'a> {
             .as_ref()
             .map(|run| run.runner.clone())
             .unwrap_or_else(|| "opencode".to_string());
+        let runner_kind = RunnerKind::parse(&runner)?;
         let max_parallel = input
             .max_parallel
             .or_else(|| {
@@ -855,7 +859,8 @@ impl<'a> SchedulerService<'a> {
             acceptance_mode: acceptance.as_str(),
             workspace_mode: workspace_mode.as_str(),
             timeout_seconds: input.timeout_seconds,
-            binary: input.opencode_bin.as_deref(),
+            binary: scheduler_binary_for_runner_resume(&runner_kind, &input),
+            trust_project: input.trust_project,
         });
         let inserted =
             self.event_store
@@ -889,7 +894,9 @@ impl<'a> SchedulerService<'a> {
                     acceptance_mode,
                     workspace_mode: input.workspace_mode,
                     opencode_bin: input.opencode_bin,
+                    codex_bin: input.codex_bin,
                     timeout_seconds: input.timeout_seconds,
+                    trust_project: input.trust_project,
                 },
                 acceptance,
                 workspace_mode,
@@ -1293,6 +1300,8 @@ impl<'a> SchedulerService<'a> {
                     state: "running".to_string(),
                     completed_at: None,
                 })?;
+            let runner = RunnerKind::parse(&input.runner)?;
+            let binary = scheduler_binary_for_runner(&runner, input).map(Path::to_path_buf);
             launches.push(SchedulerLaunch {
                 node_run_id: node_run.node_run_id,
                 work_node_id: node.work_node_id,
@@ -1302,8 +1311,10 @@ impl<'a> SchedulerService<'a> {
                 dispatch,
                 title: node.title,
                 task_body,
-                binary: input.opencode_bin.clone(),
+                runner,
+                binary,
                 timeout_seconds: input.timeout_seconds,
+                trust_project: input.trust_project,
                 branch_ref,
                 branch_path,
             });
@@ -1652,8 +1663,10 @@ struct SchedulerLaunch {
     dispatch: DispatchRecord,
     title: String,
     task_body: Vec<u8>,
+    runner: RunnerKind,
     binary: Option<PathBuf>,
     timeout_seconds: u64,
+    trust_project: bool,
     branch_ref: Option<String>,
     branch_path: Option<PathBuf>,
 }
@@ -1672,14 +1685,7 @@ fn run_scheduler_launch(workspace: &Workspace, launch: &SchedulerLaunch) -> Resu
     let trace_store = DebugTraceStore::open(&workspace.db_path())?;
     trace_store.init_schema()?;
     let blob_store = crate::snapshot::LocalSnapshotStore::new(workspace);
-    let core = RunnerCore::new(
-        workspace,
-        &event_store,
-        &trace_store,
-        &blob_store,
-        OpenCodeAdapter,
-    );
-    let (dispatch, _, _) = core.run_existing(ExistingRunnerInput {
+    let input = ExistingRunnerInput {
         agent: &launch.worker,
         token: &launch.worker_token,
         dispatch: &launch.dispatch,
@@ -1689,10 +1695,28 @@ fn run_scheduler_launch(workspace: &Workspace, launch: &SchedulerLaunch) -> Resu
         snapshot_paths: &[],
         binary: launch.binary.as_deref(),
         timeout_seconds: launch.timeout_seconds,
-        trust_project: false,
+        trust_project: launch.trust_project,
         workspace_override: launch.branch_path.as_deref(),
         branch_ref: launch.branch_ref.as_deref(),
-    })?;
+    };
+    let (dispatch, _, _) = match launch.runner {
+        RunnerKind::OpenCode => RunnerCore::new(
+            workspace,
+            &event_store,
+            &trace_store,
+            &blob_store,
+            OpenCodeAdapter,
+        )
+        .run_existing(input)?,
+        RunnerKind::Codex => RunnerCore::new(
+            workspace,
+            &event_store,
+            &trace_store,
+            &blob_store,
+            CodexAdapter,
+        )
+        .run_existing(input)?,
+    };
     Ok(dispatch.dispatch_id)
 }
 
@@ -1739,6 +1763,7 @@ struct SchedulerRequestHashInput<'a> {
     workspace_mode: &'a str,
     timeout_seconds: u64,
     binary: Option<&'a Path>,
+    trust_project: bool,
 }
 
 fn scheduler_request_hash(input: SchedulerRequestHashInput<'_>) -> String {
@@ -1762,7 +1787,29 @@ fn scheduler_request_hash(input: SchedulerRequestHashInput<'_>) -> String {
         hasher.update(b"\0");
         hasher.update(binary.to_string_lossy().as_bytes());
     }
+    hasher.update(b"\0");
+    hasher.update(input.trust_project.to_string().as_bytes());
     format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn scheduler_binary_for_runner<'a>(
+    runner: &RunnerKind,
+    input: &'a SchedulerRunInput,
+) -> Option<&'a Path> {
+    match runner {
+        RunnerKind::OpenCode => input.opencode_bin.as_deref(),
+        RunnerKind::Codex => input.codex_bin.as_deref(),
+    }
+}
+
+fn scheduler_binary_for_runner_resume<'a>(
+    runner: &RunnerKind,
+    input: &'a SchedulerResumeInput,
+) -> Option<&'a Path> {
+    match runner {
+        RunnerKind::OpenCode => input.opencode_bin.as_deref(),
+        RunnerKind::Codex => input.codex_bin.as_deref(),
+    }
 }
 
 fn scheduler_task_body(
