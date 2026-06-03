@@ -104,6 +104,9 @@ test -n "$RIVE_DISPATCH_ID"
 test -n "$CODEX_HOME"
 printf 'RIVE_PHASE6_FAKE_OK\n' > "$RIVE_WORKSPACE/codex-result.txt"
 printf '%s\n' "$CODEX_HOME" > "$RIVE_WORKSPACE/codex-home.txt"
+if [ -f "$CODEX_HOME/config.toml" ]; then
+  cp "$CODEX_HOME/config.toml" "$RIVE_WORKSPACE/codex-home-config.txt"
+fi
 SNAPSHOT_ID=$(rive snapshot capture --path "$RIVE_WORKSPACE/codex-result.txt" --label fake-codex-result --agent "$RIVE_AGENT_ID" --dispatch "$RIVE_DISPATCH_ID" | sed -n 's/.*"snapshot_id": "\([^"]*\)".*/\1/p' | head -n 1)
 printf 'codex still working\n' | team status --dispatch "$RIVE_DISPATCH_ID" --snapshot "$SNAPSHOT_ID" --command-id "fake-codex-status-$RIVE_RUN_ID" --stdin >/dev/null
 printf 'codex done\n' | team report --dispatch "$RIVE_DISPATCH_ID" --status done --snapshot "$SNAPSHOT_ID" --command-id "fake-codex-report-$RIVE_RUN_ID" --stdin >/dev/null
@@ -191,6 +194,38 @@ fn runner_command_with_token(
     let mut command = runner_command(temp, codex_bin, command_id);
     command.arg("--agent-token").arg(token);
     command
+}
+
+#[test]
+fn codex_isolated_home_preserves_top_level_model_config() {
+    let temp = init_workspace();
+    let home = TempDir::new().unwrap();
+    let codex_home = home.path().join(".codex");
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::write(
+        codex_home.join("config.toml"),
+        r#"personality = "pragmatic"
+model = "gpt-5.5"
+model_reasoning_effort = "low"
+
+[projects."/tmp/should-not-leak"]
+trust_level = "trusted"
+"#,
+    )
+    .unwrap();
+
+    let fake = temp.path().join("fake-codex");
+    write_happy_codex(&fake);
+    let mut command = runner_command_without_trust(&temp, &fake, "codex-config-copy");
+    command.env("HOME", home.path()).env_remove("CODEX_HOME");
+    run_json_with_stdin(&mut command, "Create codex-result.txt and report done.\n");
+
+    let config = fs::read_to_string(temp.path().join("codex-home-config.txt")).unwrap();
+    assert!(config.contains(r#"model = "gpt-5.5""#));
+    assert!(config.contains(r#"model_reasoning_effort = "low""#));
+    assert!(config.contains(r#"personality = "pragmatic""#));
+    assert!(!config.contains("[projects."));
+    assert!(!config.contains("should-not-leak"));
 }
 
 #[test]

@@ -2677,6 +2677,7 @@ fn prepare_isolated_codex_home(run_dir: &Path) -> Result<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")));
     if let Some(source_home) = source_home {
+        copy_codex_model_config(&source_home, &codex_home)?;
         for file_name in ["auth.json", "installation_id"] {
             let source = source_home.join(file_name);
             if source.exists() {
@@ -2693,6 +2694,32 @@ fn prepare_isolated_codex_home(run_dir: &Path) -> Result<PathBuf> {
         }
     }
     Ok(codex_home)
+}
+
+fn copy_codex_model_config(source_home: &Path, codex_home: &Path) -> Result<()> {
+    let source = source_home.join("config.toml");
+    let target = codex_home.join("config.toml");
+    if !source.exists() || target.exists() {
+        return Ok(());
+    }
+
+    let source_config = fs::read_to_string(&source)?;
+    let mut copied = String::new();
+    for line in source_config.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            break;
+        }
+        if trimmed.starts_with("model") || trimmed.starts_with("personality") {
+            copied.push_str(line);
+            copied.push('\n');
+        }
+    }
+
+    if !copied.trim().is_empty() {
+        fs::write(target, copied)?;
+    }
+    Ok(())
 }
 
 fn team_send_request_hash(
