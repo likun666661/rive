@@ -1,0 +1,178 @@
+api_version: rive.workflow/v0
+id: sentinel.prod-debug
+version: 1
+title: Sentinel production debug for {{env}} since {{since}}
+params:
+  env:
+    type: enum
+    values: [prd, stg]
+    default: prd
+  since:
+    type: duration
+    default: 1h
+  slack_channel:
+    type: string
+    required: true
+  allow_github_write:
+    type: boolean
+    default: false
+  allow_slack_post:
+    type: boolean
+    default: false
+nodes:
+  global-signal-scan:
+    kind: task
+    runner: opencode
+    title: Scan P0 alerts and golden signals
+    prompt:
+      file: prompts/global-signal-scan.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - incident_window
+        - p0_alerts
+        - golden_signals
+        - service_impact
+        - evidence_refs
+  investigate-alva-backend:
+    kind: task
+    runner: opencode
+    title: Investigate alva-backend online errors
+    prompt:
+      file: prompts/investigate-service.md
+      params:
+        service: alva-backend
+    capability_policy:
+      gated_allow:
+        github.issue.create: "{{allow_github_write}}"
+    output_contract:
+      format: markdown
+      required_sections:
+        - service
+        - online_errors
+        - log_evidence
+        - code_pivots
+        - github_issue_draft
+        - root_cause_hypothesis
+        - evidence_refs
+  investigate-alfs:
+    kind: task
+    runner: opencode
+    title: Investigate alfs online errors
+    prompt:
+      file: prompts/investigate-service.md
+      params:
+        service: alfs
+    capability_policy:
+      gated_allow:
+        github.issue.create: "{{allow_github_write}}"
+    output_contract:
+      format: markdown
+      required_sections:
+        - service
+        - online_errors
+        - log_evidence
+        - code_pivots
+        - github_issue_draft
+        - root_cause_hypothesis
+        - evidence_refs
+  investigate-jagent:
+    kind: task
+    runner: opencode
+    title: Investigate jagent online errors
+    prompt:
+      file: prompts/investigate-service.md
+      params:
+        service: jagent
+    capability_policy:
+      gated_allow:
+        github.issue.create: "{{allow_github_write}}"
+    output_contract:
+      format: markdown
+      required_sections:
+        - service
+        - online_errors
+        - log_evidence
+        - code_pivots
+        - github_issue_draft
+        - root_cause_hypothesis
+        - evidence_refs
+  investigate-alva-gateway:
+    kind: task
+    runner: opencode
+    title: Investigate alva-gateway online errors
+    prompt:
+      file: prompts/investigate-service.md
+      params:
+        service: alva-gateway
+    capability_policy:
+      gated_allow:
+        github.issue.create: "{{allow_github_write}}"
+    output_contract:
+      format: markdown
+      required_sections:
+        - service
+        - online_errors
+        - log_evidence
+        - code_pivots
+        - github_issue_draft
+        - root_cause_hypothesis
+        - evidence_refs
+  final-judge-and-slack:
+    kind: review
+    runner: opencode
+    title: Judge incident evidence and prepare Slack report for {{slack_channel}}
+    consumes:
+      - global-signal-scan
+      - investigate-alva-backend
+      - investigate-alfs
+      - investigate-jagent
+      - investigate-alva-gateway
+    prompt:
+      file: prompts/final-judge-and-slack.md
+    capability_policy:
+      gated_allow:
+        slack.post: "{{allow_slack_post}}"
+    output_contract:
+      format: markdown
+      required_sections:
+        - executive_summary
+        - likely_root_cause
+        - evidence_by_service
+        - customer_impact
+        - recommended_actions
+        - slack_draft_or_post_result
+edges:
+  - type: decomposes_to
+    from: root
+    to: global-signal-scan
+  - type: decomposes_to
+    from: root
+    to: investigate-alva-backend
+  - type: decomposes_to
+    from: root
+    to: investigate-alfs
+  - type: decomposes_to
+    from: root
+    to: investigate-jagent
+  - type: decomposes_to
+    from: root
+    to: investigate-alva-gateway
+  - type: decomposes_to
+    from: root
+    to: final-judge-and-slack
+  - type: depends_on
+    from: global-signal-scan
+    to: final-judge-and-slack
+  - type: depends_on
+    from: investigate-alva-backend
+    to: final-judge-and-slack
+  - type: depends_on
+    from: investigate-alfs
+    to: final-judge-and-slack
+  - type: depends_on
+    from: investigate-jagent
+    to: final-judge-and-slack
+  - type: depends_on
+    from: investigate-alva-gateway
+    to: final-judge-and-slack

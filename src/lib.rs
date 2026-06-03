@@ -7,4 +7,5 @@ pub mod runner;
 pub mod snapshot;
 pub mod store;
 pub mod work;
+pub mod workflow;
 pub mod workspace;

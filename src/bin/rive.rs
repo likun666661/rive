@@ -32,6 +32,7 @@ use rive::work::{
     work_edge_protocol, work_node_protocol, AddWorkEdgeInput, CreateWorkNodeInput, WorkEdgeType,
     WorkNodeKind, WorkService, WorkStatusInput,
 };
+use rive::workflow::{WorkflowImportInput, WorkflowRunInput, WorkflowService};
 use rive::workspace::{find_workspace, init_workspace};
 
 #[derive(Parser)]
@@ -87,6 +88,10 @@ enum Commands {
     Scheduler {
         #[command(subcommand)]
         command: SchedulerCommands,
+    },
+    Workflow {
+        #[command(subcommand)]
+        command: WorkflowCommands,
     },
 }
 
@@ -427,6 +432,33 @@ enum SchedulerCommands {
         opencode_bin: Option<PathBuf>,
         #[arg(long = "timeout-seconds", default_value_t = 300)]
         timeout_seconds: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkflowCommands {
+    Validate {
+        path: PathBuf,
+    },
+    Import {
+        path: PathBuf,
+        #[arg(long = "command-id")]
+        command_id: String,
+    },
+    List,
+    Show {
+        template_id: String,
+        #[arg(long)]
+        version: Option<i64>,
+    },
+    Run {
+        template_id: String,
+        #[arg(long = "param")]
+        params: Vec<String>,
+        #[arg(long = "command-id")]
+        command_id: String,
+        #[arg(long = "no-scheduler")]
+        no_scheduler: bool,
     },
 }
 
@@ -1427,7 +1459,122 @@ fn run() -> Result<()> {
                 print_json(&Envelope::new(protocol, display))
             }
         },
+        Commands::Workflow { command } => match command {
+            WorkflowCommands::Validate { path } => {
+                let workspace = find_workspace(&std::env::current_dir()?).unwrap_or_else(|_| {
+                    let root = std::env::current_dir().expect("current dir");
+                    rive::workspace::Workspace { root }
+                });
+                let store = EventStore::open(&workspace.db_path()).or_else(|_| {
+                    let temp = tempfile_db_path();
+                    EventStore::open(&temp)
+                })?;
+                let snapshot_store = LocalSnapshotStore::new(&workspace);
+                let service = WorkflowService::new(&workspace, &store, &snapshot_store);
+                let protocol = service.validate_path(&path)?;
+                let display = serde_json::json!({
+                    "summary": format!(
+                        "Workflow {}@{} valid with {} nodes",
+                        protocol.template_id, protocol.version, protocol.node_count
+                    ),
+                });
+                print_json(&Envelope::new(protocol, display))
+            }
+            WorkflowCommands::Import { path, command_id } => {
+                let workspace = find_workspace(&std::env::current_dir()?)
+                    .map_err(|_| anyhow!("workspace not initialized"))?;
+                let store = EventStore::open(&workspace.db_path())?;
+                store.init_schema()?;
+                let snapshot_store = LocalSnapshotStore::new(&workspace);
+                let service = WorkflowService::new(&workspace, &store, &snapshot_store);
+                let protocol = service.import(WorkflowImportInput { path, command_id })?;
+                let display = serde_json::json!({
+                    "summary": format!(
+                        "Imported workflow {}@{} {}",
+                        protocol.template_id, protocol.version, protocol.idempotency_status
+                    ),
+                });
+                print_json(&Envelope::new(protocol, display))
+            }
+            WorkflowCommands::List => {
+                let workspace = find_workspace(&std::env::current_dir()?)
+                    .map_err(|_| anyhow!("workspace not initialized"))?;
+                let store = EventStore::open(&workspace.db_path())?;
+                store.init_schema()?;
+                let snapshot_store = LocalSnapshotStore::new(&workspace);
+                let service = WorkflowService::new(&workspace, &store, &snapshot_store);
+                let protocol = service.list()?;
+                let display = serde_json::json!({
+                    "summary": format!("{} workflow templates", protocol.templates.len()),
+                });
+                print_json(&Envelope::new(protocol, display))
+            }
+            WorkflowCommands::Show {
+                template_id,
+                version,
+            } => {
+                let workspace = find_workspace(&std::env::current_dir()?)
+                    .map_err(|_| anyhow!("workspace not initialized"))?;
+                let store = EventStore::open(&workspace.db_path())?;
+                store.init_schema()?;
+                let snapshot_store = LocalSnapshotStore::new(&workspace);
+                let service = WorkflowService::new(&workspace, &store, &snapshot_store);
+                let protocol = service.show(&template_id, version)?;
+                let display = serde_json::json!({
+                    "summary": format!(
+                        "Workflow {}@{} {}",
+                        protocol.template_id, protocol.version, protocol.template_hash
+                    ),
+                });
+                print_json(&Envelope::new(protocol, display))
+            }
+            WorkflowCommands::Run {
+                template_id,
+                params,
+                command_id,
+                no_scheduler,
+            } => {
+                let workspace = find_workspace(&std::env::current_dir()?)
+                    .map_err(|_| anyhow!("workspace not initialized"))?;
+                let store = EventStore::open(&workspace.db_path())?;
+                store.init_schema()?;
+                let snapshot_store = LocalSnapshotStore::new(&workspace);
+                let service = WorkflowService::new(&workspace, &store, &snapshot_store);
+                let protocol = service.run(WorkflowRunInput {
+                    template_id,
+                    command_id,
+                    params: parse_params(params)?,
+                    no_scheduler,
+                })?;
+                let display = serde_json::json!({
+                    "summary": format!(
+                        "Workflow run {} instantiated root {}",
+                        protocol.workflow_run_id, protocol.root_work_node_id
+                    ),
+                });
+                print_json(&Envelope::new(protocol, display))
+            }
+        },
     }
+}
+
+fn tempfile_db_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "rive-workflow-validate-{}.db",
+        uuid::Uuid::new_v4().simple()
+    ))
+}
+
+fn parse_params(values: Vec<String>) -> Result<Vec<(String, String)>> {
+    values
+        .into_iter()
+        .map(|value| {
+            let (key, value) = value
+                .split_once('=')
+                .ok_or_else(|| anyhow!("workflow param must be key=value: {value}"))?;
+            Ok((key.to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
@@ -1442,6 +1589,31 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
         ("workspace_not_initialized", "run_rive_init")
     } else if lower.contains("no .rive workspace") {
         ("workspace_not_found", "run_rive_init")
+    } else if lower.contains("workflow template version conflict") {
+        ("workflow_template_version_conflict", "fix_arguments")
+    } else if lower.contains("workflow template not found") {
+        ("workflow_template_not_found", "fix_arguments")
+    } else if lower.contains("workflow scheduler execution not supported") {
+        ("workflow_scheduler_not_supported", "fix_arguments")
+    } else if lower.contains("unsupported workflow api version") {
+        ("workflow_api_version_unsupported", "fix_arguments")
+    } else if lower.contains("workflow graph cycle") {
+        ("workflow_graph_cycle", "fix_arguments")
+    } else if lower.contains("workflow edge endpoint not found") {
+        ("workflow_edge_endpoint_not_found", "fix_arguments")
+    } else if lower.contains("workflow gated capability") {
+        ("workflow_capability_gate_invalid", "fix_arguments")
+    } else if lower.contains("workflow missing param") {
+        ("workflow_param_missing", "fix_arguments")
+    } else if lower.contains("workflow unknown param") {
+        ("workflow_param_unknown", "fix_arguments")
+    } else if lower.contains("workflow invalid enum param")
+        || lower.contains("workflow invalid boolean param")
+        || lower.contains("workflow param must be key=value")
+    {
+        ("workflow_param_invalid", "fix_arguments")
+    } else if lower.contains("workflow unresolved template variable") {
+        ("workflow_template_unresolved", "fix_arguments")
     } else if lower.contains("runner agent token required") {
         ("runner_agent_token_required", "fix_arguments")
     } else if lower.contains("invalid agent token") {

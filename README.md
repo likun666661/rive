@@ -38,3 +38,4 @@ Rive 是本地优先 agent team runtime 的体系文档。
 ## Examples
 
 - [Eino technical manual dogfood](./examples/eino-technical-manual/) — 用 Rive Work DAG + OpenCode workers 阅读 CloudWeGo Eino 代码并产出技术手册的真实 dogfood 示例。
+- [Sentinel reusable workflow template](./examples/workflows/sentinel-prod-debug/) — 可导入/复跑的生产 debug workflow 模板包，包含 DAG 和节点 prompt。

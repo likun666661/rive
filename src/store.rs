@@ -347,6 +347,53 @@ pub struct BranchIntegrationRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowTemplateRecord {
+    pub template_id: String,
+    pub latest_version: i64,
+    pub latest_hash: String,
+    pub title: String,
+    pub source_ref: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowTemplateVersionRecord {
+    pub template_id: String,
+    pub version: i64,
+    pub template_hash: String,
+    pub source_ref: String,
+    pub spec_json: Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowRunRecord {
+    pub workflow_run_id: String,
+    pub command_id: String,
+    pub template_id: String,
+    pub template_version: i64,
+    pub template_hash: String,
+    pub params_json: Value,
+    pub params_hash: String,
+    pub request_hash: String,
+    pub root_work_node_id: String,
+    pub scheduler_run_id: Option<String>,
+    pub state: String,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowRunNodeRecord {
+    pub workflow_run_id: String,
+    pub node_template_id: String,
+    pub work_node_id: String,
+    pub output_contract_json: Value,
+    pub capability_policy_json: Value,
+}
+
 #[derive(Debug, Clone)]
 pub struct InsertWorkNodeInput {
     pub event: EventRecord,
@@ -449,6 +496,52 @@ pub struct RecordBranchCommandInput {
     pub action: String,
     pub request_hash: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertWorkflowTemplateInput {
+    pub template_id: String,
+    pub version: i64,
+    pub template_hash: String,
+    pub title: String,
+    pub source_ref: String,
+    pub spec_json: Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertWorkflowImportCommandInput {
+    pub command_id: String,
+    pub template_id: String,
+    pub version: i64,
+    pub template_hash: String,
+    pub request_hash: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertWorkflowRunInput {
+    pub workflow_run_id: String,
+    pub command_id: String,
+    pub template_id: String,
+    pub template_version: i64,
+    pub template_hash: String,
+    pub params_json: Value,
+    pub params_hash: String,
+    pub request_hash: String,
+    pub root_work_node_id: String,
+    pub scheduler_run_id: Option<String>,
+    pub state: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertWorkflowRunNodeInput {
+    pub workflow_run_id: String,
+    pub node_template_id: String,
+    pub work_node_id: String,
+    pub output_contract_json: Value,
+    pub capability_policy_json: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -793,6 +886,60 @@ impl EventStore {
               request_hash TEXT NOT NULL,
               created_at TEXT NOT NULL,
               FOREIGN KEY(integration_id) REFERENCES branch_integrations(integration_id)
+            );
+            CREATE TABLE IF NOT EXISTS workflow_templates (
+              template_id TEXT PRIMARY KEY,
+              latest_version INTEGER NOT NULL,
+              latest_hash TEXT NOT NULL,
+              title TEXT NOT NULL,
+              source_ref TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS workflow_template_versions (
+              template_id TEXT NOT NULL,
+              version INTEGER NOT NULL,
+              template_hash TEXT NOT NULL,
+              source_ref TEXT NOT NULL,
+              spec_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY(template_id, version),
+              UNIQUE(template_id, template_hash),
+              FOREIGN KEY(template_id) REFERENCES workflow_templates(template_id)
+            );
+            CREATE TABLE IF NOT EXISTS workflow_import_commands (
+              command_id TEXT PRIMARY KEY,
+              template_id TEXT NOT NULL,
+              version INTEGER NOT NULL,
+              template_hash TEXT NOT NULL,
+              request_hash TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS workflow_runs (
+              workflow_run_id TEXT PRIMARY KEY,
+              command_id TEXT NOT NULL UNIQUE,
+              template_id TEXT NOT NULL,
+              template_version INTEGER NOT NULL,
+              template_hash TEXT NOT NULL,
+              params_json TEXT NOT NULL,
+              params_hash TEXT NOT NULL,
+              request_hash TEXT NOT NULL,
+              root_work_node_id TEXT NOT NULL,
+              scheduler_run_id TEXT,
+              state TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              completed_at TEXT,
+              FOREIGN KEY(root_work_node_id) REFERENCES work_nodes(work_node_id)
+            );
+            CREATE TABLE IF NOT EXISTS workflow_run_nodes (
+              workflow_run_id TEXT NOT NULL,
+              node_template_id TEXT NOT NULL,
+              work_node_id TEXT NOT NULL,
+              output_contract_json TEXT NOT NULL,
+              capability_policy_json TEXT NOT NULL,
+              PRIMARY KEY(workflow_run_id, node_template_id),
+              FOREIGN KEY(workflow_run_id) REFERENCES workflow_runs(workflow_run_id),
+              FOREIGN KEY(work_node_id) REFERENCES work_nodes(work_node_id)
             );
             "#,
         )?;
@@ -2566,6 +2713,278 @@ impl EventStore {
         )?;
         Ok(())
     }
+
+    pub fn upsert_workflow_template(
+        &self,
+        input: &UpsertWorkflowTemplateInput,
+    ) -> Result<WorkflowTemplateVersionRecord> {
+        if let Some(existing) =
+            self.get_workflow_template_version(&input.template_id, input.version)?
+        {
+            if existing.template_hash == input.template_hash {
+                return Ok(existing);
+            }
+            return Err(anyhow::anyhow!(
+                "workflow template version conflict: {}@{}",
+                input.template_id,
+                input.version
+            ));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            r#"
+            INSERT INTO workflow_templates (
+              template_id, latest_version, latest_hash, title, source_ref, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+            ON CONFLICT(template_id) DO UPDATE SET
+              latest_version = excluded.latest_version,
+              latest_hash = excluded.latest_hash,
+              title = excluded.title,
+              source_ref = excluded.source_ref,
+              updated_at = excluded.updated_at
+            "#,
+            params![
+                input.template_id,
+                input.version,
+                input.template_hash,
+                input.title,
+                input.source_ref,
+                input.created_at.to_rfc3339(),
+            ],
+        )?;
+        tx.execute(
+            r#"
+            INSERT INTO workflow_template_versions (
+              template_id, version, template_hash, source_ref, spec_json, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                input.template_id,
+                input.version,
+                input.template_hash,
+                input.source_ref,
+                serde_json::to_string(&input.spec_json)?,
+                input.created_at.to_rfc3339(),
+            ],
+        )?;
+        tx.commit()?;
+        self.get_workflow_template_version(&input.template_id, input.version)?
+            .ok_or_else(|| anyhow::anyhow!("workflow template not found: {}", input.template_id))
+    }
+
+    pub fn get_workflow_import_command(
+        &self,
+        command_id: &str,
+    ) -> Result<Option<(String, i64, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT template_id, version, template_hash, request_hash
+            FROM workflow_import_commands
+            WHERE command_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![command_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn insert_workflow_import_command(
+        &self,
+        input: &InsertWorkflowImportCommandInput,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO workflow_import_commands (
+              command_id, template_id, version, template_hash, request_hash, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                input.command_id,
+                input.template_id,
+                input.version,
+                input.template_hash,
+                input.request_hash,
+                input.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_workflow_templates(&self) -> Result<Vec<WorkflowTemplateRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT template_id, latest_version, latest_hash, title, source_ref, created_at, updated_at
+            FROM workflow_templates
+            ORDER BY template_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], row_to_workflow_template)?;
+        let mut templates = Vec::new();
+        for row in rows {
+            templates.push(row?);
+        }
+        Ok(templates)
+    }
+
+    pub fn get_workflow_template(
+        &self,
+        template_id: &str,
+    ) -> Result<Option<WorkflowTemplateRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT template_id, latest_version, latest_hash, title, source_ref, created_at, updated_at
+            FROM workflow_templates
+            WHERE template_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![template_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_workflow_template(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_workflow_template_version(
+        &self,
+        template_id: &str,
+        version: i64,
+    ) -> Result<Option<WorkflowTemplateVersionRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT template_id, version, template_hash, source_ref, spec_json, created_at
+            FROM workflow_template_versions
+            WHERE template_id = ?1 AND version = ?2
+            "#,
+        )?;
+        let mut rows = stmt.query(params![template_id, version])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_workflow_template_version(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_latest_workflow_template_version(
+        &self,
+        template_id: &str,
+    ) -> Result<Option<WorkflowTemplateVersionRecord>> {
+        if let Some(template) = self.get_workflow_template(template_id)? {
+            self.get_workflow_template_version(template_id, template.latest_version)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_workflow_run_by_command_id(
+        &self,
+        command_id: &str,
+    ) -> Result<Option<WorkflowRunRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT workflow_run_id, command_id, template_id, template_version, template_hash,
+                   params_json, params_hash, request_hash, root_work_node_id, scheduler_run_id,
+                   state, created_at, completed_at
+            FROM workflow_runs
+            WHERE command_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![command_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_workflow_run(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_workflow_run(&self, workflow_run_id: &str) -> Result<Option<WorkflowRunRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT workflow_run_id, command_id, template_id, template_version, template_hash,
+                   params_json, params_hash, request_hash, root_work_node_id, scheduler_run_id,
+                   state, created_at, completed_at
+            FROM workflow_runs
+            WHERE workflow_run_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![workflow_run_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_workflow_run(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn insert_workflow_run(&self, input: &InsertWorkflowRunInput) -> Result<WorkflowRunRecord> {
+        self.conn.execute(
+            r#"
+            INSERT INTO workflow_runs (
+              workflow_run_id, command_id, template_id, template_version, template_hash,
+              params_json, params_hash, request_hash, root_work_node_id, scheduler_run_id,
+              state, created_at, completed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL)
+            "#,
+            params![
+                input.workflow_run_id,
+                input.command_id,
+                input.template_id,
+                input.template_version,
+                input.template_hash,
+                serde_json::to_string(&input.params_json)?,
+                input.params_hash,
+                input.request_hash,
+                input.root_work_node_id,
+                input.scheduler_run_id,
+                input.state,
+                input.created_at.to_rfc3339(),
+            ],
+        )?;
+        self.get_workflow_run(&input.workflow_run_id)?
+            .ok_or_else(|| anyhow::anyhow!("workflow run not found: {}", input.workflow_run_id))
+    }
+
+    pub fn insert_workflow_run_node(&self, input: &InsertWorkflowRunNodeInput) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO workflow_run_nodes (
+              workflow_run_id, node_template_id, work_node_id, output_contract_json,
+              capability_policy_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![
+                input.workflow_run_id,
+                input.node_template_id,
+                input.work_node_id,
+                serde_json::to_string(&input.output_contract_json)?,
+                serde_json::to_string(&input.capability_policy_json)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_workflow_run_nodes(
+        &self,
+        workflow_run_id: &str,
+    ) -> Result<Vec<WorkflowRunNodeRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT workflow_run_id, node_template_id, work_node_id, output_contract_json,
+                   capability_policy_json
+            FROM workflow_run_nodes
+            WHERE workflow_run_id = ?1
+            ORDER BY node_template_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![workflow_run_id], row_to_workflow_run_node)?;
+        let mut nodes = Vec::new();
+        for row in rows {
+            nodes.push(row?);
+        }
+        Ok(nodes)
+    }
 }
 
 fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotRecord> {
@@ -2873,10 +3292,81 @@ fn row_to_branch_integration(row: &rusqlite::Row<'_>) -> rusqlite::Result<Branch
     })
 }
 
+fn row_to_workflow_template(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowTemplateRecord> {
+    let created_at: String = row.get(5)?;
+    let updated_at: String = row.get(6)?;
+    Ok(WorkflowTemplateRecord {
+        template_id: row.get(0)?,
+        latest_version: row.get(1)?,
+        latest_hash: row.get(2)?,
+        title: row.get(3)?,
+        source_ref: row.get(4)?,
+        created_at: parse_time_for_sql(&created_at)?,
+        updated_at: parse_time_for_sql(&updated_at)?,
+    })
+}
+
+fn row_to_workflow_template_version(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WorkflowTemplateVersionRecord> {
+    let spec_json: String = row.get(4)?;
+    let created_at: String = row.get(5)?;
+    Ok(WorkflowTemplateVersionRecord {
+        template_id: row.get(0)?,
+        version: row.get(1)?,
+        template_hash: row.get(2)?,
+        source_ref: row.get(3)?,
+        spec_json: parse_json_for_sql(&spec_json)?,
+        created_at: parse_time_for_sql(&created_at)?,
+    })
+}
+
+fn row_to_workflow_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowRunRecord> {
+    let params_json: String = row.get(5)?;
+    let created_at: String = row.get(11)?;
+    let completed_at: Option<String> = row.get(12)?;
+    Ok(WorkflowRunRecord {
+        workflow_run_id: row.get(0)?,
+        command_id: row.get(1)?,
+        template_id: row.get(2)?,
+        template_version: row.get(3)?,
+        template_hash: row.get(4)?,
+        params_json: parse_json_for_sql(&params_json)?,
+        params_hash: row.get(6)?,
+        request_hash: row.get(7)?,
+        root_work_node_id: row.get(8)?,
+        scheduler_run_id: row.get(9)?,
+        state: row.get(10)?,
+        created_at: parse_time_for_sql(&created_at)?,
+        completed_at: completed_at
+            .as_deref()
+            .map(parse_time_for_sql)
+            .transpose()?,
+    })
+}
+
+fn row_to_workflow_run_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowRunNodeRecord> {
+    let output_contract_json: String = row.get(3)?;
+    let capability_policy_json: String = row.get(4)?;
+    Ok(WorkflowRunNodeRecord {
+        workflow_run_id: row.get(0)?,
+        node_template_id: row.get(1)?,
+        work_node_id: row.get(2)?,
+        output_contract_json: parse_json_for_sql(&output_contract_json)?,
+        capability_policy_json: parse_json_for_sql(&capability_policy_json)?,
+    })
+}
+
 fn parse_time_for_sql(value: &str) -> rusqlite::Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .map(|time| time.with_timezone(&Utc))
         .map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(err))
         })
+}
+
+fn parse_json_for_sql(value: &str) -> rusqlite::Result<Value> {
+    serde_json::from_str(value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+    })
 }
