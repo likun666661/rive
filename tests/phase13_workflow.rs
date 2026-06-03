@@ -52,6 +52,10 @@ fn init_workspace() -> TempDir {
 }
 
 fn add_worker(temp: &TempDir, name: &str) {
+    add_agent(temp, name, "worker");
+}
+
+fn add_agent(temp: &TempDir, name: &str, role: &str) {
     run_json(
         rive_cmd()
             .current_dir(temp.path())
@@ -59,7 +63,7 @@ fn add_worker(temp: &TempDir, name: &str) {
             .arg("add")
             .arg(name)
             .arg("--role")
-            .arg("worker")
+            .arg(role)
             .arg("--token")
             .arg(format!("{name}-token")),
     );
@@ -527,6 +531,43 @@ fn workflow_scheduler_args_are_checked_before_instantiation() {
             .arg("wf-run-no-worker"),
     );
     assert_eq!(error["protocol"]["code"], "scheduler_worker_required");
+    assert_eq!(db_count(&temp, "workflow_runs"), 0);
+    assert_eq!(db_count(&temp, "work_nodes"), 0);
+    assert_eq!(db_count(&temp, "scheduler_runs"), 0);
+
+    let missing_worker = run_json_expect_error(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("workflow")
+            .arg("run")
+            .arg("test.workflow")
+            .arg("--param")
+            .arg("slack_channel=#alerts")
+            .arg("--command-id")
+            .arg("wf-run-missing-worker")
+            .arg("--worker")
+            .arg("no-such-worker"),
+    );
+    assert_eq!(missing_worker["protocol"]["code"], "agent_not_found");
+    assert_eq!(db_count(&temp, "workflow_runs"), 0);
+    assert_eq!(db_count(&temp, "work_nodes"), 0);
+    assert_eq!(db_count(&temp, "scheduler_runs"), 0);
+
+    add_agent(&temp, "not-worker", "orchestrator");
+    let non_worker = run_json_expect_error(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("workflow")
+            .arg("run")
+            .arg("test.workflow")
+            .arg("--param")
+            .arg("slack_channel=#alerts")
+            .arg("--command-id")
+            .arg("wf-run-non-worker")
+            .arg("--worker")
+            .arg("not-worker"),
+    );
+    assert_eq!(non_worker["protocol"]["code"], "runner_worker_role_invalid");
     assert_eq!(db_count(&temp, "workflow_runs"), 0);
     assert_eq!(db_count(&temp, "work_nodes"), 0);
     assert_eq!(db_count(&temp, "scheduler_runs"), 0);

@@ -1572,6 +1572,14 @@ fn run() -> Result<()> {
                     if workers.is_empty() {
                         return Err(anyhow!("scheduler worker is required"));
                     }
+                    for worker in &workers {
+                        let agent = store
+                            .get_agent(worker)?
+                            .ok_or_else(|| anyhow!("agent not found: {worker}"))?;
+                        if agent.role != AgentRole::Worker {
+                            return Err(anyhow!("runner worker must be worker: {worker}"));
+                        }
+                    }
                     if max_parallel == 0 {
                         return Err(anyhow!("scheduler max parallel must be greater than zero"));
                     }
@@ -1814,6 +1822,8 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
         ("unsupported_trace_install_target", "fix_arguments")
     } else if lower.contains("invalid agent role") {
         ("invalid_agent_role", "fix_arguments")
+    } else if lower.contains("agent not found") {
+        ("agent_not_found", "fix_arguments")
     } else if lower.contains("dispatch target must be worker") {
         ("invalid_dispatch_target", "fix_arguments")
     } else if lower.contains("dispatch closed") {
