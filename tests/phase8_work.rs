@@ -118,6 +118,25 @@ fn create_work(temp: &TempDir, command_id: &str, title: &str) -> String {
         .to_string()
 }
 
+fn create_work_with_body(temp: &TempDir, command_id: &str, title: &str, body: &str) -> String {
+    let mut command = rive_cmd();
+    command
+        .current_dir(temp.path())
+        .arg("work")
+        .arg("create")
+        .arg("--kind")
+        .arg("task")
+        .arg("--title")
+        .arg(title)
+        .arg("--command-id")
+        .arg(command_id)
+        .arg("--stdin");
+    run_json_with_stdin(&mut command, body)["protocol"]["work_node_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 fn inspect_work(temp: &TempDir, work_node_id: &str) -> Value {
     run_json(
         rive_cmd()
@@ -190,7 +209,12 @@ fn work_node_can_be_delegated_and_accepted() {
     let temp = init_workspace();
     add_agent(&temp, "orch", "orchestrator", "orch-token");
     add_agent(&temp, "worker", "worker", "worker-token");
-    let work = create_work(&temp, "work-single", "single node");
+    let work = create_work_with_body(
+        &temp,
+        "work-single",
+        "single node",
+        "Node body acceptance: produce phase8-result.txt and report evidence.",
+    );
     let fake = temp.path().join("fake-opencode-worker");
     write_phase8_worker(&fake, "phase8-result.txt");
 
@@ -203,6 +227,20 @@ fn work_node_can_be_delegated_and_accepted() {
         response["protocol"]["work"]["state"],
         Value::String("reviewable".to_string())
     );
+    let worker_run_id = response["protocol"]["delegation"]["worker_run_id"]
+        .as_str()
+        .unwrap();
+    let prompt = fs::read_to_string(
+        temp.path()
+            .join(".rive/debug/runs")
+            .join(worker_run_id)
+            .join("prompt.txt"),
+    )
+    .unwrap();
+    assert!(prompt.contains("Node body acceptance: produce phase8-result.txt and report evidence."));
+    assert!(prompt.contains("Delegation request:"));
+    assert!(prompt.contains("Create phase8-result.txt and report done."));
+    assert!(prompt.contains("Make source/artifact edits only under `$RIVE_WORKSPACE`"));
 
     let inspected = inspect_work(&temp, &work);
     assert_eq!(inspected["protocol"]["projection"]["state"], "reviewable");

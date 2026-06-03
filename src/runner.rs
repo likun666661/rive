@@ -1770,40 +1770,87 @@ fn scheduler_task_body(
     node: &WorkNodeRecord,
     branch_ref: Option<&str>,
 ) -> Vec<u8> {
+    let body_section = work_node_body_text(workspace, node);
     let branch_section = branch_ref
         .map(|branch_ref| {
             format!(
-                "\nWorktree workspace:\n- ref: {branch_ref}\n- This worker is running in an isolated git worktree workspace.\n- Use `--workspace-ref \"$RIVE_WORKSPACE_REF\"` when reporting.\n- Do not call git worktree remove or merge directly.\n"
+                "\nWorkspace ref:\n- ref: {branch_ref}\n- Use `--workspace-ref \"$RIVE_WORKSPACE_REF\"` when reporting.\n"
             )
         })
         .unwrap_or_default();
     format!(
         r#"You are a Rive worker assigned to one work node.
 
-Workspace:
-- root: {}
+Editable workspace contract:
+- `$RIVE_WORKSPACE` is the only source/artifact workspace you may edit.
+- `$RIVE_STATE_WORKSPACE` is only for Rive ledger commands. Do not edit source files there.
+- If `$RIVE_WORKSPACE` and `$RIVE_STATE_WORKSPACE` differ, capture evidence from `$RIVE_WORKSPACE`.
 
 Work node:
 - id: {}
 - title: {}
+- body:
+{}
 {}
 
 Rules:
-1. Inspect your assigned node with `rive work inspect {}` if needed.
-2. Make only implementation changes required for this node.
-3. Capture evidence with `rive snapshot capture`.
+1. Read the work node body above as the authoritative objective and acceptance criteria.
+2. Inspect your assigned node with `rive work inspect {}` if you need ledger context.
+3. Make only implementation changes required for this node, under `$RIVE_WORKSPACE`.
 4. Report with `team report --dispatch $RIVE_DISPATCH_ID --status done|blocked|failed --snapshot <id> --command-id <unique-id> --stdin`.
 5. Include `--artifact-ref`, `--workspace-ref`, or `--diff-ref` when you create a result.
 6. Do not mutate Work DAG topology.
 7. Do not claim success in natural language without `team report`.
 "#,
-        workspace.root.display(),
         node.work_node_id,
         node.title,
+        body_section,
         branch_section,
         node.work_node_id
     )
     .into_bytes()
+}
+
+fn team_send_work_task_body(
+    workspace: &Workspace,
+    node: &WorkNodeRecord,
+    request_body: &[u8],
+) -> Vec<u8> {
+    let node_body = work_node_body_text(workspace, node);
+    let request_body = String::from_utf8_lossy(request_body);
+    format!(
+        r#"You are a Rive worker delegated to a specific Work node.
+
+Work node:
+- id: {}
+- title: {}
+- body:
+{}
+
+Delegation request:
+{}
+
+Rules:
+1. Treat the Work node body as the authoritative objective and acceptance criteria.
+2. Treat the delegation request as additional execution guidance.
+3. Make source/artifact edits only under `$RIVE_WORKSPACE`.
+4. Capture evidence and close the dispatch with `team report`; natural language completion is not enough.
+"#,
+        node.work_node_id, node.title, node_body, request_body
+    )
+    .into_bytes()
+}
+
+fn work_node_body_text(workspace: &Workspace, node: &WorkNodeRecord) -> String {
+    let Some(blob_ref) = &node.body_blob_ref else {
+        return "(empty)".to_string();
+    };
+    let path = workspace.root.join(blob_ref);
+    match fs::read(&path) {
+        Ok(bytes) if bytes.is_empty() => "(empty)".to_string(),
+        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+        Err(error) => format!("(unreadable body_blob_ref {blob_ref}: {error})"),
+    }
 }
 
 fn open_dispatch_nodes(store: &EventStore) -> Result<BTreeSet<String>> {
@@ -1881,6 +1928,8 @@ impl<'a, A: RunnerAdapter> RunnerCore<'a, A> {
         let binary = self.adapter.resolve_binary(input.binary.as_deref())?;
         let prompt = self.adapter.build_prompt(RunnerPromptContext {
             workspace: self.workspace,
+            active_workspace: self.workspace.root.as_path(),
+            branch_ref: None,
             agent: &agent,
             dispatch: &dispatch,
             title: &input.title,
@@ -1966,6 +2015,10 @@ impl<'a, A: RunnerAdapter> RunnerCore<'a, A> {
         let binary = self.adapter.resolve_binary(input.binary)?;
         let prompt = self.adapter.build_prompt(RunnerPromptContext {
             workspace: self.workspace,
+            active_workspace: input
+                .workspace_override
+                .unwrap_or(self.workspace.root.as_path()),
+            branch_ref: input.branch_ref,
             agent: input.agent,
             dispatch: input.dispatch,
             title: input.title,
@@ -2173,7 +2226,11 @@ impl<'a> TeamSendService<'a> {
             return Ok(self.response(existing, dispatch, "replayed", false, trace, work));
         }
 
-        if let Some(work_node_id) = &input.work_node_id {
+        let bound_work_node = if let Some(work_node_id) = &input.work_node_id {
+            let node = self
+                .event_store
+                .get_work_node(work_node_id)?
+                .ok_or_else(|| anyhow!("work node not found: {work_node_id}"))?;
             let projection = work_service.inspect_projection(work_node_id)?;
             if !projection.allowed_next_actions.contains(&"delegate") {
                 return Err(anyhow!(
@@ -2181,7 +2238,14 @@ impl<'a> TeamSendService<'a> {
                     projection.state
                 ));
             }
-        }
+            Some(node)
+        } else {
+            None
+        };
+        let dispatch_body = bound_work_node
+            .as_ref()
+            .map(|node| team_send_work_task_body(self.workspace, node, &input.task_body))
+            .unwrap_or_else(|| input.task_body.clone());
 
         let worker_run_id = prefixed_id("run");
         let worker_token = prefixed_id("tok");
@@ -2198,7 +2262,7 @@ impl<'a> TeamSendService<'a> {
             command_id: dispatch_command_id,
             target_agent: target.agent_id.clone(),
             title: input.title.clone(),
-            body: input.task_body.clone(),
+            body: dispatch_body.clone(),
         })? {
             CreateDispatchOutcome::Inserted(dispatch)
             | CreateDispatchOutcome::Replayed(dispatch) => dispatch,
@@ -2244,7 +2308,7 @@ impl<'a> TeamSendService<'a> {
                     dispatch: &dispatch,
                     run_id: &worker_run_id,
                     title: &input.title,
-                    task_body: &input.task_body,
+                    task_body: &dispatch_body,
                     snapshot_paths: &input.snapshot_paths,
                     binary: input.opencode_bin.as_deref(),
                     timeout_seconds: input.timeout_seconds,
@@ -2268,7 +2332,7 @@ impl<'a> TeamSendService<'a> {
                     dispatch: &dispatch,
                     run_id: &worker_run_id,
                     title: &input.title,
-                    task_body: &input.task_body,
+                    task_body: &dispatch_body,
                     snapshot_paths: &input.snapshot_paths,
                     binary: input.codex_bin.as_deref(),
                     timeout_seconds: input.timeout_seconds,
@@ -2536,6 +2600,8 @@ impl RunnerAdapter for CodexAdapter {
 
 struct RunnerPromptContext<'a> {
     workspace: &'a Workspace,
+    active_workspace: &'a Path,
+    branch_ref: Option<&'a str>,
     agent: &'a AgentRecord,
     dispatch: &'a DispatchRecord,
     title: &'a str,
@@ -2887,6 +2953,14 @@ fn run_child_process(command: &mut Command, timeout_seconds: u64) -> Result<Proc
 
 fn build_common_prompt(context: RunnerPromptContext<'_>, adapter_hints: Option<&str>) -> String {
     let body = String::from_utf8_lossy(context.body);
+    let branch_instructions = context
+        .branch_ref
+        .map(|branch_ref| {
+            format!(
+                "\nWorkspace ref:\n- ref: {branch_ref}\n- When reporting, include `--workspace-ref \"$RIVE_WORKSPACE_REF\"`.\n"
+            )
+        })
+        .unwrap_or_default();
     let mut snapshot_instructions = String::new();
     if context.snapshot_paths.is_empty() {
         snapshot_instructions
@@ -2906,8 +2980,12 @@ fn build_common_prompt(context: RunnerPromptContext<'_>, adapter_hints: Option<&
     format!(
         r#"You are running inside a Rive dispatch.
 
-Workspace:
-- root: {workspace}
+Workspace contract:
+- editable_root: {active_workspace}
+- state_root: {state_workspace}
+- `$RIVE_WORKSPACE` points to editable_root. Make all source/artifact edits there.
+- `$RIVE_STATE_WORKSPACE` points to state_root. Use it only implicitly through `rive`/`team` commands.
+- Do not edit source files under state_root when editable_root differs.
 
 Agent:
 - id: {agent_id}
@@ -2922,18 +3000,22 @@ Rive protocol:
 - Use `team status --dispatch {dispatch_id} --snapshot <snapshot_id> --command-id <unique-id> --stdin` for progress updates. Status does not close the dispatch.
 - Use `team report --dispatch {dispatch_id} --status done|blocked|failed --snapshot <snapshot_id> --command-id <unique-id> --stdin` to close, block, or fail the dispatch.
 - Before report, capture evidence with `rive snapshot capture`.
+- If a workspace ref is provided, include it in the final `team report`.
 - A natural language final answer is not a Rive report.
 
+{branch_instructions}
 {snapshot_instructions}
 {adapter_hints}
 Task:
 {body}
 "#,
-        workspace = context.workspace.root.display(),
+        active_workspace = context.active_workspace.display(),
+        state_workspace = context.workspace.root.display(),
         agent_id = context.agent.agent_id,
         agent_name = context.agent.name,
         dispatch_id = context.dispatch.dispatch_id,
         title = context.title,
+        branch_instructions = branch_instructions,
         snapshot_instructions = snapshot_instructions,
         adapter_hints = adapter_hints,
         body = body,
@@ -3071,6 +3153,8 @@ pub fn build_prompt(
     build_common_prompt(
         RunnerPromptContext {
             workspace,
+            active_workspace: workspace.root.as_path(),
+            branch_ref: None,
             agent,
             dispatch,
             title,

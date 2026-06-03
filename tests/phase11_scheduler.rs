@@ -126,6 +126,45 @@ fn create_work(temp: &TempDir, command_id: &str, title: &str) -> String {
         .to_string()
 }
 
+fn create_work_with_body(temp: &TempDir, command_id: &str, title: &str, body: &str) -> String {
+    let mut command = rive_cmd();
+    command
+        .current_dir(temp.path())
+        .arg("work")
+        .arg("create")
+        .arg("--kind")
+        .arg("task")
+        .arg("--title")
+        .arg(title)
+        .arg("--command-id")
+        .arg(command_id)
+        .arg("--stdin");
+    let mut child = command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("command should spawn");
+    use std::io::Write;
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(body.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice::<Value>(&output.stdout).unwrap()["protocol"]["work_node_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 fn add_edge(temp: &TempDir, edge_type: &str, from: &str, to: &str, command_id: &str) {
     run_json(
         rive_cmd()
@@ -757,7 +796,12 @@ fn worktree_scheduler_uses_real_git_worktree_and_commit_applies_patch() {
     add_worker(&temp, "worker-a");
     add_worker(&temp, "worker-b");
     let root = create_work(&temp, "phase12-real-worktree-root", "root");
-    let a = create_work(&temp, "phase12-real-worktree-a", "A");
+    let a = create_work_with_body(
+        &temp,
+        "phase12-real-worktree-a",
+        "A",
+        "Body acceptance: write phase12 branch result only inside the active editable workspace.",
+    );
     add_edge(
         &temp,
         "decomposes-to",
@@ -782,16 +826,39 @@ fn worktree_scheduler_uses_real_git_worktree_and_commit_applies_patch() {
     let paths = fs::read_to_string(temp.path().join(".rive/phase12-branch-paths.txt")).unwrap();
     assert!(paths.contains(".rive/worktrees/"));
     let conn = Connection::open(temp.path().join(".rive/rive.db")).unwrap();
-    let (integration_id, branch_path, backend): (String, String, String) = conn
+    let (integration_id, branch_path, backend, worker_run_id, branch_ref): (
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = conn
         .query_row(
-            "select i.integration_id, b.branch_path, b.backend from branch_integrations i join branch_workspaces b on b.branch_id=i.branch_id order by i.created_at limit 1",
+            "select i.integration_id, b.branch_path, b.backend, sn.worker_run_id, b.branch_ref from branch_integrations i join branch_workspaces b on b.branch_id=i.branch_id join scheduler_node_runs sn on sn.dispatch_id=i.dispatch_id order by i.created_at limit 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .unwrap();
     assert_eq!(backend, "git-worktree");
     assert!(Path::new(&branch_path).exists());
     drop(conn);
+    let prompt = fs::read_to_string(
+        temp.path()
+            .join(".rive/debug/runs")
+            .join(&worker_run_id)
+            .join("prompt.txt"),
+    )
+    .unwrap();
+    let state_root = temp.path().canonicalize().unwrap();
+    assert!(prompt.contains(&format!("editable_root: {branch_path}")));
+    assert!(prompt.contains(&format!("state_root: {}", state_root.display())));
+    assert!(prompt.contains("Make all source/artifact edits there"));
+    assert!(prompt.contains("Use it only implicitly through `rive`/`team` commands"));
+    assert!(prompt.contains(
+        "Body acceptance: write phase12 branch result only inside the active editable workspace."
+    ));
+    assert!(prompt.contains(&format!("ref: {branch_ref}")));
+    assert!(prompt.contains("include `--workspace-ref \"$RIVE_WORKSPACE_REF\"`"));
 
     let commit = branch_commit_default(&temp, &integration_id, "phase12-real-worktree-commit");
     assert_eq!(commit["protocol"]["integration"]["state"], "committed");
