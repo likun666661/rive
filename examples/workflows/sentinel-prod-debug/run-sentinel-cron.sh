@@ -44,6 +44,7 @@ timeout_seconds="${RIVE_SENTINEL_TIMEOUT_SECONDS:-1800}"
 codex_bin="${CODEX_BIN:-/usr/local/bin/codex}"
 rive_bin="${RIVE_BIN:-rive}"
 sentinel_bin_dir="${SENTINEL_BIN_DIR:-$workspace/users/kunli/sentinel/cli/bin}"
+sentinel_skill_dir="${SENTINEL_SKILL_DIR:-$workspace/users/kunli/sentinel}"
 notify_slack="${RIVE_SENTINEL_NOTIFY_SLACK:-0}"
 slack_script="${SENTINEL_SLACK_SCRIPT:-$workspace/users/kunli/sentinel/slack-notify.sh}"
 report_base_url="${SENTINEL_REPORT_BASE_URL:-}"
@@ -51,6 +52,7 @@ allow_github_write="${RIVE_SENTINEL_ALLOW_GITHUB_WRITE:-false}"
 allow_slack_post="${RIVE_SENTINEL_ALLOW_SLACK_POST:-false}"
 resume_stale="${RIVE_SENTINEL_RESUME_STALE:-1}"
 
+export SENTINEL_SKILL_DIR="$sentinel_skill_dir"
 export PATH="$sentinel_bin_dir:$PATH"
 if [[ "$rive_bin" == */* ]]; then
   rive_bin_dir="$(dirname "$rive_bin")"
@@ -58,10 +60,12 @@ if [[ "$rive_bin" == */* ]]; then
 fi
 
 need_cmd "$rive_bin"
+need_cmd sentinel
 need_cmd jq
 need_cmd sqlite3
 [[ -x "$codex_bin" ]] || die "codex binary not executable: $codex_bin"
 [[ -d "$workspace" ]] || die "workspace does not exist: $workspace"
+[[ -f "$sentinel_skill_dir/SKILL.md" ]] || die "Sentinel skill not found: $sentinel_skill_dir/SKILL.md"
 
 cd "$workspace"
 

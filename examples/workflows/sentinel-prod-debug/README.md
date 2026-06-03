@@ -52,6 +52,7 @@ CODEX_BIN=/usr/local/bin/codex \
 RIVE_SENTINEL_WORKSPACE=/srv/mono-meta \
 RIVE_SENTINEL_WORKFLOW_PACKAGE=/opt/rive/examples/workflows/sentinel-prod-debug \
 RIVE_SENTINEL_WORKER=sentinel-codex-worker \
+SENTINEL_SKILL_DIR=/srv/mono-meta/users/kunli/sentinel \
 RIVE_SENTINEL_ENV=prd \
 RIVE_SENTINEL_SINCE=30m \
 RIVE_SENTINEL_SLACK_CHANNEL='#alerts' \
@@ -63,10 +64,20 @@ The wrapper:
 - initializes the Rive workspace if needed;
 - imports this workflow package if missing;
 - creates the configured worker agent if missing;
+- exports `SENTINEL_SKILL_DIR` and puts `sentinel` on `PATH`, so Codex workers can load the Sentinel skill and use the Sentinel CLI;
 - uses a lock directory under `.rive/run/` so cron cannot overlap runs;
 - starts or resumes a Codex-backed scheduler run;
 - waits for root Work DAG projection to finish;
 - locates the `final-judge-and-slack` artifact from the Rive ledger.
+
+The workflow prompts explicitly instruct workers to read:
+
+- `$SENTINEL_SKILL_DIR/SKILL.md`
+- `$SENTINEL_SKILL_DIR/sentinel-context.md`
+- `$SENTINEL_SKILL_DIR/sentinel-queries.md`
+- `$SENTINEL_SKILL_DIR/sentinel-code-debug-loop.md` for service investigation nodes
+
+This is intentional: the workflow should not rely on Codex discovering the Sentinel skill by accident.
 
 Slack notification is deterministic and disabled by default. The workflow itself still runs with `allow_slack_post=false`, so agents only produce a Slack draft. To send a real Slack message after Rive confirms root `done`, enable the outer notifier and provide a URL base for the final markdown artifact:
 

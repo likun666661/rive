@@ -13,6 +13,7 @@ CODEX_BIN=/usr/local/bin/codex
 RIVE_SENTINEL_WORKSPACE=/srv/mono-meta
 RIVE_SENTINEL_WORKFLOW_PACKAGE=/opt/rive/examples/workflows/sentinel-prod-debug
 RIVE_SENTINEL_WORKER=sentinel-codex-worker
+SENTINEL_SKILL_DIR=/srv/mono-meta/users/kunli/sentinel
 RIVE_SENTINEL_ENV=prd
 RIVE_SENTINEL_SINCE=30m
 RIVE_SENTINEL_SLACK_CHANNEL=#alerts
