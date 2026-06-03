@@ -32,7 +32,9 @@ use rive::work::{
     work_edge_protocol, work_node_protocol, AddWorkEdgeInput, CreateWorkNodeInput, WorkEdgeType,
     WorkNodeKind, WorkService, WorkStatusInput,
 };
-use rive::workflow::{WorkflowImportInput, WorkflowRunInput, WorkflowService};
+use rive::workflow::{
+    WorkflowImportInput, WorkflowRunInput, WorkflowSchedulerRequest, WorkflowService,
+};
 use rive::workspace::{find_workspace, init_workspace};
 
 #[derive(Parser)]
@@ -459,6 +461,20 @@ enum WorkflowCommands {
         command_id: String,
         #[arg(long = "no-scheduler")]
         no_scheduler: bool,
+        #[arg(long, default_value = "opencode")]
+        runner: String,
+        #[arg(long = "worker")]
+        workers: Vec<String>,
+        #[arg(long = "max-parallel", default_value_t = 1)]
+        max_parallel: usize,
+        #[arg(long = "acceptance-mode", default_value = "manual")]
+        acceptance_mode: String,
+        #[arg(long = "workspace-mode", default_value = "shared")]
+        workspace_mode: String,
+        #[arg(long = "opencode-bin")]
+        opencode_bin: Option<PathBuf>,
+        #[arg(long = "timeout-seconds", default_value_t = 300)]
+        timeout_seconds: u64,
     },
 }
 
@@ -1533,6 +1549,13 @@ fn run() -> Result<()> {
                 params,
                 command_id,
                 no_scheduler,
+                runner,
+                workers,
+                max_parallel,
+                acceptance_mode,
+                workspace_mode,
+                opencode_bin,
+                timeout_seconds,
             } => {
                 let workspace = find_workspace(&std::env::current_dir()?)
                     .map_err(|_| anyhow!("workspace not initialized"))?;
@@ -1540,16 +1563,97 @@ fn run() -> Result<()> {
                 store.init_schema()?;
                 let snapshot_store = LocalSnapshotStore::new(&workspace);
                 let service = WorkflowService::new(&workspace, &store, &snapshot_store);
-                let protocol = service.run(WorkflowRunInput {
+                let scheduler_request = if no_scheduler {
+                    None
+                } else {
+                    if runner != "opencode" {
+                        return Err(anyhow!("scheduler runner not supported: {runner}"));
+                    }
+                    if workers.is_empty() {
+                        return Err(anyhow!("scheduler worker is required"));
+                    }
+                    if max_parallel == 0 {
+                        return Err(anyhow!("scheduler max parallel must be greater than zero"));
+                    }
+                    if timeout_seconds == 0 {
+                        return Err(anyhow!("runner timeout must be greater than zero"));
+                    }
+                    if !matches!(
+                        acceptance_mode.as_str(),
+                        "manual" | "auto-reported" | "auto-committed"
+                    ) {
+                        return Err(anyhow!("invalid acceptance mode: {acceptance_mode}"));
+                    }
+                    if !matches!(workspace_mode.as_str(), "shared" | "worktree") {
+                        return Err(anyhow!("workspace mode not supported: {workspace_mode}"));
+                    }
+                    Some(WorkflowSchedulerRequest {
+                        runner,
+                        workers,
+                        max_parallel,
+                        acceptance_mode,
+                        workspace_mode,
+                        timeout_seconds,
+                        opencode_bin: opencode_bin.clone(),
+                    })
+                };
+                let mut protocol = service.run(WorkflowRunInput {
                     template_id,
-                    command_id,
+                    command_id: command_id.clone(),
                     params: parse_params(params)?,
-                    no_scheduler,
+                    scheduler_request: scheduler_request.clone(),
                 })?;
+                if let Some(request) = scheduler_request {
+                    if protocol.idempotency_status == "inserted" {
+                        let trace_store = DebugTraceStore::open(&workspace.db_path())?;
+                        trace_store.init_schema()?;
+                        let scheduler = SchedulerService::new(
+                            &workspace,
+                            &store,
+                            &trace_store,
+                            &snapshot_store,
+                        );
+                        let scheduler_command_id =
+                            format!("workflow:{}:scheduler", protocol.workflow_run_id);
+                        match scheduler.run(SchedulerRunInput {
+                            root_work_node_id: protocol.root_work_node_id.clone(),
+                            runner: request.runner,
+                            workers: request.workers,
+                            command_id: scheduler_command_id.clone(),
+                            max_parallel: request.max_parallel,
+                            acceptance_mode: request.acceptance_mode,
+                            workspace_mode: request.workspace_mode,
+                            opencode_bin: request.opencode_bin,
+                            timeout_seconds: request.timeout_seconds,
+                        }) {
+                            Ok(scheduler_protocol) => {
+                                protocol = service.attach_scheduler(
+                                    &protocol.workflow_run_id,
+                                    &scheduler_protocol.scheduler.scheduler_run_id,
+                                    &scheduler_protocol.scheduler.state,
+                                    "inserted",
+                                )?;
+                            }
+                            Err(err) => {
+                                if let Some(run) =
+                                    store.get_scheduler_run_by_command_id(&scheduler_command_id)?
+                                {
+                                    let _ = service.attach_scheduler(
+                                        &protocol.workflow_run_id,
+                                        &run.scheduler_run_id,
+                                        &run.state,
+                                        "inserted",
+                                    )?;
+                                }
+                                return Err(err);
+                            }
+                        }
+                    }
+                }
                 let display = serde_json::json!({
                     "summary": format!(
-                        "Workflow run {} instantiated root {}",
-                        protocol.workflow_run_id, protocol.root_work_node_id
+                        "Workflow run {} root {} state {}",
+                        protocol.workflow_run_id, protocol.root_work_node_id, protocol.state
                     ),
                 });
                 print_json(&Envelope::new(protocol, display))

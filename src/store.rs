@@ -536,6 +536,13 @@ pub struct InsertWorkflowRunInput {
 }
 
 #[derive(Debug, Clone)]
+pub struct UpdateWorkflowRunSchedulerInput {
+    pub workflow_run_id: String,
+    pub scheduler_run_id: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct InsertWorkflowRunNodeInput {
     pub workflow_run_id: String,
     pub node_template_id: String,
@@ -2960,6 +2967,23 @@ impl EventStore {
                 input.state,
                 input.created_at.to_rfc3339(),
             ],
+        )?;
+        self.get_workflow_run(&input.workflow_run_id)?
+            .ok_or_else(|| anyhow::anyhow!("workflow run not found: {}", input.workflow_run_id))
+    }
+
+    pub fn update_workflow_run_scheduler(
+        &self,
+        input: &UpdateWorkflowRunSchedulerInput,
+    ) -> Result<WorkflowRunRecord> {
+        self.conn.execute(
+            r#"
+            UPDATE workflow_runs
+            SET scheduler_run_id = ?2,
+                state = ?3
+            WHERE workflow_run_id = ?1
+            "#,
+            params![input.workflow_run_id, input.scheduler_run_id, input.state],
         )?;
         self.get_workflow_run(&input.workflow_run_id)?
             .ok_or_else(|| anyhow::anyhow!("workflow run not found: {}", input.workflow_run_id))

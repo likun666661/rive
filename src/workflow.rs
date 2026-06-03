@@ -12,8 +12,9 @@ use uuid::Uuid;
 use crate::snapshot::SnapshotStore;
 use crate::store::{
     EventStore, InsertWorkflowImportCommandInput, InsertWorkflowRunInput,
-    InsertWorkflowRunNodeInput, UpsertWorkflowTemplateInput, WorkflowRunNodeRecord,
-    WorkflowRunRecord, WorkflowTemplateRecord, WorkflowTemplateVersionRecord,
+    InsertWorkflowRunNodeInput, UpdateWorkflowRunSchedulerInput, UpsertWorkflowTemplateInput,
+    WorkflowRunNodeRecord, WorkflowRunRecord, WorkflowTemplateRecord,
+    WorkflowTemplateVersionRecord,
 };
 use crate::work::{
     AddWorkEdgeInput, BindWorkRootCommand, CreateWorkNodeInput, WorkEdgeType, WorkNodeKind,
@@ -136,8 +137,15 @@ pub struct WorkflowRunProtocol {
     pub root_work_node_id: String,
     pub state: String,
     pub idempotency_status: &'static str,
+    pub scheduler: Option<WorkflowRunSchedulerProtocol>,
     pub nodes: Vec<WorkflowRunNodeProtocol>,
     pub root_projection: WorkProjectionProtocol,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkflowRunSchedulerProtocol {
+    pub scheduler_run_id: String,
+    pub state: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -159,7 +167,18 @@ pub struct WorkflowRunInput {
     pub template_id: String,
     pub command_id: String,
     pub params: Vec<(String, String)>,
-    pub no_scheduler: bool,
+    pub scheduler_request: Option<WorkflowSchedulerRequest>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowSchedulerRequest {
+    pub runner: String,
+    pub workers: Vec<String>,
+    pub max_parallel: usize,
+    pub acceptance_mode: String,
+    pub workspace_mode: String,
+    pub timeout_seconds: u64,
+    pub opencode_bin: Option<PathBuf>,
 }
 
 pub struct WorkflowService<'a, B: SnapshotStore> {
@@ -269,11 +288,6 @@ impl<'a, B: SnapshotStore> WorkflowService<'a, B> {
         if input.command_id.trim().is_empty() {
             return Err(anyhow!("missing command id"));
         }
-        if !input.no_scheduler {
-            return Err(anyhow!(
-                "workflow scheduler execution not supported in MVP; use --no-scheduler"
-            ));
-        }
         self.store.init_work_schema()?;
         let version = self
             .store
@@ -282,7 +296,7 @@ impl<'a, B: SnapshotStore> WorkflowService<'a, B> {
         let spec = spec_from_version(&version)?;
         let params = resolve_params(&spec, &input.params)?;
         let params_hash = hash_json(&params)?;
-        let request_hash = request_hash_for_run(&version, &params_hash, input.no_scheduler);
+        let request_hash = request_hash_for_run(&version, &params_hash, &input.scheduler_request)?;
         if let Some(existing) = self
             .store
             .get_workflow_run_by_command_id(&input.command_id)?
@@ -385,6 +399,24 @@ impl<'a, B: SnapshotStore> WorkflowService<'a, B> {
         self.run_protocol(run, "inserted")
     }
 
+    pub fn attach_scheduler(
+        &self,
+        workflow_run_id: &str,
+        scheduler_run_id: &str,
+        state: &str,
+        idempotency_status: &'static str,
+    ) -> Result<WorkflowRunProtocol> {
+        self.store.init_work_schema()?;
+        let run = self
+            .store
+            .update_workflow_run_scheduler(&UpdateWorkflowRunSchedulerInput {
+                workflow_run_id: workflow_run_id.to_string(),
+                scheduler_run_id: scheduler_run_id.to_string(),
+                state: state.to_string(),
+            })?;
+        self.run_protocol(run, idempotency_status)
+    }
+
     fn run_protocol(
         &self,
         run: WorkflowRunRecord,
@@ -398,6 +430,16 @@ impl<'a, B: SnapshotStore> WorkflowService<'a, B> {
             .into_iter()
             .map(workflow_run_node_protocol)
             .collect();
+        let scheduler = if let Some(scheduler_run_id) = &run.scheduler_run_id {
+            self.store
+                .get_scheduler_run(scheduler_run_id)?
+                .map(|scheduler| WorkflowRunSchedulerProtocol {
+                    scheduler_run_id: scheduler.scheduler_run_id,
+                    state: scheduler.state,
+                })
+        } else {
+            None
+        };
         Ok(WorkflowRunProtocol {
             workflow_run_id: run.workflow_run_id,
             template_id: run.template_id,
@@ -407,6 +449,7 @@ impl<'a, B: SnapshotStore> WorkflowService<'a, B> {
             root_work_node_id: run.root_work_node_id,
             state: run.state,
             idempotency_status,
+            scheduler,
             nodes,
             root_projection,
         })
@@ -852,8 +895,8 @@ fn workflow_run_node_protocol(record: WorkflowRunNodeRecord) -> WorkflowRunNodeP
 fn request_hash_for_run(
     template: &WorkflowTemplateVersionRecord,
     params_hash: &str,
-    no_scheduler: bool,
-) -> String {
+    scheduler_request: &Option<WorkflowSchedulerRequest>,
+) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(template.template_id.as_bytes());
     hasher.update(b"\0");
@@ -863,8 +906,14 @@ fn request_hash_for_run(
     hasher.update(b"\0");
     hasher.update(params_hash.as_bytes());
     hasher.update(b"\0");
-    hasher.update(no_scheduler.to_string().as_bytes());
-    format!("sha256:{}", hex::encode(hasher.finalize()))
+    match scheduler_request {
+        Some(request) => {
+            hasher.update(b"with-scheduler\0");
+            hasher.update(serde_json::to_vec(request)?);
+        }
+        None => hasher.update(b"no-scheduler"),
+    }
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 fn hash_json(value: &Value) -> Result<String> {

@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -48,6 +49,46 @@ fn init_workspace() -> TempDir {
     let temp = TempDir::new().unwrap();
     run_json(rive_cmd().arg("init").arg(temp.path()));
     temp
+}
+
+fn add_worker(temp: &TempDir, name: &str) {
+    run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("agent")
+            .arg("add")
+            .arg(name)
+            .arg("--role")
+            .arg("worker")
+            .arg("--token")
+            .arg(format!("{name}-token")),
+    );
+}
+
+fn write_executable(path: &Path, content: &str) {
+    fs::write(path, content).unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+fn write_fake_opencode_reporter(path: &Path) {
+    write_executable(
+        path,
+        r#"#!/bin/sh
+set -eu
+STATE="${RIVE_STATE_WORKSPACE:-$RIVE_WORKSPACE}"
+COUNT_FILE="$STATE/workflow-scheduler-invocations.txt"
+if [ -f "$COUNT_FILE" ]; then COUNT=$(cat "$COUNT_FILE"); else COUNT=0; fi
+COUNT=$((COUNT + 1))
+printf '%s\n' "$COUNT" > "$COUNT_FILE"
+RESULT="$RIVE_WORKSPACE/workflow-node-$COUNT.txt"
+printf 'RIVE_WORKFLOW_NODE_%s_OK\n' "$COUNT" > "$RESULT"
+SNAPSHOT_ID=$(rive snapshot capture --path "$RESULT" --label workflow-fake-worker --agent "$RIVE_AGENT_ID" --dispatch "$RIVE_DISPATCH_ID" | sed -n 's/.*"snapshot_id": "\([^"]*\)".*/\1/p' | head -n 1)
+printf 'workflow fake worker done\n' | team report --dispatch "$RIVE_DISPATCH_ID" --status done --snapshot "$SNAPSHOT_ID" --artifact-ref "file:workflow-node-$COUNT.txt" --command-id "workflow-report-$RIVE_RUN_ID" --stdin >/dev/null
+printf '{"final":"RIVE_WORKFLOW_FAKE_OK"}\n'
+"#,
+    );
 }
 
 fn write_workflow_package(temp: &TempDir) -> std::path::PathBuf {
@@ -376,6 +417,119 @@ fn workflow_run_instantiates_work_graph_and_mapping_without_scheduler() {
             .arg("--no-scheduler"),
     );
     assert_eq!(conflict["protocol"]["code"], "idempotency_conflict");
+}
+
+#[test]
+fn workflow_run_can_execute_scheduler_and_replay_without_relaunch() {
+    let temp = init_workspace();
+    add_worker(&temp, "worker-a");
+    add_worker(&temp, "worker-b");
+    let package = write_workflow_package(&temp);
+    import_workflow(&temp, &package, "wf-import-scheduler");
+    let fake = temp.path().join("fake-opencode-workflow");
+    write_fake_opencode_reporter(&fake);
+
+    let run = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("workflow")
+            .arg("run")
+            .arg("test.workflow")
+            .arg("--param")
+            .arg("slack_channel=#alerts")
+            .arg("--command-id")
+            .arg("wf-run-scheduler")
+            .arg("--worker")
+            .arg("worker-a")
+            .arg("--max-parallel")
+            .arg("1")
+            .arg("--acceptance-mode")
+            .arg("auto-reported")
+            .arg("--opencode-bin")
+            .arg(&fake)
+            .arg("--timeout-seconds")
+            .arg("10"),
+    );
+    assert_eq!(run["protocol"]["idempotency_status"], "inserted");
+    assert_eq!(run["protocol"]["state"], "completed");
+    assert_eq!(run["protocol"]["root_projection"]["state"], "done");
+    assert_eq!(run["protocol"]["scheduler"]["state"], "completed");
+    assert_eq!(db_count(&temp, "workflow_runs"), 1);
+    assert_eq!(db_count(&temp, "scheduler_runs"), 1);
+    assert_eq!(db_count(&temp, "scheduler_node_runs"), 2);
+    assert_eq!(
+        fs::read_to_string(temp.path().join("workflow-scheduler-invocations.txt")).unwrap(),
+        "2\n"
+    );
+
+    let replay = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("workflow")
+            .arg("run")
+            .arg("test.workflow")
+            .arg("--param")
+            .arg("slack_channel=#alerts")
+            .arg("--command-id")
+            .arg("wf-run-scheduler")
+            .arg("--worker")
+            .arg("worker-a")
+            .arg("--max-parallel")
+            .arg("1")
+            .arg("--acceptance-mode")
+            .arg("auto-reported")
+            .arg("--opencode-bin")
+            .arg(&fake)
+            .arg("--timeout-seconds")
+            .arg("10"),
+    );
+    assert_eq!(replay["protocol"]["idempotency_status"], "replayed");
+    assert_eq!(replay["protocol"]["scheduler"]["state"], "completed");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("workflow-scheduler-invocations.txt")).unwrap(),
+        "2\n"
+    );
+
+    let conflict = run_json_expect_error(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("workflow")
+            .arg("run")
+            .arg("test.workflow")
+            .arg("--param")
+            .arg("slack_channel=#alerts")
+            .arg("--command-id")
+            .arg("wf-run-scheduler")
+            .arg("--worker")
+            .arg("worker-b")
+            .arg("--acceptance-mode")
+            .arg("auto-reported")
+            .arg("--opencode-bin")
+            .arg(&fake),
+    );
+    assert_eq!(conflict["protocol"]["code"], "idempotency_conflict");
+}
+
+#[test]
+fn workflow_scheduler_args_are_checked_before_instantiation() {
+    let temp = init_workspace();
+    let package = write_workflow_package(&temp);
+    import_workflow(&temp, &package, "wf-import-scheduler-args");
+    let error = run_json_expect_error(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("workflow")
+            .arg("run")
+            .arg("test.workflow")
+            .arg("--param")
+            .arg("slack_channel=#alerts")
+            .arg("--command-id")
+            .arg("wf-run-no-worker"),
+    );
+    assert_eq!(error["protocol"]["code"], "scheduler_worker_required");
+    assert_eq!(db_count(&temp, "workflow_runs"), 0);
+    assert_eq!(db_count(&temp, "work_nodes"), 0);
+    assert_eq!(db_count(&temp, "scheduler_runs"), 0);
 }
 
 #[test]
