@@ -1601,6 +1601,10 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
         ("workflow_graph_cycle", "fix_arguments")
     } else if lower.contains("workflow edge endpoint not found") {
         ("workflow_edge_endpoint_not_found", "fix_arguments")
+    } else if lower.contains("workflow consumes must be dependency predecessor")
+        || lower.contains("workflow consumes unknown node")
+    {
+        ("workflow_consumes_invalid", "fix_arguments")
     } else if lower.contains("workflow gated capability") {
         ("workflow_capability_gate_invalid", "fix_arguments")
     } else if lower.contains("workflow missing param") {

@@ -525,19 +525,13 @@ fn validate_spec(spec: &WorkflowSpec) -> Result<()> {
             ));
         }
         validate_gated_capabilities(spec, node_id, &node.capability_policy)?;
-        for consumed in &node.consumes {
-            if !spec.nodes.contains_key(consumed) {
-                return Err(anyhow!(
-                    "workflow consumes unknown node: {node_id} -> {consumed}"
-                ));
-            }
-        }
     }
     for edge in &spec.edges {
         WorkEdgeType::parse(&edge.edge_type)?;
         validate_endpoint(spec, &edge.from)?;
         validate_endpoint(spec, &edge.to)?;
     }
+    validate_consumes_dependencies(spec)?;
     ensure_dag(spec)?;
     Ok(())
 }
@@ -559,6 +553,69 @@ fn validate_endpoint(spec: &WorkflowSpec, endpoint: &str) -> Result<()> {
     } else {
         Err(anyhow!("workflow edge endpoint not found: {endpoint}"))
     }
+}
+
+fn validate_consumes_dependencies(spec: &WorkflowSpec) -> Result<()> {
+    let dependency_index = depends_on_adjacency(spec);
+    for (node_id, node) in &spec.nodes {
+        let dependency_closure = dependency_closure(node_id, &dependency_index)?;
+        for consumed in &node.consumes {
+            if !spec.nodes.contains_key(consumed) {
+                return Err(anyhow!(
+                    "workflow consumes unknown node: {node_id} -> {consumed}"
+                ));
+            }
+            if !dependency_closure.contains(consumed.as_str()) {
+                return Err(anyhow!(
+                    "workflow consumes must be dependency predecessor: {node_id} -> {consumed}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn depends_on_adjacency(spec: &WorkflowSpec) -> HashMap<&str, Vec<&str>> {
+    let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
+    for edge in &spec.edges {
+        if edge.edge_type.replace('-', "_") == "depends_on" {
+            adjacency
+                .entry(edge.from.as_str())
+                .or_default()
+                .push(edge.to.as_str());
+        }
+    }
+    adjacency
+}
+
+fn dependency_closure<'a>(
+    node_id: &'a str,
+    adjacency: &HashMap<&'a str, Vec<&'a str>>,
+) -> Result<HashSet<&'a str>> {
+    let mut closure = HashSet::new();
+    let mut visiting = HashSet::new();
+    fn visit<'a>(
+        node_id: &'a str,
+        adjacency: &HashMap<&'a str, Vec<&'a str>>,
+        closure: &mut HashSet<&'a str>,
+        visiting: &mut HashSet<&'a str>,
+    ) -> Result<()> {
+        if visiting.contains(node_id) {
+            return Err(anyhow!("workflow graph cycle"));
+        }
+        visiting.insert(node_id);
+        if let Some(dependencies) = adjacency.get(node_id) {
+            for dependency in dependencies {
+                if closure.insert(dependency) {
+                    visit(dependency, adjacency, closure, visiting)?;
+                }
+            }
+        }
+        visiting.remove(node_id);
+        Ok(())
+    }
+    visit(node_id, adjacency, &mut closure, &mut visiting)?;
+    Ok(closure)
 }
 
 fn validate_gated_capabilities(spec: &WorkflowSpec, node_id: &str, policy: &Value) -> Result<()> {

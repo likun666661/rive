@@ -110,6 +110,34 @@ edges:
     package
 }
 
+fn write_versioned_workflow(temp: &TempDir, version: i64, title: &str) -> std::path::PathBuf {
+    let path = temp.path().join(format!("versioned-{version}.yaml"));
+    fs::write(
+        &path,
+        format!(
+            r#"api_version: rive.workflow/v0
+id: versioned.workflow
+version: {version}
+title: {title}
+nodes:
+  only:
+    kind: task
+    title: Only v{version}
+    prompt:
+      inline: "Do one thing in v{version}."
+    output_contract:
+      format: markdown
+edges:
+  - type: decomposes_to
+    from: root
+    to: only
+"#
+        ),
+    )
+    .unwrap();
+    path
+}
+
 fn write_single_file_workflow(temp: &TempDir) -> std::path::PathBuf {
     let path = temp.path().join("single-workflow.yaml");
     fs::write(
@@ -422,6 +450,76 @@ edges:
         invalid_gate_error["protocol"]["code"],
         "workflow_capability_gate_invalid"
     );
+}
+
+#[test]
+fn workflow_consumes_must_be_dependency_predecessor() {
+    let temp = init_workspace();
+    let invalid = temp.path().join("invalid-consumes.yaml");
+    fs::write(
+        &invalid,
+        r#"api_version: rive.workflow/v0
+id: invalid.consumes
+version: 1
+title: Invalid consumes
+nodes:
+  producer:
+    kind: task
+    title: Producer
+    prompt:
+      inline: "Produce evidence."
+    output_contract:
+      format: markdown
+  judge:
+    kind: review
+    title: Judge
+    consumes: [producer]
+    prompt:
+      inline: "Judge producer output."
+    output_contract:
+      format: markdown
+edges:
+  - type: decomposes_to
+    from: root
+    to: producer
+  - type: decomposes_to
+    from: root
+    to: judge
+"#,
+    )
+    .unwrap();
+    let error = run_json_expect_error(rive_cmd().arg("workflow").arg("validate").arg(&invalid));
+    assert_eq!(error["protocol"]["code"], "workflow_consumes_invalid");
+}
+
+#[test]
+fn workflow_importing_old_version_does_not_move_latest_pointer_backwards() {
+    let temp = init_workspace();
+    let v2 = write_versioned_workflow(&temp, 2, "Version two");
+    let v1 = write_versioned_workflow(&temp, 1, "Version one");
+
+    let import_v2 = import_workflow(&temp, &v2, "import-versioned-v2");
+    assert_eq!(import_v2["protocol"]["version"], 2);
+    let import_v1 = import_workflow(&temp, &v1, "import-versioned-v1");
+    assert_eq!(import_v1["protocol"]["version"], 1);
+
+    let show_latest = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("workflow")
+            .arg("show")
+            .arg("versioned.workflow"),
+    );
+    assert_eq!(show_latest["protocol"]["version"], 2);
+    assert_eq!(show_latest["protocol"]["title"], "Version two");
+
+    let list = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("workflow")
+            .arg("list"),
+    );
+    assert_eq!(list["protocol"]["templates"][0]["latest_version"], 2);
 }
 
 #[test]

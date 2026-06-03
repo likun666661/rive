@@ -2730,28 +2730,47 @@ impl EventStore {
                 input.version
             ));
         }
+        let existing_template = self.get_workflow_template(&input.template_id)?;
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            r#"
-            INSERT INTO workflow_templates (
-              template_id, latest_version, latest_hash, title, source_ref, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-            ON CONFLICT(template_id) DO UPDATE SET
-              latest_version = excluded.latest_version,
-              latest_hash = excluded.latest_hash,
-              title = excluded.title,
-              source_ref = excluded.source_ref,
-              updated_at = excluded.updated_at
-            "#,
-            params![
-                input.template_id,
-                input.version,
-                input.template_hash,
-                input.title,
-                input.source_ref,
-                input.created_at.to_rfc3339(),
-            ],
-        )?;
+        if let Some(existing_template) = &existing_template {
+            if input.version >= existing_template.latest_version {
+                tx.execute(
+                    r#"
+                    UPDATE workflow_templates
+                    SET latest_version = ?2,
+                        latest_hash = ?3,
+                        title = ?4,
+                        source_ref = ?5,
+                        updated_at = ?6
+                    WHERE template_id = ?1
+                    "#,
+                    params![
+                        input.template_id,
+                        input.version,
+                        input.template_hash,
+                        input.title,
+                        input.source_ref,
+                        input.created_at.to_rfc3339(),
+                    ],
+                )?;
+            }
+        } else {
+            tx.execute(
+                r#"
+                INSERT INTO workflow_templates (
+                  template_id, latest_version, latest_hash, title, source_ref, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                "#,
+                params![
+                    input.template_id,
+                    input.version,
+                    input.template_hash,
+                    input.title,
+                    input.source_ref,
+                    input.created_at.to_rfc3339(),
+                ],
+            )?;
+        }
         tx.execute(
             r#"
             INSERT INTO workflow_template_versions (
