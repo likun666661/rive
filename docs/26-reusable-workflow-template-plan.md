@@ -287,6 +287,7 @@ final_judge depends_on online_recheck
 
 ```sh
 rive workflow validate <path>
+rive workflow import <path> --command-id <id>
 rive workflow register <path> --command-id <id>
 rive workflow list
 rive workflow show <template_id> [--version <n>]
@@ -310,7 +311,205 @@ sentinel-rive run --service jagent --since 1h
 
 这个垂直 CLI 不能绕过 Rive。它只负责准备参数，然后调用 `rive workflow run`。
 
-## 8. Ledger
+## 8. Workflow Import
+
+@kun-li 提出的关键简化是对的：一个可重复消费 workflow 的最小可重建资产，就是两类东西：
+
+```text
+1. workflow DAG
+   node ids / node kinds / edges / runner policy / acceptance policy
+
+2. node prompts
+   每个 node 的 prompt template / input params / upstream output usage / output contract
+```
+
+只保存这两个，理论上就能重建 workflow。但为了让导入后的 workflow 可重复、可审计、不会漂，需要把 prompt 挂到稳定的 `node_template_id` 上，并显式声明它依赖哪些参数和前序节点输出。
+
+### 8.1 Import Package
+
+支持两种导入形态。
+
+单文件：
+
+```text
+workflows/sentinel-prod-debug.yaml
+```
+
+目录包：
+
+```text
+workflows/sentinel-prod-debug/
+  workflow.yaml
+  prompts/
+    global-signal-scan.md
+    investigate-service.md
+    final-judge-and-slack.md
+```
+
+单文件适合小 workflow；目录包适合 prompt 很长、需要版本审阅的真实生产 workflow。
+
+### 8.2 Import Schema
+
+导入文件需要把 graph 和 prompts 绑定起来：
+
+```yaml
+api_version: rive.workflow/v0
+id: sentinel.prod-debug
+version: 1
+title: "Sentinel production debug workflow"
+
+params:
+  env:
+    type: enum
+    values: ["prd", "stg"]
+    default: "prd"
+  since:
+    type: duration
+    default: "1h"
+  slack_channel:
+    type: string
+    required: true
+  allow_github_write:
+    type: boolean
+    default: false
+  allow_slack_post:
+    type: boolean
+    default: false
+
+nodes:
+  global_signal_scan:
+    kind: task
+    runner: opencode
+    prompt:
+      inline: |
+        查 P0 alerts、golden signals、latency、error rate。
+        输出 incident window、受影响服务、证据链接和不确定性。
+    output_contract:
+      type: global_signal_scan
+      required_sections: ["signals", "evidence", "gaps"]
+
+  investigate_alva_backend:
+    kind: task
+    runner: opencode
+    prompt:
+      file: prompts/investigate-service.md
+      params:
+        service: "alva-backend"
+    capability_policy:
+      allow:
+        - "sentinel errors"
+        - "sentinel logs"
+        - "code.read"
+        - "github.read"
+      gated_allow:
+        github.issue.create: "{{allow_github_write}}"
+    output_contract:
+      type: service_investigation
+      required_sections: ["errors", "logs", "code_pivot", "issue_draft", "evidence", "gaps"]
+
+  final_judge_and_slack:
+    kind: review
+    runner: opencode
+    prompt:
+      file: prompts/final-judge-and-slack.md
+    consumes:
+      - global_signal_scan
+      - investigate_alva_backend
+      - investigate_alfs
+      - investigate_jagent
+      - investigate_alva_gateway
+    capability_policy:
+      allow:
+        - "slack.post"
+      gated_allow:
+        slack.post: "{{allow_slack_post}}"
+    output_contract:
+      type: incident_slack_report
+
+edges:
+  - type: decomposes_to
+    from: root
+    to: global_signal_scan
+  - type: decomposes_to
+    from: root
+    to: investigate_alva_backend
+  - type: decomposes_to
+    from: root
+    to: investigate_alfs
+  - type: decomposes_to
+    from: root
+    to: investigate_jagent
+  - type: decomposes_to
+    from: root
+    to: investigate_alva_gateway
+  - type: decomposes_to
+    from: root
+    to: final_judge_and_slack
+  - type: depends_on
+    from: final_judge_and_slack
+    to: global_signal_scan
+  - type: depends_on
+    from: final_judge_and_slack
+    to: investigate_alva_backend
+```
+
+导入时，Rive 应该把所有 prompt 文件内容纳入 `template_hash`。不能只 hash `workflow.yaml`，否则 prompt 改了但版本看起来没变。
+
+### 8.3 Import Validation
+
+`rive workflow import` 做这些检查：
+
+1. `api_version` 支持。
+2. `id`、`version`、node id 稳定且合法。
+3. 所有 prompt `file` 都存在。
+4. 所有 `edges.from/to` 都指向存在的 node 或 `root`。
+5. graph 是 DAG。
+6. `consumes` 只能引用 predecessor 或 reachable dependency。
+7. prompt declared params 都能从 workflow params 或 node-local params 解析。
+8. output contract 不为空。
+9. gated capability 的 gate 必须来自 boolean param。
+10. template hash 覆盖 workflow spec 和 prompt bytes。
+
+导入成功后写入 template registry。它不会立刻创建 Work DAG，也不会启动 runner：
+
+```text
+workflow package
+  -> validate
+  -> normalize
+  -> hash spec + prompts
+  -> workflow.template.registered
+  -> immutable workflow_template_version
+```
+
+### 8.4 Import vs Run
+
+这条边界要写硬：
+
+```text
+workflow import/register = 保存可复用模板
+workflow run             = 用参数实例化真实 Work DAG
+```
+
+导入不会产生 dispatch、fact、snapshot、branch ref、trace。运行才会产生这些 execution / evidence / debug record。
+
+### 8.5 Export Back to Package
+
+为了支持“先和 agent 临时编排，跑通后沉淀模板”，需要反向导出：
+
+```sh
+rive workflow export-template --root <root_work_node_id> --output workflows/debug-template/
+```
+
+它应该生成：
+
+```text
+workflow.yaml
+prompts/<node_template_id>.md
+```
+
+这一步生成的是 draft。人可以编辑、删减、抽参数，然后再 `rive workflow import`。
+
+## 9. Ledger
 
 Add workflow ledger/projection tables:
 
@@ -375,7 +574,7 @@ workflow_run.state =
 
 它不能依赖 stdout、final answer 或 debug trace。
 
-## 9. Instantiation Semantics
+## 10. Instantiation Semantics
 
 `rive workflow run` should:
 
@@ -397,7 +596,7 @@ workflow_run.state =
 - Template update creates a new version; it does not mutate old runs.
 - Workflow run id is stable enough to resume/status/report.
 
-## 10. Capability Policy
+## 11. Capability Policy
 
 Templates should not just store prompts. They should store what each node is allowed to do.
 
@@ -425,7 +624,7 @@ For Sentinel specifically:
 - judge nodes should not create new evidence except a synthesis report;
 - secrets must come from local config/env, never template files.
 
-## 11. Output Contract
+## 12. Output Contract
 
 Every reusable node needs a small output contract, otherwise reruns drift into prose.
 
@@ -447,7 +646,7 @@ output_contract:
 
 Runtime can initially check only that required refs exist and that the worker reported a snapshot/ref. Later an LLM judge or schema validator can check section-level quality.
 
-## 12. Template from Successful Run
+## 13. Template from Successful Run
 
 The most interesting loop is:
 
@@ -469,7 +668,7 @@ ad hoc successful DAG
 - usage/cost profile;
 - failure/retry history.
 
-## 13. Implementation Slices
+## 14. Implementation Slices
 
 ### Slice A: Template File and Validation
 
@@ -478,13 +677,15 @@ ad hoc successful DAG
 - Validate DAG acyclic.
 - Validate node ids and output contract shape.
 - Add `rive workflow validate`.
+- Support both single-file import and `workflow.yaml + prompts/*.md` package import.
+- Hash workflow spec plus prompt bytes into immutable `template_hash`.
 
 ### Slice B: Registry and Versioning
 
 - Add template registry ledger.
 - Add immutable template versions by hash.
 - Add `workflow.template.registered` event.
-- Add `rive workflow register/list/show`.
+- Add `rive workflow import/register/list/show`.
 
 ### Slice C: Instantiation to Work DAG
 
@@ -509,25 +710,29 @@ ad hoc successful DAG
 ### Slice F: Template from Run
 
 - Add `rive workflow propose-template --root <root>`.
+- Add `rive workflow export-template --root <root> --output <dir>`.
 - Export a draft YAML from an accepted DAG.
 - Keep it human-editable; do not auto-register without review.
 
-## 14. Acceptance Criteria
+## 15. Acceptance Criteria
 
 Phase 13 达到以下条件时才算有用：
 
 1. A workflow template can be validated and registered.
-2. A template run records exact template version/hash and params hash.
-3. Running the same template with the same command id is idempotent.
-4. Running the same template with different params creates a separate run.
-5. Instantiated Work DAG is inspectable before execution.
-6. Scheduler can execute a workflow run with existing OpenCode workers.
-7. Workflow success is derived from root Work DAG projection and output contracts.
-8. Trace/usage remain debug read models only.
-9. A Sentinel-style workflow can be expressed as a template.
-10. A successful ad hoc DAG can be exported as a draft reusable template.
+2. A workflow package can import DAG plus prompt files into an immutable template version.
+3. Changing any prompt changes `template_hash`.
+4. Import does not create dispatch/fact/snapshot/trace side effects.
+5. A template run records exact template version/hash and params hash.
+6. Running the same template with the same command id is idempotent.
+7. Running the same template with different params creates a separate run.
+8. Instantiated Work DAG is inspectable before execution.
+9. Scheduler can execute a workflow run with existing OpenCode workers.
+10. Workflow success is derived from root Work DAG projection and output contracts.
+11. Trace/usage remain debug read models only.
+12. A Sentinel-style workflow can be expressed as a template.
+13. A successful ad hoc DAG can be exported as a draft reusable template package.
 
-## 15. Product Boundary
+## 16. Product Boundary
 
 这个能力应该给用户这样的感觉：
 
