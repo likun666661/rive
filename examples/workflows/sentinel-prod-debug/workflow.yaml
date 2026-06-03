@@ -162,17 +162,17 @@ edges:
     from: root
     to: final-judge-and-slack
   - type: depends_on
-    from: global-signal-scan
-    to: final-judge-and-slack
+    from: final-judge-and-slack
+    to: global-signal-scan
   - type: depends_on
-    from: investigate-alva-backend
-    to: final-judge-and-slack
+    from: final-judge-and-slack
+    to: investigate-alva-backend
   - type: depends_on
-    from: investigate-alfs
-    to: final-judge-and-slack
+    from: final-judge-and-slack
+    to: investigate-alfs
   - type: depends_on
-    from: investigate-jagent
-    to: final-judge-and-slack
+    from: final-judge-and-slack
+    to: investigate-jagent
   - type: depends_on
-    from: investigate-alva-gateway
-    to: final-judge-and-slack
+    from: final-judge-and-slack
+    to: investigate-alva-gateway

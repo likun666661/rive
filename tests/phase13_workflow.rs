@@ -101,8 +101,8 @@ edges:
     from: root
     to: judge
   - type: depends_on
-    from: scan
-    to: judge
+    from: judge
+    to: scan
 "#,
     )
     .unwrap();
@@ -273,6 +273,48 @@ fn workflow_run_instantiates_work_graph_and_mapping_without_scheduler() {
     assert_eq!(db_count(&temp, "facts"), 0);
     assert_eq!(db_count(&temp, "snapshots"), 0);
 
+    let nodes = run["protocol"]["nodes"].as_array().unwrap();
+    let scan_work = nodes
+        .iter()
+        .find(|node| node["node_template_id"] == "scan")
+        .unwrap()["work_node_id"]
+        .as_str()
+        .unwrap();
+    let judge_work = nodes
+        .iter()
+        .find(|node| node["node_template_id"] == "judge")
+        .unwrap()["work_node_id"]
+        .as_str()
+        .unwrap();
+    let scan_projection = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("work")
+            .arg("inspect")
+            .arg(scan_work),
+    );
+    assert_eq!(scan_projection["protocol"]["projection"]["state"], "ready");
+    let judge_projection = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("work")
+            .arg("inspect")
+            .arg(judge_work),
+    );
+    assert_eq!(
+        judge_projection["protocol"]["projection"]["state"],
+        "blocked"
+    );
+    let missing = judge_projection["protocol"]["projection"]["missing_requirements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(missing
+        .iter()
+        .any(|requirement| *requirement == format!("dependency:{scan_work}")));
+
     let replay = run_json(
         rive_cmd()
             .current_dir(temp.path())
@@ -414,4 +456,48 @@ fn workflow_single_file_and_sentinel_example_validate() {
             .arg("--no-scheduler"),
     );
     assert_eq!(run["protocol"]["nodes"].as_array().unwrap().len(), 6);
+    let nodes = run["protocol"]["nodes"].as_array().unwrap();
+    let final_work = nodes
+        .iter()
+        .find(|node| node["node_template_id"] == "final-judge-and-slack")
+        .unwrap()["work_node_id"]
+        .as_str()
+        .unwrap();
+    let global_work = nodes
+        .iter()
+        .find(|node| node["node_template_id"] == "global-signal-scan")
+        .unwrap()["work_node_id"]
+        .as_str()
+        .unwrap();
+    let global_projection = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("work")
+            .arg("inspect")
+            .arg(global_work),
+    );
+    assert_eq!(
+        global_projection["protocol"]["projection"]["state"],
+        "ready"
+    );
+    let final_projection = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("work")
+            .arg("inspect")
+            .arg(final_work),
+    );
+    assert_eq!(
+        final_projection["protocol"]["projection"]["state"],
+        "blocked"
+    );
+    let missing = final_projection["protocol"]["projection"]["missing_requirements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(missing
+        .iter()
+        .any(|requirement| *requirement == format!("dependency:{global_work}")));
 }
