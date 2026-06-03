@@ -5,8 +5,11 @@ import "context"
 type BranchCondition[I any] func(ctx context.Context, input I) (string, error)
 
 type GraphBranch struct {
-	condition func(ctx context.Context, input any) (string, error)
-	branchMap map[string]bool
+	condition  func(ctx context.Context, input any) (string, error)
+	branchMap  map[string]bool
+	invoke     func(ctx context.Context, input any) ([]string, error)
+	endNodes   map[string]bool
+	noDataFlow bool
 }
 
 func NewGraphBranch[I any](condition BranchCondition[I], branchMap map[string]bool) *GraphBranch {

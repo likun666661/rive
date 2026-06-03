@@ -15,10 +15,12 @@ type channel interface {
 }
 
 type chanCall struct {
-	nodeKey  string
-	action   *composableRunnable
-	writeTo  map[string]bool
-	controls map[string]bool
+	nodeKey       string
+	action        *composableRunnable
+	writeTo       map[string]bool
+	controls      map[string]bool
+	fieldMappings map[string][]*FieldMapping
+	preHandlers   []handlerPair
 }
 
 type channelManager struct {
@@ -62,7 +64,7 @@ func (cm *channelManager) reportSkip(nodeKey string, targets map[string]bool) {
 func (cm *channelManager) getReadyChannels(exceptNode string) map[string]any {
 	ready := make(map[string]any)
 	for nodeKey, ch := range cm.channels {
-		if nodeKey == exceptNode {
+		if nodeKey == exceptNode || nodeKey == END {
 			continue
 		}
 		val, ok, err := ch.get()
