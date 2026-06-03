@@ -2,10 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
@@ -2000,7 +2003,13 @@ impl<'a, A: RunnerAdapter> RunnerCore<'a, A> {
                 workspace_override: None,
                 branch_ref: None,
             })?;
-            let output = run_child_process(&mut command, input.timeout_seconds)?;
+            let dispatch_id = dispatch.dispatch_id.clone();
+            let output = run_child_process_until_reported(
+                &mut command,
+                input.timeout_seconds,
+                self.event_store,
+                &dispatch_id,
+            )?;
             exit_code = output.exit_code;
             fs::write(&stdout_path, &output.stdout)?;
             fs::write(&stderr_path, &output.stderr)?;
@@ -2087,7 +2096,13 @@ impl<'a, A: RunnerAdapter> RunnerCore<'a, A> {
             workspace_override: input.workspace_override,
             branch_ref: input.branch_ref,
         })?;
-        let output = run_child_process(&mut command, input.timeout_seconds)?;
+        let dispatch_id = input.dispatch.dispatch_id.clone();
+        let output = run_child_process_until_reported(
+            &mut command,
+            input.timeout_seconds,
+            self.event_store,
+            &dispatch_id,
+        )?;
         fs::write(&stdout_path, &output.stdout)?;
         fs::write(&stderr_path, &output.stderr)?;
         if output.timed_out {
@@ -2985,6 +3000,35 @@ fn apply_common_env(command: &mut Command, input: &RunnerProcessInput<'_>) {
 }
 
 fn run_child_process(command: &mut Command, timeout_seconds: u64) -> Result<ProcessOutput> {
+    run_child_process_until(command, timeout_seconds, || Ok(false))
+}
+
+fn run_child_process_until_reported(
+    command: &mut Command,
+    timeout_seconds: u64,
+    event_store: &EventStore,
+    dispatch_id: &str,
+) -> Result<ProcessOutput> {
+    run_child_process_until(command, timeout_seconds, || {
+        let dispatch = event_store
+            .get_dispatch(dispatch_id)?
+            .ok_or_else(|| anyhow!("dispatch not found: {dispatch_id}"))?;
+        Ok(!matches!(dispatch.state, DispatchState::Open))
+    })
+}
+
+fn run_child_process_until<F>(
+    command: &mut Command,
+    timeout_seconds: u64,
+    mut should_stop: F,
+) -> Result<ProcessOutput>
+where
+    F: FnMut() -> Result<bool>,
+{
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
     let mut child = command.spawn().map_err(|err| {
         let program = command.get_program().to_string_lossy();
         if err.kind() == std::io::ErrorKind::NotFound {
@@ -3002,6 +3046,16 @@ fn run_child_process(command: &mut Command, timeout_seconds: u64) -> Result<Proc
     let started = Instant::now();
     let timeout = Duration::from_secs(timeout_seconds);
     loop {
+        if should_stop()? {
+            terminate_child(&mut child);
+            let output = child.wait_with_output()?;
+            return Ok(ProcessOutput {
+                exit_code: output.status.code().or(Some(0)),
+                stdout: output.stdout,
+                stderr: output.stderr,
+                timed_out: false,
+            });
+        }
         if child.try_wait()?.is_some() {
             let output = child.wait_with_output()?;
             return Ok(ProcessOutput {
@@ -3012,7 +3066,7 @@ fn run_child_process(command: &mut Command, timeout_seconds: u64) -> Result<Proc
             });
         }
         if started.elapsed() >= timeout {
-            let _ = child.kill();
+            terminate_child(&mut child);
             let output = child.wait_with_output()?;
             return Ok(ProcessOutput {
                 exit_code: output.status.code(),
@@ -3022,6 +3076,35 @@ fn run_child_process(command: &mut Command, timeout_seconds: u64) -> Result<Proc
             });
         }
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn terminate_child(child: &mut Child) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let process_group = format!("-{}", child.id());
+        let _ = Command::new("/bin/kill")
+            .arg("-TERM")
+            .arg(&process_group)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        thread::sleep(Duration::from_millis(200));
+        if matches!(child.try_wait(), Ok(None)) {
+            let _ = Command::new("/bin/kill")
+                .arg("-KILL")
+                .arg(&process_group)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
     }
 }
 

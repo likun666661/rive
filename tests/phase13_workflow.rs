@@ -114,6 +114,25 @@ printf '{"final":"RIVE_WORKFLOW_FAKE_CODEX_OK"}\n'
     );
 }
 
+fn write_fake_codex_reporter_then_hangs(path: &Path) {
+    write_executable(
+        path,
+        r#"#!/bin/sh
+set -eu
+STATE="${RIVE_STATE_WORKSPACE:-$RIVE_WORKSPACE}"
+COUNT_FILE="$STATE/workflow-codex-hanging-invocations.txt"
+if [ -f "$COUNT_FILE" ]; then COUNT=$(cat "$COUNT_FILE"); else COUNT=0; fi
+COUNT=$((COUNT + 1))
+printf '%s\n' "$COUNT" > "$COUNT_FILE"
+RESULT="$RIVE_WORKSPACE/workflow-codex-hanging-node-$COUNT.txt"
+printf 'RIVE_WORKFLOW_CODEX_HANGING_NODE_%s_OK\n' "$COUNT" > "$RESULT"
+SNAPSHOT_ID=$(rive snapshot capture --path "$RESULT" --label workflow-fake-codex-hanging-worker --agent "$RIVE_AGENT_ID" --dispatch "$RIVE_DISPATCH_ID" | sed -n 's/.*"snapshot_id": "\([^"]*\)".*/\1/p' | head -n 1)
+printf 'workflow fake codex worker reported before hanging\n' | team report --dispatch "$RIVE_DISPATCH_ID" --status done --snapshot "$SNAPSHOT_ID" --artifact-ref "file:workflow-codex-hanging-node-$COUNT.txt" --command-id "workflow-codex-hanging-report-$RIVE_RUN_ID" --stdin >/dev/null
+sleep 60
+"#,
+    );
+}
+
 fn write_workflow_package(temp: &TempDir) -> std::path::PathBuf {
     let package = temp.path().join("workflow-package");
     fs::create_dir_all(package.join("prompts")).unwrap();
@@ -233,6 +252,16 @@ fn db_count(temp: &TempDir, table: &str) -> i64 {
     conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
         row.get(0)
     })
+    .unwrap()
+}
+
+fn db_count_where(temp: &TempDir, table: &str, predicate: &str) -> i64 {
+    let conn = Connection::open(temp.path().join(".rive/rive.db")).unwrap();
+    conn.query_row(
+        &format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"),
+        [],
+        |row| row.get(0),
+    )
     .unwrap()
 }
 
@@ -536,6 +565,50 @@ fn workflow_run_can_execute_scheduler_and_replay_without_relaunch() {
             .arg(&fake),
     );
     assert_eq!(conflict["protocol"]["code"], "idempotency_conflict");
+}
+
+#[test]
+fn workflow_scheduler_stops_codex_child_after_report() {
+    let temp = init_workspace();
+    add_worker(&temp, "codex-worker");
+    let package = write_workflow_package(&temp);
+    import_workflow(&temp, &package, "wf-import-codex-hanging");
+    let fake = temp.path().join("fake-codex-hanging-workflow");
+    write_fake_codex_reporter_then_hangs(&fake);
+
+    let run = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("workflow")
+            .arg("run")
+            .arg("test.workflow")
+            .arg("--param")
+            .arg("slack_channel=#alerts")
+            .arg("--command-id")
+            .arg("wf-run-codex-hanging")
+            .arg("--runner")
+            .arg("codex")
+            .arg("--worker")
+            .arg("codex-worker")
+            .arg("--acceptance-mode")
+            .arg("auto-reported")
+            .arg("--codex-bin")
+            .arg(&fake)
+            .arg("--trust-project")
+            .arg("--timeout-seconds")
+            .arg("3"),
+    );
+
+    assert_eq!(run["protocol"]["state"], "completed");
+    assert_eq!(run["protocol"]["root_projection"]["state"], "done");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("workflow-codex-hanging-invocations.txt")).unwrap(),
+        "2\n"
+    );
+    assert_eq!(
+        db_count_where(&temp, "scheduler_node_runs", "state = 'accepted'"),
+        2
+    );
 }
 
 #[test]
