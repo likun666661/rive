@@ -23,6 +23,10 @@ type graph struct {
 	successors          map[string][]string
 	startNodes          []string
 	endNodes            []string
+
+	fieldMappingRecords map[string]map[string][]*FieldMapping
+	handlerPreNodes     map[string][]handlerPair
+	triggerMode         NodeTriggerMode
 }
 
 func newGraph(inputType, outputType string) *graph {
@@ -109,6 +113,50 @@ func (g *graph) AddBranch(key string, branch *GraphBranch) error {
 	return nil
 }
 
+func (g *graph) addEdgeWithMappings(fromNodeKey, toNodeKey string, noDirectDependency bool, isControl bool, mappings ...*FieldMapping) error {
+	if err := g.checkCompiled(); err != nil {
+		return err
+	}
+
+	if _, ok := g.nodes[fromNodeKey]; !ok && fromNodeKey != START {
+		return fmt.Errorf("%w: %s", ErrNodeNotFound, fromNodeKey)
+	}
+	if _, ok := g.nodes[toNodeKey]; !ok && toNodeKey != END {
+		return fmt.Errorf("%w: %s", ErrNodeNotFound, toNodeKey)
+	}
+
+	if isControl {
+		g.controlEdges[fromNodeKey] = append(g.controlEdges[fromNodeKey], toNodeKey)
+	} else {
+		g.dataEdges[fromNodeKey] = append(g.dataEdges[fromNodeKey], toNodeKey)
+		if !noDirectDependency {
+			g.controlEdges[fromNodeKey] = append(g.controlEdges[fromNodeKey], toNodeKey)
+		}
+	}
+
+	if len(mappings) > 0 {
+		if g.fieldMappingRecords == nil {
+			g.fieldMappingRecords = make(map[string]map[string][]*FieldMapping)
+		}
+		if g.fieldMappingRecords[fromNodeKey] == nil {
+			g.fieldMappingRecords[fromNodeKey] = make(map[string][]*FieldMapping)
+		}
+		g.fieldMappingRecords[fromNodeKey][toNodeKey] = append(
+			g.fieldMappingRecords[fromNodeKey][toNodeKey], mappings...)
+	}
+
+	return nil
+}
+
+func (g *graph) addBranch(fromNodeKey string, branch *GraphBranch, noDataFlow bool) error {
+	if err := g.checkCompiled(); err != nil {
+		return err
+	}
+	branch.noDataFlow = noDataFlow
+	g.branches[fromNodeKey] = append(g.branches[fromNodeKey], branch)
+	return nil
+}
+
 func (g *graph) compile(ctx context.Context) (*runner, error) {
 	if g.compiled {
 		for _, call := range g.chanSubscribeTo {
@@ -124,6 +172,9 @@ func (g *graph) compile(ctx context.Context) (*runner, error) {
 	compileOpts = newNodeCompileOptions()
 
 	runT := runTypePregel
+	if g.triggerMode == AllPredecessor {
+		runT = runTypeDAG
+	}
 	if g.graphInfo != nil && g.graphInfo.TriggerMode == AllPredecessor {
 		runT = runTypeDAG
 	}
@@ -137,23 +188,26 @@ func (g *graph) compile(ctx context.Context) (*runner, error) {
 			return nil, fmt.Errorf("compile node %s: %w", key, err)
 		}
 		g.chanSubscribeTo[key] = &chanCall{
-			nodeKey:  key,
-			action:   cr,
-			writeTo:  make(map[string]bool),
-			controls: make(map[string]bool),
+			nodeKey:       key,
+			action:        cr,
+			writeTo:       make(map[string]bool),
+			controls:      make(map[string]bool),
+			fieldMappings: make(map[string][]*FieldMapping),
 		}
 	}
 
 	g.chanSubscribeTo[START] = &chanCall{
-		nodeKey:  START,
-		writeTo:  make(map[string]bool),
-		controls: make(map[string]bool),
+		nodeKey:       START,
+		writeTo:       make(map[string]bool),
+		controls:      make(map[string]bool),
+		fieldMappings: make(map[string][]*FieldMapping),
 	}
 
 	g.chanSubscribeTo[END] = &chanCall{
-		nodeKey:  END,
-		writeTo:  make(map[string]bool),
-		controls: make(map[string]bool),
+		nodeKey:       END,
+		writeTo:       make(map[string]bool),
+		controls:      make(map[string]bool),
+		fieldMappings: make(map[string][]*FieldMapping),
 	}
 
 	for from, targets := range g.dataEdges {
@@ -180,6 +234,24 @@ func (g *graph) compile(ctx context.Context) (*runner, error) {
 		}
 	}
 
+	for fromNodeKey, toMap := range g.fieldMappingRecords {
+		fromCall, ok := g.chanSubscribeTo[fromNodeKey]
+		if !ok {
+			continue
+		}
+		for toNodeKey, mappings := range toMap {
+			fromCall.fieldMappings[toNodeKey] = append(fromCall.fieldMappings[toNodeKey], mappings...)
+		}
+	}
+
+	for nodeKey, handlers := range g.handlerPreNodes {
+		if cc, ok := g.chanSubscribeTo[nodeKey]; ok {
+			for _, h := range handlers {
+				cc.preHandlers = append(cc.preHandlers, h)
+			}
+		}
+	}
+
 	for startTarget := range g.chanSubscribeTo[START].writeTo {
 		g.startNodes = append(g.startNodes, startTarget)
 	}
@@ -201,6 +273,12 @@ func (g *graph) compile(ctx context.Context) (*runner, error) {
 			if !containsString(g.endNodes, nodeKey) {
 				g.endNodes = append(g.endNodes, nodeKey)
 			}
+		}
+	}
+
+	if _, ok := g.chanSubscribeTo[START].writeTo[END]; ok {
+		if !containsString(g.endNodes, START) {
+			g.endNodes = append(g.endNodes, START)
 		}
 	}
 

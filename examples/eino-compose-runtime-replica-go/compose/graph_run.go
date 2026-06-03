@@ -120,7 +120,19 @@ func (r *runner) initChannels(cm *channelManager) {
 }
 
 func (r *runner) routeInputToStartNodes(cm *channelManager, input any) {
+	startCall := r.chanSubscribeTo[START]
 	for _, startNode := range r.startNodes {
+		if startCall != nil {
+			if fms, ok := startCall.fieldMappings[startNode]; ok && len(fms) > 0 {
+				val, err := fieldMap(fms, false, nil)(input)
+				if err != nil {
+					continue
+				}
+				cm.updateValues(START, val, map[string]bool{startNode: true})
+				cm.updateDependencies(START, map[string]bool{startNode: true})
+				continue
+			}
+		}
 		cm.updateValues(START, input, map[string]bool{startNode: true})
 		cm.updateDependencies(START, map[string]bool{startNode: true})
 	}
@@ -161,7 +173,32 @@ func (r *runner) resolveCompletedTasks(cm *channelManager, completedTasks []*tas
 			continue
 		}
 
-		cm.updateValues(t.nodeKey, t.output, cc.writeTo)
+		output := t.output
+
+		for _, h := range cc.preHandlers {
+			var err error
+			output, err = h.invoke(output)
+			if err != nil {
+				continue
+			}
+		}
+
+		if len(cc.fieldMappings) > 0 {
+			for target := range cc.writeTo {
+				var val any = output
+				if fms, ok := cc.fieldMappings[target]; ok && len(fms) > 0 {
+					var err error
+					val, err = fieldMap(fms, false, nil)(output)
+					if err != nil {
+						continue
+					}
+				}
+				cm.updateValues(t.nodeKey, val, map[string]bool{target: true})
+			}
+		} else {
+			cm.updateValues(t.nodeKey, output, cc.writeTo)
+		}
+
 		cm.updateDependencies(t.nodeKey, cc.controls)
 
 		for branchTarget := range cc.writeTo {
