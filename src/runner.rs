@@ -1077,6 +1077,12 @@ impl<'a> SchedulerService<'a> {
             .reachable_nodes
             .into_iter()
             .collect::<BTreeSet<_>>();
+        let explicit_target_retry = target_work_node_id.is_some();
+        let include_reported_retry = include_failed
+            && (explicit_target_retry
+                || source_run
+                    .map(|source| matches!(source.state.as_str(), "failed" | "superseded"))
+                    .unwrap_or(false));
         let mut retry_nodes = BTreeMap::new();
         for node_id in reachable {
             if let Some(target) = target_work_node_id {
@@ -1092,7 +1098,10 @@ impl<'a> SchedulerService<'a> {
                     self.event_store
                         .list_scheduler_node_runs_for_work_node(&node_id)?
                         .into_iter()
-                        .filter(|run| run.state == "failed"),
+                        .filter(|run| {
+                            run.state == "failed"
+                                || (include_reported_retry && run.state == "reported")
+                        }),
                 );
                 attempts.sort_by_key(|run| run.started_at);
                 attempts.dedup_by(|a, b| a.node_run_id == b.node_run_id);
@@ -1106,6 +1115,30 @@ impl<'a> SchedulerService<'a> {
                 if let Some(dispatch_id) = &run.dispatch_id {
                     if let Some(dispatch) = self.event_store.get_dispatch(dispatch_id)? {
                         if matches!(dispatch.state, DispatchState::Reported) {
+                            let should_retry_reported = include_failed
+                                && (explicit_target_retry
+                                    || source_run
+                                        .map(|source| source.state == "failed")
+                                        .unwrap_or(false))
+                                && self.reported_dispatch_has_uncommitted_branch_integration(
+                                    &node_id,
+                                    &dispatch.dispatch_id,
+                                )?;
+                            if should_retry_reported {
+                                self.event_store.update_scheduler_node_run(
+                                    &UpdateSchedulerNodeRunInput {
+                                        node_run_id: run.node_run_id.clone(),
+                                        dispatch_id: run.dispatch_id.clone(),
+                                        worker_run_id: run.worker_run_id.clone(),
+                                        state: "superseded".to_string(),
+                                        completed_at: Some(Utc::now()),
+                                    },
+                                )?;
+                                if let Some(node) = self.event_store.get_work_node(&node_id)? {
+                                    retry_nodes.insert(node.work_node_id.clone(), node);
+                                }
+                                continue;
+                            }
                             self.event_store.update_scheduler_node_run(
                                 &UpdateSchedulerNodeRunInput {
                                     node_run_id: run.node_run_id.clone(),
@@ -1159,6 +1192,22 @@ impl<'a> SchedulerService<'a> {
             }
         }
         Ok(retry_nodes.into_values().collect())
+    }
+
+    fn reported_dispatch_has_uncommitted_branch_integration(
+        &self,
+        work_node_id: &str,
+        dispatch_id: &str,
+    ) -> Result<bool> {
+        Ok(self
+            .event_store
+            .list_branch_integrations()?
+            .into_iter()
+            .any(|integration| {
+                integration.work_node_id == work_node_id
+                    && integration.dispatch_id == dispatch_id
+                    && integration.state != "committed"
+            }))
     }
 
     fn execute_scheduler(

@@ -247,6 +247,65 @@ impl GitWorktreeBackend {
         }
         Ok(())
     }
+
+    fn seed_branch_with_parent_working_tree(
+        &self,
+        workspace: &Workspace,
+        branch_path: &Path,
+    ) -> Result<()> {
+        apply_deletions(branch_path, &workspace.root)?;
+        copy_tree(&workspace.root, branch_path, CopyMode::ParentToBranch)?;
+        self.run_git_checked(
+            branch_path,
+            [
+                "add",
+                "-A",
+                "--",
+                ".",
+                ":(exclude).opencode/**",
+                ":(exclude).rive/**",
+                ":(exclude)target/**",
+            ],
+            "worktree baseline failed",
+        )?;
+        let output = self.run_git(
+            branch_path,
+            [
+                "diff",
+                "--cached",
+                "--quiet",
+                "--",
+                ".",
+                ":(exclude).opencode/**",
+                ":(exclude).rive/**",
+                ":(exclude)target/**",
+            ],
+        )?;
+        if output.status.success() {
+            return Ok(());
+        }
+        if output.status.code() != Some(1) {
+            return Err(anyhow!(
+                "worktree baseline failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        self.run_git_checked(
+            branch_path,
+            [
+                "-c",
+                "user.name=Rive",
+                "-c",
+                "user.email=rive@example.invalid",
+                "commit",
+                "--no-gpg-sign",
+                "--no-verify",
+                "-m",
+                "rive branch baseline",
+            ],
+            "worktree baseline failed",
+        )
+    }
 }
 
 impl BranchWorkspaceBackend for GitWorktreeBackend {
@@ -288,6 +347,7 @@ impl BranchWorkspaceBackend for GitWorktreeBackend {
             ],
             "worktree create failed",
         )?;
+        self.seed_branch_with_parent_working_tree(workspace, &branch_path)?;
         Ok(BranchWorkspace {
             branch_id,
             backend: self.backend_name().to_string(),
@@ -311,8 +371,32 @@ impl BranchWorkspaceBackend for GitWorktreeBackend {
         if !branch_path.is_dir() {
             return Err(anyhow!("worktree not found: {}", branch.branch_id));
         }
-        self.run_git_checked(&branch_path, ["add", "-N", "."], "worktree diff failed")?;
-        let changed_output = self.run_git(&branch_path, ["diff", "--name-only", "HEAD"])?;
+        self.run_git_checked(
+            &branch_path,
+            [
+                "add",
+                "-N",
+                "--",
+                ".",
+                ":(exclude).opencode/**",
+                ":(exclude).rive/**",
+                ":(exclude)target/**",
+            ],
+            "worktree diff failed",
+        )?;
+        let changed_output = self.run_git(
+            &branch_path,
+            [
+                "diff",
+                "--name-only",
+                "HEAD",
+                "--",
+                ".",
+                ":(exclude).opencode/**",
+                ":(exclude).rive/**",
+                ":(exclude)target/**",
+            ],
+        )?;
         if !changed_output.status.success() {
             return Err(anyhow!(
                 "worktree diff failed: {}",
@@ -328,7 +412,19 @@ impl BranchWorkspaceBackend for GitWorktreeBackend {
         changed_files.sort();
         changed_files.dedup();
 
-        let patch_output = self.run_git(&branch_path, ["diff", "--binary", "HEAD"])?;
+        let patch_output = self.run_git(
+            &branch_path,
+            [
+                "diff",
+                "--binary",
+                "HEAD",
+                "--",
+                ".",
+                ":(exclude).opencode/**",
+                ":(exclude).rive/**",
+                ":(exclude)target/**",
+            ],
+        )?;
         if !patch_output.status.success() {
             return Err(anyhow!(
                 "worktree diff failed: {}",
@@ -817,8 +913,8 @@ fn copy_tree(src: &Path, dst: &Path, mode: CopyMode) -> Result<()> {
 fn should_skip(rel: &str, mode: &CopyMode) -> bool {
     let first = rel.split('/').next().unwrap_or("");
     match mode {
-        CopyMode::ParentToBranch => matches!(first, ".rive" | ".git" | "target"),
-        CopyMode::BranchToParent => matches!(first, ".rive" | ".git" | "target"),
+        CopyMode::ParentToBranch => matches!(first, ".rive" | ".git" | ".opencode" | "target"),
+        CopyMode::BranchToParent => matches!(first, ".rive" | ".git" | ".opencode" | "target"),
     }
 }
 

@@ -1002,6 +1002,62 @@ fn worktree_scheduler_uses_real_git_worktree_and_commit_applies_patch() {
 }
 
 #[test]
+fn worktree_branch_starts_from_current_parent_workspace_state() {
+    let temp = init_git_workspace();
+    fs::write(
+        temp.path().join("accepted-parent.txt"),
+        "accepted upstream\n",
+    )
+    .unwrap();
+    add_worker(&temp, "worker-a");
+    add_worker(&temp, "worker-b");
+    let root = create_work(&temp, "phase16-worktree-baseline-root", "root");
+    let a = create_work(
+        &temp,
+        "phase16-worktree-baseline-a",
+        "A sees accepted parent state",
+    );
+    add_edge(
+        &temp,
+        "decomposes-to",
+        &root,
+        &a,
+        "edge-phase16-worktree-baseline-root-a",
+    );
+    let fake = temp.path().join("fake-opencode-worktree-baseline");
+    let rive_bin = env!("CARGO_BIN_EXE_rive");
+    let team_bin = env!("CARGO_BIN_EXE_team");
+    write_executable(
+        &fake,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+test -f "$RIVE_WORKSPACE/accepted-parent.txt"
+cat "$RIVE_WORKSPACE/accepted-parent.txt" > "$RIVE_WORKSPACE/worker-output.txt"
+SNAPSHOT_ID=$("{rive_bin}" snapshot capture --path "$RIVE_WORKSPACE/worker-output.txt" --label phase16-worktree-baseline --agent "$RIVE_AGENT_ID" --dispatch "$RIVE_DISPATCH_ID" | sed -n 's/.*"snapshot_id": "\([^"]*\)".*/\1/p' | head -n 1)
+printf 'baseline worker done\n' | "{team_bin}" report --dispatch "$RIVE_DISPATCH_ID" --status done --snapshot "$SNAPSHOT_ID" --workspace-ref "$RIVE_WORKSPACE_REF" --command-id "phase16-baseline-report-$RIVE_RUN_ID" --stdin >/dev/null
+"#
+        ),
+    );
+
+    let mut command = scheduler_command_with_mode(
+        &temp,
+        &fake,
+        &root,
+        "phase16-worktree-baseline",
+        "auto-committed",
+    );
+    command.arg("--workspace-mode").arg("worktree");
+    let response = run_json(&mut command);
+    assert_eq!(response["protocol"]["scheduler"]["state"], "completed");
+    assert_eq!(response["protocol"]["root_work"]["state"], "done");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("worker-output.txt")).unwrap(),
+        "accepted upstream\n"
+    );
+}
+
+#[test]
 fn branch_scheduler_real_backend_missing_is_stable_error() {
     let temp = init_workspace();
     add_worker(&temp, "worker-a");
