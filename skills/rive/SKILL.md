@@ -1,35 +1,89 @@
 ---
 name: rive
-description: Use Rive to coordinate local multi-agent software work through ledger-backed Work DAGs and external CLI agents. Use when an agent should translate a user objective into a Work DAG, run OpenCode/Codex workers in parallel, isolate worker file changes with git worktrees, resume scheduler runs, inspect trace/usage, or review worker outputs instead of solving everything in one agent session.
+description: Use Rive to coordinate local multi-agent software work through ledger-backed Work DAGs, reusable workflow templates, OpenCode/Codex runners, git-worktree isolation, scheduler resume/retry, conflict inspection, failure classification, and debug trace/usage. Use when an agent should plan a DAG, run bounded worker pools, preserve artifacts and refs, recover failed nodes, or repeat a workflow instead of solving everything in one session.
 ---
 
 # Rive
 
-Rive is a local-first agent team runtime. Treat it as a durable coordination system, not as chat: the Work DAG, dispatch ledger, facts, snapshots, worktree refs, scheduler runs, and debug traces each have different authority.
+Rive is a local-first runtime for multi-agent engineering work. Treat it as a
+durable coordination system, not as chat: Work DAGs, workflow templates,
+dispatches, facts, snapshots, worktree refs, scheduler runs, and debug traces
+each have different authority.
 
-## Hard Rules
+## Core Rules
 
-- Only Rive ledger/projection state counts as protocol truth. Do not infer success from stdout, final answers, or debug trace.
-- Work topology is semantic work structure. Dispatches, delegations, scheduler node runs, and external CLI processes are execution attempts, not graph edges.
-- `team report --status done` makes a work node `reviewable`; it does not make the node `done`.
-- A node becomes `done` only through an explicit accept event, either `rive work accept` or a scheduler acceptance policy.
-- In worktree mode, worker changes remain isolated until `rive branch commit` or scheduler `auto-committed` applies the worktree patch.
-- Debug trace and usage are for diagnosis and cost inspection only. They must not drive work, dispatch, fact, or evidence state.
-- Prefer OpenCode as the production runner unless the task explicitly needs Codex coverage.
+- Only Rive ledger/projection state counts as protocol truth. Do not infer
+  success from stdout, final answers, or debug trace.
+- Work DAG topology is semantic work structure. Dispatches, delegations,
+  scheduler node runs, and external CLI processes are execution attempts, not
+  graph edges.
+- `team report --status done` makes a work node `reviewable`; it does not make
+  the node `done`.
+- A node becomes `done` only through explicit acceptance: `rive work accept`, a
+  scheduler acceptance policy, or a workflow run that delegates to that policy.
+- In worktree mode, worker file changes stay isolated until `rive branch commit`
+  or scheduler `auto-committed` applies the patch.
+- Debug trace and usage are diagnostic only. They must never drive work,
+  dispatch, fact, evidence, branch, scheduler, or workflow state.
+- Prefer OpenCode for low-cost production worker pools. Use Codex when the task
+  requires Codex coverage, Codex-specific behavior, or the user explicitly asks.
+- Do not manually edit SQLite or patch around Rive state. Use retry, resume,
+  branch, work, and workflow commands.
+
+## Capability Map
+
+Use this map to choose the right layer.
+
+- Evidence and facts:
+  - `rive snapshot capture/list/show`
+  - `rive evidence list`
+  - `team fact record`
+  - `rive fact list/show`
+- Agents, dispatches, and agent-facing completion:
+  - `rive agent add/list/show`
+  - `rive dispatch create/list/show/cancel`
+  - `team status`, `team report`, `team list`
+- Debug trace and cost inspection:
+  - `rive debug trace ingest/list/show/session/export/install/uninstall`
+  - `rive debug trace usage`
+- Runners:
+  - `rive runner opencode`
+  - `rive runner codex`
+  - `rive runner orchestrator --runner opencode`
+- Work DAG:
+  - `rive work create/list/show/inspect/edge add/accept/reopen/retry`
+  - `rive work graph inspect`
+  - `team work create/edge/list/show/inspect/note`
+- Delegation:
+  - `team send --wait`
+  - `team send --work <work_id> --wait`
+- Scheduler:
+  - `rive scheduler run/status/resume`
+  - `rive scheduler resume --failed`
+- Worktree refs and conflicts:
+  - `rive branch list/show/commit/abort/reject`
+  - `rive branch conflict show/reject`
+- Reusable workflows:
+  - `rive workflow validate/import/list/show/run/status`
+  - workflow packages can be a single `workflow.yaml` or a directory with
+    `workflow.yaml` plus `prompts/*.md`
 
 ## When to Use Rive
 
-Use Rive when the request benefits from multiple coordinated agents:
+Use Rive when the request benefits from durable multi-agent coordination:
 
-- parallel investigation, such as logs plus code search;
-- implementation plus independent review or validation;
-- multiple ready tasks that can run concurrently;
-- long work that may need `scheduler status` / `scheduler resume`;
-- tasks where worker patches must be isolated and explicitly integrated.
+- parallel investigation, such as logs plus code search plus final judge;
+- implementation plus independent review, test, changelog, and merge nodes;
+- long-running work that may need `scheduler status`, `scheduler resume`, or
+  `work retry`;
+- repeated operational workflows that should become one-command templates;
+- tasks where worker patches must be isolated and explicitly integrated;
+- dogfood where trace, artifact refs, and retry history matter.
 
-Do not use Rive for a tiny single-file edit that one agent can finish faster without orchestration.
+Do not use Rive for a tiny one-agent edit that is faster and clearer without
+orchestration.
 
-## Startup
+## Setup
 
 Work from the repository root.
 
@@ -37,24 +91,28 @@ Work from the repository root.
 rive init .
 ```
 
-Add worker agents if the workspace does not already have them. Store generated or chosen tokens securely; Rive stores token hashes and later issues run-scoped worker tokens.
+Add worker agents when the workspace does not already have them. Rive stores
+token hashes and later issues run-scoped worker tokens.
 
 ```sh
 rive agent add opencode-worker-a --role worker
 rive agent add opencode-worker-b --role worker
+rive agent add codex-worker-a --role worker
 ```
 
-Use git worktree isolation for production worker file mutations:
+For production file mutation, prefer git worktree isolation:
 
 ```text
 --workspace-mode worktree
 ```
 
-Use shared workspace mode only for controlled smoke tests or read-only flows.
+Use shared workspace mode only for controlled smoke tests, read-only flows, or
+cases where the user intentionally wants all workers in the same tree.
 
-## Plan the Work DAG
+## Plan a Work DAG
 
-Create a small DAG that a human can inspect. Nodes should represent goals and acceptance criteria, not process attempts.
+Create a small DAG that a human can inspect. Nodes should represent goals and
+acceptance criteria, not process attempts.
 
 Common shape:
 
@@ -72,16 +130,18 @@ Rules:
 - Keep the graph acyclic.
 - Use `decomposes-to` for parent-to-child structure.
 - Use `depends-on` from the blocked node to its prerequisite.
-- Use review or judge nodes when results from multiple workers need synthesis.
-- Keep node titles actionable and acceptance-oriented.
+- Prefer narrow worker nodes with concrete artifact expectations.
+- Use judge/review nodes when multiple worker outputs need synthesis.
+- Avoid a giant synthesis node unless it can itself use Rive to spawn another
+  DAG; otherwise its context window becomes the bottleneck.
 
-Create nodes and edges with idempotent command IDs:
+Example:
 
 ```sh
-rive work create --kind objective --title "Fix production checkout bug" --command-id plan-root-1
-rive work create --kind task --title "Inspect production logs for checkout failures" --command-id plan-logs-1
-rive work create --kind task --title "Inspect code path for checkout failures" --command-id plan-code-1
-rive work create --kind review --title "Compare log and code findings, decide fix" --command-id plan-judge-1
+rive work create --kind objective --title "Diagnose checkout bug" --command-id plan-root-1
+rive work create --kind task --title "Inspect production logs" --command-id plan-logs-1
+rive work create --kind task --title "Inspect checkout code path" --command-id plan-code-1
+rive work create --kind review --title "Judge log and code findings" --command-id plan-judge-1
 
 rive work edge add --type decomposes-to --from <root> --to <logs_node> --command-id edge-root-logs-1
 rive work edge add --type decomposes-to --from <root> --to <code_node> --command-id edge-root-code-1
@@ -99,7 +159,7 @@ rive work inspect <node>
 
 ## Run the Scheduler
 
-For most real work, let the scheduler run ready nodes with a bounded OpenCode worker pool.
+For most real work, run ready nodes with a bounded worker pool.
 
 Manual review mode:
 
@@ -116,7 +176,7 @@ rive scheduler run \
   --timeout-seconds 900
 ```
 
-Automation mode that integrates reported worktree patches and accepts nodes:
+Automation mode that applies reported worktree patches and accepts nodes:
 
 ```sh
 rive scheduler run \
@@ -131,7 +191,23 @@ rive scheduler run \
   --timeout-seconds 900
 ```
 
-Interpret scheduler results from `protocol`, not display text. If the run stops:
+Codex scheduler runs are also supported:
+
+```sh
+rive scheduler run \
+  --root <root> \
+  --runner codex \
+  --worker codex-worker-a \
+  --command-id sched-<objective>-codex-1 \
+  --workspace-mode worktree \
+  --trust-project \
+  --timeout-seconds 900
+```
+
+Codex uses an isolated per-run `CODEX_HOME` and must not mutate global
+`~/.codex/config.toml`.
+
+Interpret scheduler results from `protocol`, not display text:
 
 ```sh
 rive scheduler status --root <root>
@@ -139,23 +215,72 @@ rive scheduler status --run <scheduler_run_id>
 rive work graph inspect --root <root>
 ```
 
-Resume stale or incomplete scheduler work with the same workers and a new command ID:
+## Reusable Workflow Templates
+
+Use workflows when a successful DAG should be repeated later with one command.
+A workflow package is the durable product asset:
+
+```text
+workflow.yaml
+prompts/<node_template_id>.md
+```
+
+Important semantics:
+
+- `workflow import` registers an immutable template version and has zero business
+  side effects.
+- `template_hash` covers the normalized workflow spec and prompt bytes.
+- If prompt bytes changed, import with `--bump-if-changed`; do not assume editing
+  a prompt mutates an existing version.
+- `workflow run --no-scheduler` instantiates the Work DAG only.
+- Plain `workflow run` instantiates the Work DAG, starts the scheduler, records
+  `workflow_runs.scheduler_run_id`, and returns effective state.
+- Use `workflow status --run` for effective state and debug refs; do not read raw
+  `workflow_runs.state` directly.
+
+Typical package flow:
 
 ```sh
-rive scheduler resume \
-  --run <scheduler_run_id> \
-  --worker opencode-worker-a \
-  --worker opencode-worker-b \
-  --command-id resume-<objective>-1 \
-  --max-parallel 2 \
-  --acceptance-mode manual \
-  --workspace-mode worktree \
-  --timeout-seconds 900
+rive workflow validate examples/workflows/sentinel-prod-debug
+rive workflow import examples/workflows/sentinel-prod-debug \
+  --command-id workflow-import-sentinel-$(date +%Y%m%d%H%M%S) \
+  --bump-if-changed
+
+rive workflow run sentinel.prod-debug \
+  --param env=prd \
+  --param window=1h \
+  --param slack_channel=dry-run \
+  --command-id sentinel-prod-debug-$(date +%Y%m%d%H%M%S) \
+  --runner codex \
+  --worker codex-worker-a \
+  --max-parallel 3 \
+  --acceptance-mode auto-reported \
+  --workspace-mode shared \
+  --trust-project \
+  --timeout-seconds 1800
+
+rive workflow status --run <workflow_run_id>
 ```
+
+The Sentinel example in `examples/workflows/sentinel-prod-debug/` models:
+global signal scan, parallel service investigations for `alva-backend`,
+`alfs`, `jagent`, and `alva-gateway`, then a final judge/Slack draft node.
+GitHub and Slack side effects are gated/dry-run by default.
+
+For cron or VM automation, use an external wrapper example rather than baking
+product-specific policy into Rive:
+
+```text
+examples/workflows/sentinel-prod-debug/run-sentinel-cron.sh
+examples/workflows/sentinel-prod-debug/crontab.example
+```
+
+The wrapper should reconcile templates with `--bump-if-changed`, check
+`workflow status --run`, resume incomplete runs, and avoid overlapping runs.
 
 ## Review and Integrate Worker Output
 
-Manual mode leaves reported worker output in `reviewable` state with a pending integration.
+Manual mode leaves worker output in `reviewable` with pending refs.
 
 Inspect work and integrations:
 
@@ -165,25 +290,83 @@ rive branch list
 rive branch show <integration_id>
 ```
 
-Commit a worktree ref into the parent workspace, then accept the node:
+Commit a worktree ref into the parent workspace, then accept:
 
 ```sh
 rive branch commit <integration_id> --command-id commit-<node>-1
 rive work accept <node> --require-committed-branch --command-id accept-<node>-1
 ```
 
-Reject or abort bad output explicitly:
+Reject or abort explicitly:
 
 ```sh
 printf '%s\n' "Reason for rejection" | rive branch reject <integration_id> --command-id reject-<node>-1 --stdin
 rive branch abort <integration_id> --command-id abort-<node>-1
 ```
 
-Never manually `git apply`, merge, remove worktrees, or treat a worker's natural-language summary as integration. Rive owns integration events.
+If patch application conflicts, inspect the structured conflict. Parent files
+must not be half-applied.
+
+```sh
+rive branch conflict show <conflict_id>
+printf '%s\n' "Reject conflicting worker patch" | rive branch conflict reject <conflict_id> \
+  --command-id reject-conflict-<node>-1 \
+  --stdin
+```
+
+Use the conflict record to decide between `reject`, retrying from current
+parent, or manually inspecting the worktree path. Do not hide conflict handling
+inside a worker summary.
+
+## Retry and Resume
+
+Use Phase 16 recovery commands instead of manual SQL or ad hoc dispatch edits.
+
+Retry a failed scheduler run and only rerun failed/active attempts:
+
+```sh
+rive scheduler resume \
+  --run <scheduler_run_id> \
+  --failed \
+  --worker opencode-worker-a \
+  --worker opencode-worker-b \
+  --command-id resume-failed-<objective>-1 \
+  --max-parallel 2 \
+  --acceptance-mode auto-committed \
+  --workspace-mode worktree \
+  --timeout-seconds 900
+```
+
+Retry a single work node:
+
+```sh
+rive work retry <work_node_id> \
+  --worker opencode-worker-a \
+  --command-id retry-<work_node_id>-1 \
+  --acceptance-mode manual \
+  --workspace-mode worktree \
+  --timeout-seconds 900
+```
+
+Recovery semantics:
+
+- stale failed/active attempts are marked `superseded`;
+- old open/blocked dispatches are cancelled;
+- failure trace and refs remain inspectable;
+- replay of the retry command does not start another child process.
+
+Failure records include `failure_kind`, `retryable`, `suggested_action`, and
+`detail`. Common kinds include `certificate_error`, `network_error`,
+`model_error`, `binary_not_found`, `timeout`, `process_exit`,
+`dispatch_not_reported`, and `worktree_patch_conflict`.
+
+Runner stdout/stderr can enrich failure diagnosis, especially no-report
+environment errors, but it still never counts as success.
 
 ## Agent-Facing Delegation
 
-Inside an orchestrator run, use `team send --work` only when direct delegation is needed instead of the scheduler.
+Inside an orchestrator run, use `team send --work` only when direct delegation is
+needed instead of the scheduler.
 
 ```sh
 printf '%s\n' "Worker instructions" | team send \
@@ -196,11 +379,14 @@ printf '%s\n' "Worker instructions" | team send \
   --stdin
 ```
 
-Success still comes from the worker dispatch projection. `team send --wait` must not consider stdout, final answer, or trace as success.
+`team send --wait` succeeds only when the worker dispatch projection reports.
+It must not consider stdout, final answer, or trace a success signal.
 
 ## Worker Contract
 
-When acting as a worker, modify only `$RIVE_WORKSPACE`. Rive state is in `$RIVE_STATE_WORKSPACE` when running from an isolated worktree.
+When acting as a worker, modify only `$RIVE_WORKSPACE`. In worktree mode, Rive
+state lives in `$RIVE_STATE_WORKSPACE` and worker changes are reported through
+`$RIVE_WORKSPACE_REF`.
 
 Minimal worker completion:
 
@@ -215,7 +401,7 @@ printf '%s\n' "What changed and how it was checked" | team report \
   --stdin
 ```
 
-If blocked or failed, report that explicitly:
+If blocked or failed, report explicitly:
 
 ```sh
 printf '%s\n' "Why this is blocked" | team report \
@@ -225,11 +411,12 @@ printf '%s\n' "Why this is blocked" | team report \
   --stdin
 ```
 
-Workers must not mutate Work DAG topology, accept nodes, commit integrations, or claim natural-language success without `team report`.
+Workers must not accept work nodes, commit integrations, mutate orchestrator
+root state, or claim natural-language success without `team report`.
 
-## Orchestrator Progress
+## Orchestrator Control Plane
 
-The orchestrator can update the control plane without touching implementation files:
+The orchestrator can update progress without touching implementation files:
 
 ```sh
 printf '%s\n' "Created two investigation nodes and one judge node." | team work note <root> \
@@ -238,11 +425,16 @@ printf '%s\n' "Created two investigation nodes and one judge node." | team work 
   --stdin
 ```
 
-Use notes for progress, decisions, blockers, risks, and validation rationale. Notes do not prove completion.
+Use notes for progress, decisions, blockers, risks, and validation rationale.
+Notes do not prove completion.
+
+If the orchestrator is restricted to planning/control-plane work, workers should
+perform workspace mutations and tests. Rive enforces this with planner PATH and
+mutation audit in orchestrator runner flows.
 
 ## Debug and Usage
 
-Use trace only after a run needs inspection.
+Use trace after a run needs inspection.
 
 ```sh
 rive debug trace list --agent <agent_id>
@@ -251,27 +443,48 @@ rive debug trace usage --root <root>
 rive debug trace usage --run <run_id>
 ```
 
-Usage is a debug read model. It helps estimate cost and tool activity but does not affect business state.
+Use workflow status for higher-level failure inspection:
 
-## Failure Handling
+```sh
+rive workflow status --run <workflow_run_id>
+```
 
-- `dispatch_not_reported`: inspect trace and dispatch; rerun or resume, but do not accept.
-- `work_scheduler_stalled`: run `rive work graph inspect --root <root>` and address missing requirements.
-- `work_graph_not_closed`: fix orphan/unconnected/reviewable nodes before root accept.
-- `worktree_ref_not_committed`: commit or reject the pending integration before guarded accept.
-- `worktree_backend_unavailable`: ensure the repository supports git worktrees and git is available.
-- idempotency conflict: choose a new command ID only when the request is intentionally different.
+The status response includes effective state and scheduler-node debug refs such
+as prompt/stdout/stderr refs. Use those refs to diagnose failures; never use
+them to mark success.
+
+## Common Failure Handling
+
+- `certificate_error`: fix cert/proxy/runtime environment, then
+  `scheduler resume --failed` or `work retry`.
+- `network_error` or `model_error`: fix the external runner environment or
+  model config, then retry.
+- `binary_not_found`: fix `PATH` or pass `--opencode-bin` / `--codex-bin`.
+- `dispatch_not_reported`: inspect trace and failure detail; retry or report a
+  worker bug, but do not accept.
+- `work_scheduler_stalled`: inspect `rive work graph inspect --root <root>` and
+  resolve missing requirements.
+- `work_graph_not_closed`: fix orphan, unconnected, incomplete, or unaccepted
+  reviewable nodes before root accept.
+- `worktree_ref_not_committed`: commit or reject the pending integration before
+  guarded accept.
+- `worktree_patch_conflict`: inspect `rive branch conflict show`, then reject,
+  retry from parent, or manually review the branch path.
+- `idempotency_conflict`: use a new command ID only when the request is
+  intentionally different.
 
 ## Reporting Back
 
 Report ledger-backed results:
 
+- workflow run ID and effective state, when using workflows;
 - root work ID and final root projection;
 - scheduler run ID and state;
 - important node states and pending reviewable/blocked nodes;
 - dispatch IDs for worker attempts;
-- integration IDs and committed refs;
-- tests or validation commands run by workers;
-- unresolved risks or rejected/aborted integrations.
+- integration IDs, conflict IDs, and committed refs;
+- validation commands run by workers or final judge;
+- unresolved risks, failures, rejected integrations, or retry decisions.
 
-Do not present a task as complete unless the relevant Work DAG projection is `done` and any requested external validation has passed.
+Do not present a task as complete unless the relevant Work DAG projection is
+`done` and any requested external validation has passed.
