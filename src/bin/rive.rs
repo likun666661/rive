@@ -4,7 +4,9 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
-use rive::branch::{backend_from_env, branch_integration_protocol, BranchService};
+use rive::branch::{
+    backend_from_env, branch_conflict_protocol, branch_integration_protocol, BranchService,
+};
 use rive::debug_trace::{
     install_codex_hook, install_opencode_plugin, uninstall_managed, usage_for_workspace,
     DebugTraceStore, IngestTraceInput, TraceAdapter, TraceListFilter, TraceListProtocol,
@@ -212,6 +214,27 @@ enum WorkCommands {
         #[arg(long)]
         stdin: bool,
     },
+    Retry {
+        work_node_id: String,
+        #[arg(long = "worker")]
+        workers: Vec<String>,
+        #[arg(long = "command-id")]
+        command_id: String,
+        #[arg(long = "max-parallel")]
+        max_parallel: Option<usize>,
+        #[arg(long = "acceptance-mode")]
+        acceptance_mode: Option<String>,
+        #[arg(long = "workspace-mode", default_value = "shared")]
+        workspace_mode: String,
+        #[arg(long = "opencode-bin")]
+        opencode_bin: Option<PathBuf>,
+        #[arg(long = "codex-bin")]
+        codex_bin: Option<PathBuf>,
+        #[arg(long = "trust-project")]
+        trust_project: bool,
+        #[arg(long = "timeout-seconds", default_value_t = 300)]
+        timeout_seconds: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -219,6 +242,10 @@ enum BranchCommands {
     List,
     Show {
         id: String,
+    },
+    Conflict {
+        #[command(subcommand)]
+        command: BranchConflictCommands,
     },
     Commit {
         integration_id: String,
@@ -232,6 +259,20 @@ enum BranchCommands {
     },
     Reject {
         integration_id: String,
+        #[arg(long = "command-id")]
+        command_id: String,
+        #[arg(long)]
+        stdin: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BranchConflictCommands {
+    Show {
+        id: String,
+    },
+    Reject {
+        conflict_id: String,
         #[arg(long = "command-id")]
         command_id: String,
         #[arg(long)]
@@ -441,6 +482,8 @@ enum SchedulerCommands {
         codex_bin: Option<PathBuf>,
         #[arg(long = "trust-project")]
         trust_project: bool,
+        #[arg(long = "failed")]
+        failed: bool,
         #[arg(long = "timeout-seconds", default_value_t = 300)]
         timeout_seconds: u64,
     },
@@ -977,6 +1020,49 @@ fn run() -> Result<()> {
                     });
                     print_json(&Envelope::new(protocol, display))
                 }
+                WorkCommands::Retry {
+                    work_node_id,
+                    workers,
+                    command_id,
+                    max_parallel,
+                    acceptance_mode,
+                    workspace_mode,
+                    opencode_bin,
+                    codex_bin,
+                    trust_project,
+                    timeout_seconds,
+                } => {
+                    let trace_store = DebugTraceStore::open(&workspace.db_path())?;
+                    trace_store.init_schema()?;
+                    let scheduler =
+                        SchedulerService::new(&workspace, &store, &trace_store, &snapshot_store);
+                    let protocol = scheduler.resume(SchedulerResumeInput {
+                        scheduler_run_id: None,
+                        root_work_node_id: None,
+                        work_node_id: Some(work_node_id),
+                        workers,
+                        command_id,
+                        max_parallel,
+                        acceptance_mode,
+                        workspace_mode,
+                        opencode_bin,
+                        codex_bin,
+                        timeout_seconds,
+                        trust_project,
+                        failed: true,
+                    })?;
+                    let display = serde_json::json!({
+                        "summary": format!(
+                            "Work retry scheduler {} ended {} with root {} {}",
+                            protocol.scheduler.scheduler_run_id,
+                            protocol.scheduler.state,
+                            protocol.scheduler.root_work_node_id,
+                            protocol.root_work.state
+                        ),
+                        "trace_note": "Debug trace is retained for failed attempts; retry success is based on Work DAG projection.",
+                    });
+                    print_json(&Envelope::new(protocol, display))
+                }
             }
         }
         Commands::Branch { command } => {
@@ -1008,6 +1094,44 @@ fn run() -> Result<()> {
                     });
                     print_json(&Envelope::new(protocol, display))
                 }
+                BranchCommands::Conflict { command } => match command {
+                    BranchConflictCommands::Show { id } => {
+                        let conflict = service.show_conflict(&id)?;
+                        let protocol = serde_json::json!({
+                            "conflict": branch_conflict_protocol(&conflict),
+                        });
+                        let display = serde_json::json!({
+                            "summary": format!(
+                                "Branch conflict {} {} with {} files",
+                                conflict.conflict_id,
+                                conflict.state,
+                                conflict.conflict_files_json.as_array().map(|files| files.len()).unwrap_or(0)
+                            ),
+                        });
+                        print_json(&Envelope::new(protocol, display))
+                    }
+                    BranchConflictCommands::Reject {
+                        conflict_id,
+                        command_id,
+                        stdin,
+                    } => {
+                        let mut reason = Vec::new();
+                        if stdin {
+                            std::io::stdin().read_to_end(&mut reason)?;
+                        }
+                        let (conflict, integration, idempotency_status) =
+                            service.reject_conflict(&conflict_id, &command_id, &reason)?;
+                        let protocol = serde_json::json!({
+                            "conflict": branch_conflict_protocol(&conflict),
+                            "integration": branch_integration_protocol(&integration),
+                            "idempotency_status": idempotency_status,
+                        });
+                        let display = serde_json::json!({
+                            "summary": format!("Rejected branch conflict {}", conflict.conflict_id),
+                        });
+                        print_json(&Envelope::new(protocol, display))
+                    }
+                },
                 BranchCommands::Commit {
                     integration_id,
                     command_id,
@@ -1465,6 +1589,7 @@ fn run() -> Result<()> {
                 opencode_bin,
                 codex_bin,
                 trust_project,
+                failed,
                 timeout_seconds,
             } => {
                 let workspace = find_workspace(&std::env::current_dir()?)
@@ -1479,6 +1604,7 @@ fn run() -> Result<()> {
                 let protocol = scheduler.resume(SchedulerResumeInput {
                     scheduler_run_id,
                     root_work_node_id,
+                    work_node_id: None,
                     workers,
                     command_id,
                     max_parallel,
@@ -1488,6 +1614,7 @@ fn run() -> Result<()> {
                     codex_bin,
                     timeout_seconds,
                     trust_project,
+                    failed,
                 })?;
                 let display = serde_json::json!({
                     "summary": format!(
@@ -1820,6 +1947,8 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
         ("worktree_create_failed", "inspect_backend")
     } else if lower.contains("worktree commit failed") {
         ("worktree_commit_failed", "inspect_backend")
+    } else if lower.contains("worktree patch conflict") {
+        ("worktree_patch_conflict", "inspect_branch_conflict")
     } else if lower.contains("worktree abort failed") {
         ("worktree_abort_failed", "inspect_backend")
     } else if lower.contains("worktree ref not committed") {
@@ -1828,6 +1957,8 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
         ("worktree_not_found", "inspect_branch")
     } else if lower.contains("branch not pending") {
         ("branch_not_pending", "inspect_branch")
+    } else if lower.contains("branch conflict not found") {
+        ("branch_conflict_not_found", "inspect_branch")
     } else if lower.contains("branch integration conflict") {
         ("branch_integration_conflict", "inspect_branch")
     } else if lower.contains("branch not found") {

@@ -290,6 +290,56 @@ fn branch_reject(temp: &TempDir, integration_id: &str, command_id: &str, reason:
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn branch_conflict_show(temp: &TempDir, id: &str) -> Value {
+    run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("branch")
+            .arg("conflict")
+            .arg("show")
+            .arg(id),
+    )
+}
+
+fn branch_conflict_reject(
+    temp: &TempDir,
+    conflict_id: &str,
+    command_id: &str,
+    reason: &str,
+) -> Value {
+    let mut command = rive_cmd();
+    command
+        .current_dir(temp.path())
+        .arg("branch")
+        .arg("conflict")
+        .arg("reject")
+        .arg(conflict_id)
+        .arg("--command-id")
+        .arg(command_id)
+        .arg("--stdin");
+    let mut child = command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("command should spawn");
+    use std::io::Write;
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(reason.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
 fn first_branch_integration_id(temp: &TempDir) -> String {
     let conn = Connection::open(temp.path().join(".rive/rive.db")).unwrap();
     conn.query_row(
@@ -478,6 +528,22 @@ printf 'modified in branch\n' > "$RIVE_WORKSPACE/modify-me.txt"
 rm "$RIVE_WORKSPACE/delete-me.txt"
 SNAPSHOT_ID=$("{rive_bin}" snapshot capture --path "$RIVE_WORKSPACE/modify-me.txt" --label phase12-branch-modify-delete --agent "$RIVE_AGENT_ID" --dispatch "$RIVE_DISPATCH_ID" | sed -n 's/.*"snapshot_id": "\([^"]*\)".*/\1/p' | head -n 1)
 printf 'worktree worker modified and deleted\n' | "{team_bin}" report --dispatch "$RIVE_DISPATCH_ID" --status done --snapshot "$SNAPSHOT_ID" --workspace-ref "$RIVE_WORKSPACE_REF" --command-id "phase12-moddel-report-$RIVE_RUN_ID" --stdin >/dev/null
+"#
+        ),
+    );
+}
+
+fn write_branch_conflict_worker(path: &Path) {
+    let rive_bin = env!("CARGO_BIN_EXE_rive");
+    let team_bin = env!("CARGO_BIN_EXE_team");
+    write_executable(
+        path,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+printf 'worker change\n' > "$RIVE_WORKSPACE/conflict.txt"
+SNAPSHOT_ID=$("{rive_bin}" snapshot capture --path "$RIVE_WORKSPACE/conflict.txt" --label phase16-conflict-worker --agent "$RIVE_AGENT_ID" --dispatch "$RIVE_DISPATCH_ID" | sed -n 's/.*"snapshot_id": "\([^"]*\)".*/\1/p' | head -n 1)
+printf 'conflict worker done\n' | "{team_bin}" report --dispatch "$RIVE_DISPATCH_ID" --status done --snapshot "$SNAPSHOT_ID" --workspace-ref "$RIVE_WORKSPACE_REF" --command-id "phase16-conflict-report-$RIVE_RUN_ID" --stdin >/dev/null
 "#
         ),
     );
@@ -1157,27 +1223,19 @@ fn scheduler_resume_supersedes_stale_attempt_and_reruns_node() {
             |row| row.get(0),
         )
         .unwrap();
-    conn.execute(
-        "update scheduler_runs set state='running', completed_at=null where scheduler_run_id=?1",
-        [&scheduler_run_id],
-    )
-    .unwrap();
-    conn.execute(
-        "update scheduler_node_runs set state='running', completed_at=null where node_run_id=?1",
-        [&node_run_id],
-    )
-    .unwrap();
     drop(conn);
 
     let worker = temp.path().join("fake-opencode-resume-worker");
     write_scheduler_worker(&worker);
-    let resumed = run_json(&mut scheduler_resume_command(
+    let mut resume = scheduler_resume_command(
         &temp,
         &worker,
         &scheduler_run_id,
         "phase13-resume-command",
         "manual",
-    ));
+    );
+    resume.arg("--failed");
+    let resumed = run_json(&mut resume);
     assert_eq!(resumed["protocol"]["scheduler"]["state"], "waiting_review");
     assert_eq!(resumed["protocol"]["scheduler"]["child_executed"], true);
     assert_eq!(
@@ -1235,6 +1293,166 @@ fn scheduler_resume_supersedes_stale_attempt_and_reruns_node() {
         )
         .unwrap();
     assert_eq!(reported_dispatches, 1);
+    let failure_kind: String = conn
+        .query_row(
+            "select failure_kind from scheduler_node_failures where node_run_id=?1",
+            [&node_run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(failure_kind, "dispatch_not_reported");
+}
+
+#[test]
+fn work_retry_reruns_failed_node_without_manual_ledger_edits() {
+    let temp = init_workspace();
+    add_worker(&temp, "worker-a");
+    add_worker(&temp, "worker-b");
+    let root = create_work(&temp, "phase16-work-retry-root", "root");
+    let a = create_work(&temp, "phase16-work-retry-a", "A");
+    add_edge(
+        &temp,
+        "decomposes-to",
+        &root,
+        &a,
+        "edge-phase16-work-retry-root-a",
+    );
+
+    let no_report = temp.path().join("fake-opencode-work-retry-no-report");
+    write_no_report_worker(&no_report);
+    let failed = run_json_expect_error(&mut scheduler_command_with_mode(
+        &temp,
+        &no_report,
+        &root,
+        "phase16-work-retry-failed",
+        "manual",
+    ));
+    assert_eq!(failed["protocol"]["code"], "dispatch_not_reported");
+
+    let worker = temp.path().join("fake-opencode-work-retry-worker");
+    write_scheduler_worker(&worker);
+    let retried = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("work")
+            .arg("retry")
+            .arg(&a)
+            .arg("--worker")
+            .arg("worker-a")
+            .arg("--worker")
+            .arg("worker-b")
+            .arg("--command-id")
+            .arg("phase16-work-retry-command")
+            .arg("--acceptance-mode")
+            .arg("manual")
+            .arg("--opencode-bin")
+            .arg(&worker)
+            .arg("--timeout-seconds")
+            .arg("10"),
+    );
+    assert_eq!(retried["protocol"]["scheduler"]["state"], "waiting_review");
+    assert_eq!(
+        inspect_work(&temp, &a)["protocol"]["projection"]["state"],
+        "reviewable"
+    );
+
+    let conn = Connection::open(temp.path().join(".rive/rive.db")).unwrap();
+    let superseded: i64 = conn
+        .query_row(
+            "select count(*) from scheduler_node_runs where state='superseded'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(superseded, 1);
+    let cancelled: i64 = conn
+        .query_row(
+            "select count(*) from dispatches where state='cancelled'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(cancelled, 1);
+    let reported: i64 = conn
+        .query_row(
+            "select count(*) from dispatches where state='reported'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reported, 1);
+}
+
+#[test]
+fn worktree_commit_conflict_records_read_model_and_rejects_safely() {
+    let temp = init_git_workspace();
+    fs::write(temp.path().join("conflict.txt"), "base\n").unwrap();
+    run_git(&temp, ["add", "conflict.txt"]);
+    run_git(&temp, ["commit", "-m", "add conflict fixture"]);
+    add_worker(&temp, "worker-a");
+    add_worker(&temp, "worker-b");
+    let root = create_work(&temp, "phase16-conflict-root", "root");
+    let a = create_work(&temp, "phase16-conflict-a", "A");
+    add_edge(
+        &temp,
+        "decomposes-to",
+        &root,
+        &a,
+        "edge-phase16-conflict-root-a",
+    );
+    let fake = temp.path().join("fake-opencode-conflict");
+    write_branch_conflict_worker(&fake);
+
+    let mut command =
+        scheduler_command_with_mode(&temp, &fake, &root, "phase16-conflict-scheduler", "manual");
+    command.arg("--workspace-mode").arg("worktree");
+    let response = run_json(&mut command);
+    assert_eq!(response["protocol"]["scheduler"]["state"], "waiting_review");
+    fs::write(temp.path().join("conflict.txt"), "parent current\n").unwrap();
+
+    let integration_id = first_branch_integration_id(&temp);
+    let error = run_json_expect_error(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("branch")
+            .arg("commit")
+            .arg(&integration_id)
+            .arg("--command-id")
+            .arg("phase16-conflict-commit"),
+    );
+    assert_eq!(error["protocol"]["code"], "worktree_patch_conflict");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("conflict.txt")).unwrap(),
+        "parent current\n"
+    );
+
+    let conflict = branch_conflict_show(&temp, &integration_id);
+    assert_eq!(
+        conflict["protocol"]["conflict"]["integration_id"],
+        serde_json::Value::String(integration_id.clone())
+    );
+    assert!(conflict["protocol"]["conflict"]["conflict_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|file| file.as_str() == Some("conflict.txt")));
+    assert!(conflict["protocol"]["conflict"]["suggested_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action.as_str() == Some("reject")));
+    let conflict_id = conflict["protocol"]["conflict"]["conflict_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rejected = branch_conflict_reject(
+        &temp,
+        &conflict_id,
+        "phase16-conflict-reject",
+        "keep parent current",
+    );
+    assert_eq!(rejected["protocol"]["conflict"]["state"], "rejected");
+    assert_eq!(rejected["protocol"]["integration"]["state"], "rejected");
 }
 
 #[test]

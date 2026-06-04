@@ -316,6 +316,16 @@ pub struct SchedulerNodeRunRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerNodeFailureRecord {
+    pub node_run_id: String,
+    pub failure_kind: String,
+    pub retryable: bool,
+    pub suggested_action: String,
+    pub detail: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BranchWorkspaceRecord {
     pub branch_id: String,
     pub backend: String,
@@ -343,6 +353,22 @@ pub struct BranchIntegrationRecord {
     pub state: String,
     pub commit_ref: Option<String>,
     pub rejection_reason_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchConflictRecord {
+    pub conflict_id: String,
+    pub integration_id: String,
+    pub branch_id: String,
+    pub work_node_id: String,
+    pub dispatch_id: String,
+    pub branch_path: String,
+    pub conflict_files_json: Value,
+    pub worker_summary: Option<String>,
+    pub error_message: String,
+    pub state: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -444,6 +470,16 @@ pub struct UpdateSchedulerNodeRunInput {
 }
 
 #[derive(Debug, Clone)]
+pub struct InsertSchedulerNodeFailureInput {
+    pub node_run_id: String,
+    pub failure_kind: String,
+    pub retryable: bool,
+    pub suggested_action: String,
+    pub detail: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
 pub struct InsertBranchWorkspaceInput {
     pub branch_id: String,
     pub backend: String,
@@ -486,6 +522,28 @@ pub struct UpdateBranchIntegrationInput {
     pub state: String,
     pub commit_ref: Option<String>,
     pub rejection_reason_hash: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertBranchConflictInput {
+    pub conflict_id: String,
+    pub integration_id: String,
+    pub branch_id: String,
+    pub work_node_id: String,
+    pub dispatch_id: String,
+    pub branch_path: String,
+    pub conflict_files_json: Value,
+    pub worker_summary: Option<String>,
+    pub error_message: String,
+    pub state: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateBranchConflictInput {
+    pub conflict_id: String,
+    pub state: String,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -846,6 +904,15 @@ impl EventStore {
               ON scheduler_node_runs(work_node_id, state);
             CREATE INDEX IF NOT EXISTS idx_scheduler_node_runs_scheduler
               ON scheduler_node_runs(scheduler_run_id);
+            CREATE TABLE IF NOT EXISTS scheduler_node_failures (
+              node_run_id TEXT PRIMARY KEY,
+              failure_kind TEXT NOT NULL,
+              retryable INTEGER NOT NULL,
+              suggested_action TEXT NOT NULL,
+              detail TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY(node_run_id) REFERENCES scheduler_node_runs(node_run_id)
+            );
             CREATE TABLE IF NOT EXISTS branch_workspaces (
               branch_id TEXT PRIMARY KEY,
               backend TEXT NOT NULL,
@@ -886,6 +953,26 @@ impl EventStore {
             );
             CREATE INDEX IF NOT EXISTS idx_branch_integrations_work
               ON branch_integrations(work_node_id, state);
+            CREATE TABLE IF NOT EXISTS branch_conflicts (
+              conflict_id TEXT PRIMARY KEY,
+              integration_id TEXT NOT NULL,
+              branch_id TEXT NOT NULL,
+              work_node_id TEXT NOT NULL,
+              dispatch_id TEXT NOT NULL,
+              branch_path TEXT NOT NULL,
+              conflict_files_json TEXT NOT NULL,
+              worker_summary TEXT,
+              error_message TEXT NOT NULL,
+              state TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY(integration_id) REFERENCES branch_integrations(integration_id),
+              FOREIGN KEY(branch_id) REFERENCES branch_workspaces(branch_id),
+              FOREIGN KEY(work_node_id) REFERENCES work_nodes(work_node_id),
+              FOREIGN KEY(dispatch_id) REFERENCES dispatches(dispatch_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_branch_conflicts_integration
+              ON branch_conflicts(integration_id, state);
             CREATE TABLE IF NOT EXISTS branch_commands (
               command_id TEXT PRIMARY KEY,
               integration_id TEXT NOT NULL,
@@ -2476,6 +2563,99 @@ impl EventStore {
         Ok(runs)
     }
 
+    pub fn list_scheduler_node_runs_for_work_node(
+        &self,
+        work_node_id: &str,
+    ) -> Result<Vec<SchedulerNodeRunRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT node_run_id, scheduler_run_id, work_node_id, dispatch_id, worker_agent_id,
+                   worker_run_id, state, started_at, completed_at
+            FROM scheduler_node_runs
+            WHERE work_node_id = ?1
+            ORDER BY started_at ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![work_node_id], row_to_scheduler_node_run)?;
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(row?);
+        }
+        Ok(runs)
+    }
+
+    pub fn latest_scheduler_node_run_for_work_node(
+        &self,
+        work_node_id: &str,
+    ) -> Result<Option<SchedulerNodeRunRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT node_run_id, scheduler_run_id, work_node_id, dispatch_id, worker_agent_id,
+                   worker_run_id, state, started_at, completed_at
+            FROM scheduler_node_runs
+            WHERE work_node_id = ?1
+            ORDER BY started_at DESC
+            LIMIT 1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![work_node_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_scheduler_node_run(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn record_scheduler_node_failure(
+        &self,
+        input: &InsertSchedulerNodeFailureInput,
+    ) -> Result<SchedulerNodeFailureRecord> {
+        self.conn.execute(
+            r#"
+            INSERT INTO scheduler_node_failures (
+              node_run_id, failure_kind, retryable, suggested_action, detail, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(node_run_id) DO UPDATE SET
+              failure_kind = excluded.failure_kind,
+              retryable = excluded.retryable,
+              suggested_action = excluded.suggested_action,
+              detail = excluded.detail,
+              created_at = excluded.created_at
+            "#,
+            params![
+                input.node_run_id,
+                input.failure_kind,
+                if input.retryable { 1 } else { 0 },
+                input.suggested_action,
+                input.detail,
+                input.created_at.to_rfc3339(),
+            ],
+        )?;
+        self.get_scheduler_node_failure(&input.node_run_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("scheduler node failure not found: {}", input.node_run_id)
+            })
+    }
+
+    pub fn get_scheduler_node_failure(
+        &self,
+        node_run_id: &str,
+    ) -> Result<Option<SchedulerNodeFailureRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT node_run_id, failure_kind, retryable, suggested_action, detail, created_at
+            FROM scheduler_node_failures
+            WHERE node_run_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![node_run_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_scheduler_node_failure(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn insert_branch_workspace(
         &self,
         input: &InsertBranchWorkspaceInput,
@@ -2689,6 +2869,94 @@ impl EventStore {
             integrations.push(row?);
         }
         Ok(integrations)
+    }
+
+    pub fn insert_branch_conflict(
+        &self,
+        input: &InsertBranchConflictInput,
+    ) -> Result<BranchConflictRecord> {
+        self.conn.execute(
+            r#"
+            INSERT INTO branch_conflicts (
+              conflict_id, integration_id, branch_id, work_node_id, dispatch_id, branch_path,
+              conflict_files_json, worker_summary, error_message, state, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
+            "#,
+            params![
+                input.conflict_id,
+                input.integration_id,
+                input.branch_id,
+                input.work_node_id,
+                input.dispatch_id,
+                input.branch_path,
+                input.conflict_files_json.to_string(),
+                input.worker_summary,
+                input.error_message,
+                input.state,
+                input.created_at.to_rfc3339(),
+            ],
+        )?;
+        self.get_branch_conflict(&input.conflict_id)?
+            .ok_or_else(|| anyhow::anyhow!("branch conflict not found: {}", input.conflict_id))
+    }
+
+    pub fn update_branch_conflict(
+        &self,
+        input: &UpdateBranchConflictInput,
+    ) -> Result<BranchConflictRecord> {
+        self.conn.execute(
+            r#"
+            UPDATE branch_conflicts
+            SET state = ?1, updated_at = ?2
+            WHERE conflict_id = ?3
+            "#,
+            params![
+                input.state,
+                input.updated_at.to_rfc3339(),
+                input.conflict_id,
+            ],
+        )?;
+        self.get_branch_conflict(&input.conflict_id)?
+            .ok_or_else(|| anyhow::anyhow!("branch conflict not found: {}", input.conflict_id))
+    }
+
+    pub fn get_branch_conflict(&self, conflict_id: &str) -> Result<Option<BranchConflictRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT conflict_id, integration_id, branch_id, work_node_id, dispatch_id, branch_path,
+                   conflict_files_json, worker_summary, error_message, state, created_at, updated_at
+            FROM branch_conflicts
+            WHERE conflict_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![conflict_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_branch_conflict(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn latest_branch_conflict_for_integration(
+        &self,
+        integration_id: &str,
+    ) -> Result<Option<BranchConflictRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT conflict_id, integration_id, branch_id, work_node_id, dispatch_id, branch_path,
+                   conflict_files_json, worker_summary, error_message, state, created_at, updated_at
+            FROM branch_conflicts
+            WHERE integration_id = ?1
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![integration_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_branch_conflict(row)?))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn get_branch_command(&self, command_id: &str) -> Result<Option<(String, String)>> {
@@ -3342,6 +3610,21 @@ fn row_to_scheduler_node_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Schedu
     })
 }
 
+fn row_to_scheduler_node_failure(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SchedulerNodeFailureRecord> {
+    let created_at: String = row.get(5)?;
+    let retryable: i64 = row.get(2)?;
+    Ok(SchedulerNodeFailureRecord {
+        node_run_id: row.get(0)?,
+        failure_kind: row.get(1)?,
+        retryable: retryable != 0,
+        suggested_action: row.get(3)?,
+        detail: row.get(4)?,
+        created_at: parse_time_for_sql(&created_at)?,
+    })
+}
+
 fn row_to_branch_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<BranchWorkspaceRecord> {
     let created_at: String = row.get(10)?;
     let updated_at: String = row.get(11)?;
@@ -3375,6 +3658,28 @@ fn row_to_branch_integration(row: &rusqlite::Row<'_>) -> rusqlite::Result<Branch
         state: row.get(7)?,
         commit_ref: row.get(8)?,
         rejection_reason_hash: row.get(9)?,
+        created_at: parse_time_for_sql(&created_at)?,
+        updated_at: parse_time_for_sql(&updated_at)?,
+    })
+}
+
+fn row_to_branch_conflict(row: &rusqlite::Row<'_>) -> rusqlite::Result<BranchConflictRecord> {
+    let conflict_files_json: String = row.get(6)?;
+    let created_at: String = row.get(10)?;
+    let updated_at: String = row.get(11)?;
+    Ok(BranchConflictRecord {
+        conflict_id: row.get(0)?,
+        integration_id: row.get(1)?,
+        branch_id: row.get(2)?,
+        work_node_id: row.get(3)?,
+        dispatch_id: row.get(4)?,
+        branch_path: row.get(5)?,
+        conflict_files_json: serde_json::from_str(&conflict_files_json).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(err))
+        })?,
+        worker_summary: row.get(7)?,
+        error_message: row.get(8)?,
+        state: row.get(9)?,
         created_at: parse_time_for_sql(&created_at)?,
         updated_at: parse_time_for_sql(&updated_at)?,
     })

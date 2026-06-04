@@ -11,8 +11,9 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use crate::store::{
-    BranchIntegrationRecord, BranchWorkspaceRecord, EventStore, InsertBranchIntegrationInput,
-    InsertBranchWorkspaceInput, RecordBranchCommandInput, UpdateBranchIntegrationInput,
+    BranchConflictRecord, BranchIntegrationRecord, BranchWorkspaceRecord, EventStore,
+    InsertBranchConflictInput, InsertBranchIntegrationInput, InsertBranchWorkspaceInput,
+    RecordBranchCommandInput, UpdateBranchConflictInput, UpdateBranchIntegrationInput,
     UpdateBranchWorkspaceInput,
 };
 use crate::workspace::Workspace;
@@ -34,6 +35,21 @@ pub struct BranchWorkspace {
 pub struct BranchCommitResult {
     pub commit_ref: String,
     pub changed_files: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BranchConflictProtocol {
+    pub conflict_id: String,
+    pub integration_id: String,
+    pub branch_id: String,
+    pub work_node_id: String,
+    pub dispatch_id: String,
+    pub branch_path: String,
+    pub conflict_files: Vec<String>,
+    pub worker_summary: Option<String>,
+    pub error_message: String,
+    pub state: String,
+    pub suggested_actions: Vec<&'static str>,
 }
 
 pub trait BranchWorkspaceBackend {
@@ -524,6 +540,38 @@ impl<'a> BranchService<'a> {
         )
     }
 
+    pub fn show_conflict(&self, id: &str) -> Result<BranchConflictRecord> {
+        self.store.init_work_schema()?;
+        if let Some(conflict) = self.store.get_branch_conflict(id)? {
+            return Ok(conflict);
+        }
+        self.store
+            .latest_branch_conflict_for_integration(id)?
+            .ok_or_else(|| anyhow!("branch conflict not found: {id}"))
+    }
+
+    pub fn reject_conflict(
+        &self,
+        conflict_id: &str,
+        command_id: &str,
+        reason: &[u8],
+    ) -> Result<(BranchConflictRecord, BranchIntegrationRecord, &'static str)> {
+        let conflict = self
+            .store
+            .get_branch_conflict(conflict_id)?
+            .ok_or_else(|| anyhow!("branch conflict not found: {conflict_id}"))?;
+        let (integration, idempotency_status) =
+            self.reject(&conflict.integration_id, command_id, reason)?;
+        let conflict = self
+            .store
+            .update_branch_conflict(&UpdateBranchConflictInput {
+                conflict_id: conflict.conflict_id,
+                state: "rejected".to_string(),
+                updated_at: Utc::now(),
+            })?;
+        Ok((conflict, integration, idempotency_status))
+    }
+
     pub fn abort(
         &self,
         backend: &dyn BranchWorkspaceBackend,
@@ -620,7 +668,34 @@ impl<'a> BranchService<'a> {
             .store
             .get_branch_workspace(&integration.branch_id)?
             .ok_or_else(|| anyhow!("branch not found: {}", integration.branch_id))?;
-        let result = apply(backend, self.workspace, &branch)?;
+        let result = match apply(backend, self.workspace, &branch) {
+            Ok(result) => result,
+            Err(err) if action == "commit" => {
+                let conflict_files = conflict_files_for_branch(self.workspace, &branch);
+                let worker_summary = worker_summary_for_integration(self.store, &integration);
+                let conflict = self
+                    .store
+                    .insert_branch_conflict(&InsertBranchConflictInput {
+                        conflict_id: prefixed_id("brconf"),
+                        integration_id: integration.integration_id.clone(),
+                        branch_id: branch.branch_id.clone(),
+                        work_node_id: integration.work_node_id.clone(),
+                        dispatch_id: integration.dispatch_id.clone(),
+                        branch_path: branch.branch_path.clone(),
+                        conflict_files_json: serde_json::json!(conflict_files),
+                        worker_summary,
+                        error_message: err.to_string(),
+                        state: "open".to_string(),
+                        created_at: Utc::now(),
+                    })?;
+                return Err(anyhow!(
+                    "worktree patch conflict: {} for integration {}",
+                    conflict.conflict_id,
+                    integration.integration_id
+                ));
+            }
+            Err(err) => return Err(err),
+        };
         let (state, event_type, commit_ref) = match action {
             "commit" => (
                 "committed",
@@ -681,6 +756,32 @@ pub fn branch_integration_protocol(
         branch_ref: integration.branch_ref.clone(),
         state: integration.state.clone(),
         commit_ref: integration.commit_ref.clone(),
+    }
+}
+
+pub fn branch_conflict_protocol(conflict: &BranchConflictRecord) -> BranchConflictProtocol {
+    let conflict_files = conflict
+        .conflict_files_json
+        .as_array()
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|file| file.as_str().map(ToOwned::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    BranchConflictProtocol {
+        conflict_id: conflict.conflict_id.clone(),
+        integration_id: conflict.integration_id.clone(),
+        branch_id: conflict.branch_id.clone(),
+        work_node_id: conflict.work_node_id.clone(),
+        dispatch_id: conflict.dispatch_id.clone(),
+        branch_path: conflict.branch_path.clone(),
+        conflict_files,
+        worker_summary: conflict.worker_summary.clone(),
+        error_message: conflict.error_message.clone(),
+        state: conflict.state.clone(),
+        suggested_actions: vec!["reject", "retry-from-parent", "open-conflict"],
     }
 }
 
@@ -747,6 +848,23 @@ fn apply_deletions(parent: &Path, branch: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn conflict_files_for_branch(workspace: &Workspace, branch: &BranchWorkspaceRecord) -> Vec<String> {
+    let branch_path = PathBuf::from(&branch.branch_path);
+    changed_files(&workspace.root, &branch_path).unwrap_or_default()
+}
+
+fn worker_summary_for_integration(
+    store: &EventStore,
+    integration: &BranchIntegrationRecord,
+) -> Option<String> {
+    let fact_id = integration.fact_event_id.as_ref()?;
+    let fact = store.get_fact_by_event_id(fact_id).ok().flatten()?;
+    Some(format!(
+        "fact={} type={} body_ref={}",
+        fact.event_id, fact.fact_type, fact.body_blob_ref
+    ))
 }
 
 fn prune_empty_parents(root: &Path, mut current: Option<&Path>) -> Result<()> {

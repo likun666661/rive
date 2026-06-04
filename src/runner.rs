@@ -30,8 +30,9 @@ use crate::facts::ActorEnv;
 use crate::store::{
     AgentRecord, AgentRole, CompleteDelegationInput, DelegationRecord, DispatchRecord,
     DispatchState, EventStore, IdempotencyResolution, InsertAgentRunInput, InsertDelegationInput,
-    InsertSchedulerNodeRunInput, InsertSchedulerRunInput, SchedulerNodeRunRecord,
-    SchedulerRunRecord, UpdateSchedulerNodeRunInput, UpdateSchedulerRunStateInput, WorkNodeRecord,
+    InsertSchedulerNodeFailureInput, InsertSchedulerNodeRunInput, InsertSchedulerRunInput,
+    SchedulerNodeFailureRecord, SchedulerNodeRunRecord, SchedulerRunRecord,
+    UpdateSchedulerNodeRunInput, UpdateSchedulerRunStateInput, WorkNodeRecord,
     WorkRefBindingRecord,
 };
 use crate::work::{
@@ -97,6 +98,7 @@ pub struct SchedulerRunInput {
 pub struct SchedulerResumeInput {
     pub scheduler_run_id: Option<String>,
     pub root_work_node_id: Option<String>,
+    pub work_node_id: Option<String>,
     pub workers: Vec<String>,
     pub command_id: String,
     pub max_parallel: Option<usize>,
@@ -106,6 +108,7 @@ pub struct SchedulerResumeInput {
     pub codex_bin: Option<PathBuf>,
     pub timeout_seconds: u64,
     pub trust_project: bool,
+    pub failed: bool,
 }
 
 #[derive(Debug)]
@@ -290,8 +293,17 @@ pub struct SchedulerNodeRunProtocol {
     pub worker_agent_id: String,
     pub worker_run_id: Option<String>,
     pub state: String,
+    pub failure: Option<WorkerFailureProtocol>,
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct WorkerFailureProtocol {
+    pub failure_kind: String,
+    pub retryable: bool,
+    pub suggested_action: String,
+    pub detail: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -776,7 +788,10 @@ impl<'a> SchedulerService<'a> {
         Ok(SchedulerRunResponseProtocol {
             scheduler: scheduler_run_protocol(&scheduler_run, child_executed, idempotency_status),
             root_work,
-            launched_nodes: node_runs.iter().map(scheduler_node_run_protocol).collect(),
+            launched_nodes: node_runs
+                .iter()
+                .map(|run| self.scheduler_node_run_protocol(run))
+                .collect(),
             completed_nodes,
             waiting_review_nodes,
             stalled_nodes,
@@ -815,8 +830,20 @@ impl<'a> SchedulerService<'a> {
         {
             return self.scheduler_run_response(existing, false, "replayed");
         }
+        let inferred_scheduler_run_id =
+            if input.scheduler_run_id.is_none() && input.root_work_node_id.is_none() {
+                input.work_node_id.as_ref().and_then(|work_node_id| {
+                    self.event_store
+                        .latest_scheduler_node_run_for_work_node(work_node_id)
+                        .ok()
+                        .flatten()
+                        .map(|run| run.scheduler_run_id)
+                })
+            } else {
+                None
+            };
         let source_run = self.resolve_scheduler_run(
-            input.scheduler_run_id.clone(),
+            input.scheduler_run_id.clone().or(inferred_scheduler_run_id),
             input.root_work_node_id.clone(),
         )?;
         let root_work_node_id = input
@@ -848,8 +875,12 @@ impl<'a> SchedulerService<'a> {
             backend_from_env().ensure_available(self.workspace)?;
         }
         let workers = self.resolve_workers(&input.workers)?;
-        let stale_nodes =
-            self.supersede_active_attempts(&root_work_node_id, source_run.as_ref())?;
+        let stale_nodes = self.supersede_retryable_attempts(
+            &root_work_node_id,
+            source_run.as_ref(),
+            input.work_node_id.as_deref(),
+            input.failed,
+        )?;
         let worker_ids = workers
             .iter()
             .map(|worker| worker.agent_id.clone())
@@ -959,7 +990,10 @@ impl<'a> SchedulerService<'a> {
         Ok(SchedulerRunResponseProtocol {
             scheduler: scheduler_run_protocol(&scheduler_run, child_executed, idempotency_status),
             root_work,
-            launched_nodes: node_runs.iter().map(scheduler_node_run_protocol).collect(),
+            launched_nodes: node_runs
+                .iter()
+                .map(|run| self.scheduler_node_run_protocol(run))
+                .collect(),
             completed_nodes,
             waiting_review_nodes,
             stalled_nodes,
@@ -1000,10 +1034,13 @@ impl<'a> SchedulerService<'a> {
                 .as_ref()
                 .map(|run| scheduler_run_protocol(run, false, "status")),
             root_work,
-            node_runs: node_runs.iter().map(scheduler_node_run_protocol).collect(),
+            node_runs: node_runs
+                .iter()
+                .map(|run| self.scheduler_node_run_protocol(run))
+                .collect(),
             active_node_runs: active_node_runs
                 .iter()
-                .map(scheduler_node_run_protocol)
+                .map(|run| self.scheduler_node_run_protocol(run))
                 .collect(),
             waiting_review_nodes,
             unfinished_nodes,
@@ -1027,10 +1064,12 @@ impl<'a> SchedulerService<'a> {
         }
     }
 
-    fn supersede_active_attempts(
+    fn supersede_retryable_attempts(
         &self,
         root_work_node_id: &str,
         source_run: Option<&SchedulerRunRecord>,
+        target_work_node_id: Option<&str>,
+        include_failed: bool,
     ) -> Result<Vec<WorkNodeRecord>> {
         let work_service = WorkService::new(self.workspace, self.event_store, self.blob_store);
         let reachable = work_service
@@ -1040,10 +1079,25 @@ impl<'a> SchedulerService<'a> {
             .collect::<BTreeSet<_>>();
         let mut retry_nodes = BTreeMap::new();
         for node_id in reachable {
-            for run in self
+            if let Some(target) = target_work_node_id {
+                if node_id != target {
+                    continue;
+                }
+            }
+            let mut attempts = self
                 .event_store
-                .list_active_scheduler_node_runs_for_work_node(&node_id)?
-            {
+                .list_active_scheduler_node_runs_for_work_node(&node_id)?;
+            if include_failed {
+                attempts.extend(
+                    self.event_store
+                        .list_scheduler_node_runs_for_work_node(&node_id)?
+                        .into_iter()
+                        .filter(|run| run.state == "failed"),
+                );
+                attempts.sort_by_key(|run| run.started_at);
+                attempts.dedup_by(|a, b| a.node_run_id == b.node_run_id);
+            }
+            for run in attempts {
                 if let Some(source) = source_run {
                     if run.scheduler_run_id != source.scheduler_run_id {
                         continue;
@@ -1082,7 +1136,7 @@ impl<'a> SchedulerService<'a> {
                 }
                 self.event_store
                     .update_scheduler_node_run(&UpdateSchedulerNodeRunInput {
-                        node_run_id: run.node_run_id,
+                        node_run_id: run.node_run_id.clone(),
                         dispatch_id: run.dispatch_id,
                         worker_run_id: run.worker_run_id,
                         state: "superseded".to_string(),
@@ -1336,12 +1390,16 @@ impl<'a> SchedulerService<'a> {
                     if projection.state != "reviewable" && projection.state != "done" {
                         self.event_store.update_scheduler_node_run(
                             &UpdateSchedulerNodeRunInput {
-                                node_run_id: result.node_run_id,
-                                dispatch_id: Some(dispatch.dispatch_id),
-                                worker_run_id: Some(result.worker_run_id),
+                                node_run_id: result.node_run_id.clone(),
+                                dispatch_id: Some(dispatch.dispatch_id.clone()),
+                                worker_run_id: Some(result.worker_run_id.clone()),
                                 state: "failed".to_string(),
                                 completed_at: Some(Utc::now()),
                             },
+                        )?;
+                        self.record_node_failure(
+                            &result.node_run_id,
+                            &format!("work scheduler stalled: {}", result.work_node_id),
                         )?;
                         first_error.get_or_insert_with(|| {
                             anyhow!("work scheduler stalled: {}", result.work_node_id)
@@ -1362,16 +1420,31 @@ impl<'a> SchedulerService<'a> {
                                 })
                         {
                             let backend = backend_from_env();
-                            BranchService::new(self.workspace, self.event_store).commit(
-                                backend.as_ref(),
-                                &integration.integration_id,
-                                &format!(
-                                    "scheduler:{}:branch-commit:{}",
-                                    scheduler_run.scheduler_run_id, result.work_node_id
-                                ),
-                            )?;
+                            if let Err(err) = BranchService::new(self.workspace, self.event_store)
+                                .commit(
+                                    backend.as_ref(),
+                                    &integration.integration_id,
+                                    &format!(
+                                        "scheduler:{}:branch-commit:{}",
+                                        scheduler_run.scheduler_run_id, result.work_node_id
+                                    ),
+                                )
+                            {
+                                self.event_store.update_scheduler_node_run(
+                                    &UpdateSchedulerNodeRunInput {
+                                        node_run_id: result.node_run_id.clone(),
+                                        dispatch_id: Some(dispatch.dispatch_id.clone()),
+                                        worker_run_id: Some(result.worker_run_id.clone()),
+                                        state: "failed".to_string(),
+                                        completed_at: Some(Utc::now()),
+                                    },
+                                )?;
+                                self.record_node_failure(&result.node_run_id, &err.to_string())?;
+                                first_error.get_or_insert(err);
+                                continue;
+                            }
                         }
-                        work_service.accept_node(crate::work::WorkStatusInput {
+                        if let Err(err) = work_service.accept_node(crate::work::WorkStatusInput {
                             command_id: format!(
                                 "scheduler:{}:accept:{}",
                                 scheduler_run.scheduler_run_id, result.work_node_id
@@ -1379,7 +1452,20 @@ impl<'a> SchedulerService<'a> {
                             work_node_id: result.work_node_id.clone(),
                             reason: b"scheduler auto-committed acceptance".to_vec(),
                             require_committed_branch: true,
-                        })?;
+                        }) {
+                            self.event_store.update_scheduler_node_run(
+                                &UpdateSchedulerNodeRunInput {
+                                    node_run_id: result.node_run_id.clone(),
+                                    dispatch_id: Some(dispatch.dispatch_id.clone()),
+                                    worker_run_id: Some(result.worker_run_id.clone()),
+                                    state: "failed".to_string(),
+                                    completed_at: Some(Utc::now()),
+                                },
+                            )?;
+                            self.record_node_failure(&result.node_run_id, &err.to_string())?;
+                            first_error.get_or_insert(err);
+                            continue;
+                        }
                         state = "accepted";
                     } else if acceptance_mode == AcceptanceMode::AutoReported
                         && projection.state == "reviewable"
@@ -1405,14 +1491,16 @@ impl<'a> SchedulerService<'a> {
                         })?;
                 }
                 Err(err) => {
+                    let detail = err.to_string();
                     self.event_store
                         .update_scheduler_node_run(&UpdateSchedulerNodeRunInput {
-                            node_run_id: result.node_run_id,
+                            node_run_id: result.node_run_id.clone(),
                             dispatch_id: Some(result.dispatch_id),
                             worker_run_id: Some(result.worker_run_id),
                             state: "failed".to_string(),
                             completed_at: Some(Utc::now()),
                         })?;
+                    self.record_node_failure(&result.node_run_id, &detail)?;
                     first_error.get_or_insert(err);
                 }
             }
@@ -1420,6 +1508,20 @@ impl<'a> SchedulerService<'a> {
         if let Some(err) = first_error {
             return Err(err);
         }
+        Ok(())
+    }
+
+    fn record_node_failure(&self, node_run_id: &str, detail: &str) -> Result<()> {
+        let failure = classify_worker_failure(detail);
+        self.event_store
+            .record_scheduler_node_failure(&InsertSchedulerNodeFailureInput {
+                node_run_id: node_run_id.to_string(),
+                failure_kind: failure.failure_kind,
+                retryable: failure.retryable,
+                suggested_action: failure.suggested_action,
+                detail: failure.detail,
+                created_at: Utc::now(),
+            })?;
         Ok(())
     }
 
@@ -1606,6 +1708,19 @@ impl<'a> SchedulerService<'a> {
         )?;
         Ok(Some(usage.totals))
     }
+
+    fn scheduler_node_run_protocol(
+        &self,
+        run: &SchedulerNodeRunRecord,
+    ) -> SchedulerNodeRunProtocol {
+        scheduler_node_run_protocol(
+            run,
+            self.event_store
+                .get_scheduler_node_failure(&run.node_run_id)
+                .ok()
+                .flatten(),
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1743,7 +1858,10 @@ fn scheduler_run_protocol(
     }
 }
 
-fn scheduler_node_run_protocol(run: &SchedulerNodeRunRecord) -> SchedulerNodeRunProtocol {
+fn scheduler_node_run_protocol(
+    run: &SchedulerNodeRunRecord,
+    failure: Option<SchedulerNodeFailureRecord>,
+) -> SchedulerNodeRunProtocol {
     SchedulerNodeRunProtocol {
         node_run_id: run.node_run_id.clone(),
         scheduler_run_id: run.scheduler_run_id.clone(),
@@ -1752,8 +1870,58 @@ fn scheduler_node_run_protocol(run: &SchedulerNodeRunRecord) -> SchedulerNodeRun
         worker_agent_id: run.worker_agent_id.clone(),
         worker_run_id: run.worker_run_id.clone(),
         state: run.state.clone(),
+        failure: failure.map(worker_failure_protocol),
         started_at: run.started_at,
         completed_at: run.completed_at,
+    }
+}
+
+fn worker_failure_protocol(record: SchedulerNodeFailureRecord) -> WorkerFailureProtocol {
+    WorkerFailureProtocol {
+        failure_kind: record.failure_kind,
+        retryable: record.retryable,
+        suggested_action: record.suggested_action,
+        detail: record.detail,
+    }
+}
+
+fn classify_worker_failure(detail: &str) -> WorkerFailureProtocol {
+    let lower = detail.to_lowercase();
+    let (failure_kind, retryable, suggested_action) =
+        if lower.contains("certificate") || lower.contains("x509") || lower.contains("tls") {
+            ("certificate_error", true, "retry_after_certificate_fix")
+        } else if lower.contains("network")
+            || lower.contains("econnreset")
+            || lower.contains("enotfound")
+            || lower.contains("connection")
+        {
+            ("network_error", true, "retry_failed")
+        } else if lower.contains("model") || lower.contains("unsupported") {
+            ("model_error", false, "fix_model_or_runner")
+        } else if lower.contains("not found")
+            || lower.contains("no such file")
+            || lower.contains("permission denied")
+            || lower.contains("launch failed")
+        {
+            ("worker_environment_error", false, "fix_installation")
+        } else if lower.contains("timeout") {
+            ("timeout", true, "retry_with_longer_timeout")
+        } else if lower.contains("dispatch not reported") {
+            ("dispatch_not_reported", true, "retry_work")
+        } else if lower.contains("worktree patch conflict")
+            || lower.contains("worktree commit failed")
+        {
+            ("worktree_patch_conflict", false, "inspect_branch_conflict")
+        } else if lower.contains("exit failed") {
+            ("process_exit_failed", true, "inspect_runner_logs")
+        } else {
+            ("unknown_worker_failure", true, "inspect_runner_logs")
+        };
+    WorkerFailureProtocol {
+        failure_kind: failure_kind.to_string(),
+        retryable,
+        suggested_action: suggested_action.to_string(),
+        detail: detail.to_string(),
     }
 }
 
@@ -2018,9 +2186,10 @@ impl<'a, A: RunnerAdapter> RunnerCore<'a, A> {
             }
             if output.exit_code.unwrap_or(1) != 0 {
                 return Err(anyhow!(
-                    "{} exit failed: {:?}",
+                    "{} exit failed: {:?}: {}",
                     self.adapter.kind(),
-                    output.exit_code
+                    output.exit_code,
+                    process_failure_excerpt(&output)
                 ));
             }
         } else {
@@ -2110,9 +2279,10 @@ impl<'a, A: RunnerAdapter> RunnerCore<'a, A> {
         }
         if output.exit_code.unwrap_or(1) != 0 {
             return Err(anyhow!(
-                "{} exit failed: {:?}",
+                "{} exit failed: {:?}: {}",
                 self.adapter.kind(),
-                output.exit_code
+                output.exit_code,
+                process_failure_excerpt(&output)
             ));
         }
 
@@ -2774,6 +2944,25 @@ struct ProcessOutput {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     timed_out: bool,
+}
+
+fn process_failure_excerpt(output: &ProcessOutput) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = tail_lines(&stderr, 12);
+    let stdout = tail_lines(&stdout, 12);
+    match (stderr.trim().is_empty(), stdout.trim().is_empty()) {
+        (false, false) => format!("stderr: {stderr}; stdout: {stdout}"),
+        (false, true) => format!("stderr: {stderr}"),
+        (true, false) => format!("stdout: {stdout}"),
+        (true, true) => "no stdout/stderr captured".to_string(),
+    }
+}
+
+fn tail_lines(value: &str, max_lines: usize) -> String {
+    let mut lines = value.lines().rev().take(max_lines).collect::<Vec<_>>();
+    lines.reverse();
+    lines.join("\n")
 }
 
 fn prepare_planner_bin(planner_bin: &Path) -> Result<()> {

@@ -121,8 +121,8 @@ printf 'RIVE_PHASE7_FAKE_OK\n' > "$RIVE_WORKSPACE/phase7-result.txt"
 printf '%s\n' "$RIVE_AGENT_TOKEN" > "$RIVE_WORKSPACE/worker-token-leak-check.txt"
 SNAPSHOT_ID=$(rive snapshot capture --path "$RIVE_WORKSPACE/phase7-result.txt" --label phase7-fake-worker --agent "$RIVE_AGENT_ID" --dispatch "$RIVE_DISPATCH_ID" | sed -n 's/.*"snapshot_id": "\([^"]*\)".*/\1/p' | head -n 1)
 printf 'delegated worker still running\n' | team status --dispatch "$RIVE_DISPATCH_ID" --snapshot "$SNAPSHOT_ID" --command-id "phase7-status-$RIVE_RUN_ID" --stdin >/dev/null
-printf 'delegated worker done\n' | team report --dispatch "$RIVE_DISPATCH_ID" --status done --snapshot "$SNAPSHOT_ID" --command-id "phase7-report-$RIVE_RUN_ID" --stdin >/dev/null
 printf '{"type":"message.part.updated","properties":{"sessionID":"phase7-fake-session","messageID":"msg_1","part":{"type":"text","text":"debug only"}}}' | rive debug trace ingest --adapter opencode-plugin --agent "$RIVE_AGENT_ID" --run "$RIVE_RUN_ID" --dispatch "$RIVE_DISPATCH_ID" --stdin >/dev/null
+printf 'delegated worker done\n' | team report --dispatch "$RIVE_DISPATCH_ID" --status done --snapshot "$SNAPSHOT_ID" --command-id "phase7-report-$RIVE_RUN_ID" --stdin >/dev/null
 printf '{"final":"RIVE_PHASE7_FAKE_OK"}\n'
 "#,
     );
