@@ -294,8 +294,22 @@ pub struct SchedulerNodeRunProtocol {
     pub worker_run_id: Option<String>,
     pub state: String,
     pub failure: Option<WorkerFailureProtocol>,
+    pub activity: SchedulerNodeActivityProtocol,
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SchedulerNodeActivityProtocol {
+    pub prompt_ref: Option<String>,
+    pub stdout_ref: Option<String>,
+    pub stderr_ref: Option<String>,
+    pub stdout_tail: Option<String>,
+    pub stderr_tail: Option<String>,
+    pub recent_trace_events: Vec<String>,
+    pub branch_path: Option<String>,
+    pub branch_ref: Option<String>,
+    pub changed_files: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1768,6 +1782,102 @@ impl<'a> SchedulerService<'a> {
                 .get_scheduler_node_failure(&run.node_run_id)
                 .ok()
                 .flatten(),
+            self.scheduler_node_activity(run)
+                .unwrap_or_else(|_| empty_scheduler_node_activity()),
+        )
+    }
+
+    fn scheduler_node_activity(
+        &self,
+        run: &SchedulerNodeRunRecord,
+    ) -> Result<SchedulerNodeActivityProtocol> {
+        let Some(worker_run_id) = run.worker_run_id.as_ref() else {
+            return Ok(empty_scheduler_node_activity());
+        };
+        let run_ref = debug_run_ref(self.workspace, worker_run_id);
+        let run_dir = self.workspace.debug_runs_dir().join(worker_run_id);
+        let stdout_path = run_dir.join("stdout.jsonl");
+        let stderr_path = run_dir.join("stderr.log");
+        let prompt_path = run_dir.join("prompt.txt");
+        let stdout_ref = stdout_path
+            .exists()
+            .then(|| format!("{run_ref}/stdout.jsonl"));
+        let stderr_ref = stderr_path
+            .exists()
+            .then(|| format!("{run_ref}/stderr.log"));
+        let prompt_ref = prompt_path
+            .exists()
+            .then(|| format!("{run_ref}/prompt.txt"));
+        let stdout_tail = read_tail_if_exists(&stdout_path, 12);
+        let stderr_tail = read_tail_if_exists(&stderr_path, 12);
+        let recent_trace_events =
+            self.recent_trace_summaries(worker_run_id, run.dispatch_id.as_deref());
+        let (branch_path, branch_ref, changed_files) =
+            self.branch_activity_for_dispatch(run.dispatch_id.as_deref());
+        Ok(SchedulerNodeActivityProtocol {
+            prompt_ref,
+            stdout_ref,
+            stderr_ref,
+            stdout_tail,
+            stderr_tail,
+            recent_trace_events,
+            branch_path,
+            branch_ref,
+            changed_files,
+        })
+    }
+
+    fn recent_trace_summaries(&self, run_id: &str, dispatch_id: Option<&str>) -> Vec<String> {
+        self.trace_store
+            .list_events(TraceListFilter {
+                dispatch_id: dispatch_id.map(ToOwned::to_owned),
+                ..TraceListFilter::default()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|event| {
+                event.run_id.as_deref() == Some(run_id)
+                    || dispatch_id.is_some_and(|id| event.dispatch_id.as_deref() == Some(id))
+            })
+            .take(5)
+            .map(|event| {
+                let summary = serde_json::to_string(&event.summary).unwrap_or_default();
+                truncate_chars(&format!("{}: {summary}", event.event_kind), 300)
+            })
+            .collect()
+    }
+
+    fn branch_activity_for_dispatch(
+        &self,
+        dispatch_id: Option<&str>,
+    ) -> (Option<String>, Option<String>, Vec<String>) {
+        let Some(dispatch_id) = dispatch_id else {
+            return (None, None, Vec::new());
+        };
+        let Some(integration) = self
+            .event_store
+            .list_branch_integrations()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|integration| integration.dispatch_id == dispatch_id)
+        else {
+            return (None, None, Vec::new());
+        };
+        let Some(branch) = self
+            .event_store
+            .get_branch_workspace(&integration.branch_id)
+            .ok()
+            .flatten()
+        else {
+            return (None, Some(integration.branch_ref), Vec::new());
+        };
+        let changed_files =
+            changed_files_for_activity(&self.workspace.root, Path::new(&branch.branch_path))
+                .unwrap_or_default();
+        (
+            Some(branch.branch_path),
+            Some(integration.branch_ref),
+            changed_files,
         )
     }
 }
@@ -1910,6 +2020,7 @@ fn scheduler_run_protocol(
 fn scheduler_node_run_protocol(
     run: &SchedulerNodeRunRecord,
     failure: Option<SchedulerNodeFailureRecord>,
+    activity: SchedulerNodeActivityProtocol,
 ) -> SchedulerNodeRunProtocol {
     SchedulerNodeRunProtocol {
         node_run_id: run.node_run_id.clone(),
@@ -1920,9 +2031,89 @@ fn scheduler_node_run_protocol(
         worker_run_id: run.worker_run_id.clone(),
         state: run.state.clone(),
         failure: failure.map(worker_failure_protocol),
+        activity,
         started_at: run.started_at,
         completed_at: run.completed_at,
     }
+}
+
+fn empty_scheduler_node_activity() -> SchedulerNodeActivityProtocol {
+    SchedulerNodeActivityProtocol {
+        prompt_ref: None,
+        stdout_ref: None,
+        stderr_ref: None,
+        stdout_tail: None,
+        stderr_tail: None,
+        recent_trace_events: Vec::new(),
+        branch_path: None,
+        branch_ref: None,
+        changed_files: Vec::new(),
+    }
+}
+
+fn debug_run_ref(workspace: &Workspace, run_id: &str) -> String {
+    workspace
+        .debug_runs_dir()
+        .join(run_id)
+        .strip_prefix(&workspace.root)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| format!(".rive/debug/runs/{run_id}"))
+}
+
+fn read_tail_if_exists(path: &Path, max_lines: usize) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|value| tail_lines(&value, max_lines))
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut truncated = value.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn changed_files_for_activity(parent: &Path, branch: &Path) -> Result<Vec<String>> {
+    if !branch.exists() {
+        return Ok(Vec::new());
+    }
+    let parent = file_digest_map_for_activity(parent)?;
+    let branch = file_digest_map_for_activity(branch)?;
+    let mut changed = parent
+        .keys()
+        .chain(branch.keys())
+        .filter(|path| parent.get(*path) != branch.get(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    changed.sort();
+    changed.dedup();
+    Ok(changed)
+}
+
+fn file_digest_map_for_activity(root: &Path) -> Result<BTreeMap<String, String>> {
+    let mut files = BTreeMap::new();
+    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = path_relative_to(entry.path(), root)?;
+        if scheduler_activity_should_skip(&rel) {
+            continue;
+        }
+        let bytes = fs::read(entry.path())?;
+        files.insert(rel, sha256_hex(&bytes));
+    }
+    Ok(files)
+}
+
+fn scheduler_activity_should_skip(rel: &str) -> bool {
+    matches!(
+        rel.split('/').next().unwrap_or(""),
+        ".rive" | ".git" | ".opencode" | "target"
+    )
 }
 
 fn worker_failure_protocol(record: SchedulerNodeFailureRecord) -> WorkerFailureProtocol {

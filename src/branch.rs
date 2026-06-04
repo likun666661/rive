@@ -46,6 +46,8 @@ pub struct BranchConflictProtocol {
     pub dispatch_id: String,
     pub branch_path: String,
     pub conflict_files: Vec<String>,
+    pub business_conflict_files: Vec<String>,
+    pub runtime_conflict_files: Vec<String>,
     pub worker_summary: Option<String>,
     pub error_message: String,
     pub state: String,
@@ -866,6 +868,10 @@ pub fn branch_conflict_protocol(conflict: &BranchConflictRecord) -> BranchConfli
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let (runtime_conflict_files, business_conflict_files): (Vec<_>, Vec<_>) = conflict_files
+        .iter()
+        .cloned()
+        .partition(|file| is_runtime_conflict_file(file));
     BranchConflictProtocol {
         conflict_id: conflict.conflict_id.clone(),
         integration_id: conflict.integration_id.clone(),
@@ -874,11 +880,25 @@ pub fn branch_conflict_protocol(conflict: &BranchConflictRecord) -> BranchConfli
         dispatch_id: conflict.dispatch_id.clone(),
         branch_path: conflict.branch_path.clone(),
         conflict_files,
+        business_conflict_files,
+        runtime_conflict_files,
         worker_summary: conflict.worker_summary.clone(),
         error_message: conflict.error_message.clone(),
         state: conflict.state.clone(),
-        suggested_actions: vec!["reject", "retry-from-parent", "open-conflict"],
+        suggested_actions: vec![
+            "accept-current",
+            "retry-from-parent",
+            "open-conflict",
+            "reject",
+        ],
     }
+}
+
+fn is_runtime_conflict_file(path: &str) -> bool {
+    matches!(
+        path.split('/').next().unwrap_or(""),
+        ".rive" | ".opencode" | "target"
+    )
 }
 
 enum CopyMode {

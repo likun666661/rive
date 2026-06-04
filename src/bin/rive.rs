@@ -278,6 +278,27 @@ enum BranchConflictCommands {
         #[arg(long)]
         stdin: bool,
     },
+    RetryFromParent {
+        conflict_id: String,
+        #[arg(long = "worker")]
+        workers: Vec<String>,
+        #[arg(long = "command-id")]
+        command_id: String,
+        #[arg(long = "max-parallel")]
+        max_parallel: Option<usize>,
+        #[arg(long = "acceptance-mode")]
+        acceptance_mode: Option<String>,
+        #[arg(long = "workspace-mode", default_value = "worktree")]
+        workspace_mode: String,
+        #[arg(long = "opencode-bin")]
+        opencode_bin: Option<PathBuf>,
+        #[arg(long = "codex-bin")]
+        codex_bin: Option<PathBuf>,
+        #[arg(long = "trust-project")]
+        trust_project: bool,
+        #[arg(long = "timeout-seconds", default_value_t = 300)]
+        timeout_seconds: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1128,6 +1149,70 @@ fn run() -> Result<()> {
                         });
                         let display = serde_json::json!({
                             "summary": format!("Rejected branch conflict {}", conflict.conflict_id),
+                        });
+                        print_json(&Envelope::new(protocol, display))
+                    }
+                    BranchConflictCommands::RetryFromParent {
+                        conflict_id,
+                        workers,
+                        command_id,
+                        max_parallel,
+                        acceptance_mode,
+                        workspace_mode,
+                        opencode_bin,
+                        codex_bin,
+                        trust_project,
+                        timeout_seconds,
+                    } => {
+                        let conflict = service.show_conflict(&conflict_id)?;
+                        for worker in &workers {
+                            let agent = store
+                                .get_agent(worker)?
+                                .ok_or_else(|| anyhow!("agent not found: {worker}"))?;
+                            if agent.role != AgentRole::Worker {
+                                return Err(anyhow!("runner worker role invalid: {worker}"));
+                            }
+                        }
+                        let reason =
+                            b"retry-from-parent rejected conflicted worker branch".to_vec();
+                        let (conflict, integration, reject_idempotency_status) =
+                            service.reject_conflict(&conflict.conflict_id, &command_id, &reason)?;
+                        let trace_store = DebugTraceStore::open(&workspace.db_path())?;
+                        trace_store.init_schema()?;
+                        let snapshot_store = LocalSnapshotStore::new(&workspace);
+                        let scheduler = SchedulerService::new(
+                            &workspace,
+                            &store,
+                            &trace_store,
+                            &snapshot_store,
+                        );
+                        let scheduler_protocol = scheduler.resume(SchedulerResumeInput {
+                            scheduler_run_id: None,
+                            root_work_node_id: None,
+                            work_node_id: Some(integration.work_node_id.clone()),
+                            workers,
+                            command_id: command_id.clone(),
+                            max_parallel,
+                            acceptance_mode,
+                            workspace_mode,
+                            opencode_bin,
+                            codex_bin,
+                            timeout_seconds,
+                            trust_project,
+                            failed: true,
+                        })?;
+                        let protocol = serde_json::json!({
+                            "conflict": branch_conflict_protocol(&conflict),
+                            "rejected_integration": branch_integration_protocol(&integration),
+                            "reject_idempotency_status": reject_idempotency_status,
+                            "scheduler": scheduler_protocol,
+                        });
+                        let display = serde_json::json!({
+                            "summary": format!(
+                                "Rejected conflict {} and retried work {} from parent",
+                                conflict.conflict_id,
+                                integration.work_node_id
+                            ),
                         });
                         print_json(&Envelope::new(protocol, display))
                     }

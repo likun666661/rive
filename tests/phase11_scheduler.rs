@@ -340,6 +340,32 @@ fn branch_conflict_reject(
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn branch_conflict_retry_from_parent(
+    temp: &TempDir,
+    conflict_id: &str,
+    command_id: &str,
+    fake: &Path,
+) -> Value {
+    run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("branch")
+            .arg("conflict")
+            .arg("retry-from-parent")
+            .arg(conflict_id)
+            .arg("--worker")
+            .arg("worker-a")
+            .arg("--worker")
+            .arg("worker-b")
+            .arg("--command-id")
+            .arg(command_id)
+            .arg("--opencode-bin")
+            .arg(fake)
+            .arg("--timeout-seconds")
+            .arg("10"),
+    )
+}
+
 fn first_branch_integration_id(temp: &TempDir) -> String {
     let conn = Connection::open(temp.path().join(".rive/rive.db")).unwrap();
     conn.query_row(
@@ -810,6 +836,25 @@ fn scheduler_classifies_no_report_runner_stdout_errors() {
     assert_eq!(suggested_action, "retry_after_certificate_fix");
     assert!(detail.contains("unknown certificate verification error"));
     assert!(detail.contains("dispatch not reported"));
+
+    let status = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("scheduler")
+            .arg("status")
+            .arg("--root")
+            .arg(&root),
+    );
+    let node_run = &status["protocol"]["node_runs"][0];
+    assert_eq!(node_run["failure"]["failure_kind"], "certificate_error");
+    assert!(node_run["activity"]["stdout_tail"]
+        .as_str()
+        .unwrap()
+        .contains("unknown certificate verification error"));
+    assert!(node_run["activity"]["stdout_ref"]
+        .as_str()
+        .unwrap()
+        .contains(".rive/debug/runs/"));
 }
 
 #[test]
@@ -1542,11 +1587,23 @@ fn worktree_commit_conflict_records_read_model_and_rejects_safely() {
         .unwrap()
         .iter()
         .any(|file| file.as_str() == Some("conflict.txt")));
+    assert!(conflict["protocol"]["conflict"]["business_conflict_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|file| file.as_str() == Some("conflict.txt")));
+    assert_eq!(
+        conflict["protocol"]["conflict"]["runtime_conflict_files"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
     assert!(conflict["protocol"]["conflict"]["suggested_actions"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|action| action.as_str() == Some("reject")));
+        .any(|action| action.as_str() == Some("retry-from-parent")));
     let conflict_id = conflict["protocol"]["conflict"]["conflict_id"]
         .as_str()
         .unwrap()
@@ -1559,6 +1616,124 @@ fn worktree_commit_conflict_records_read_model_and_rejects_safely() {
     );
     assert_eq!(rejected["protocol"]["conflict"]["state"], "rejected");
     assert_eq!(rejected["protocol"]["integration"]["state"], "rejected");
+}
+
+#[test]
+fn branch_conflict_retry_from_parent_rejects_and_reruns_work() {
+    let temp = init_git_workspace();
+    fs::write(temp.path().join("conflict.txt"), "base\n").unwrap();
+    run_git(&temp, ["add", "conflict.txt"]);
+    run_git(&temp, ["commit", "-m", "add retry conflict fixture"]);
+    add_worker(&temp, "worker-a");
+    add_worker(&temp, "worker-b");
+    let root = create_work(&temp, "phase17-conflict-retry-root", "root");
+    let a = create_work(&temp, "phase17-conflict-retry-a", "A");
+    add_edge(
+        &temp,
+        "decomposes-to",
+        &root,
+        &a,
+        "edge-phase17-conflict-retry-root-a",
+    );
+    let fake = temp.path().join("fake-opencode-conflict-retry");
+    write_branch_conflict_worker(&fake);
+
+    let mut command = scheduler_command_with_mode(
+        &temp,
+        &fake,
+        &root,
+        "phase17-conflict-retry-scheduler",
+        "manual",
+    );
+    command.arg("--workspace-mode").arg("worktree");
+    let response = run_json(&mut command);
+    assert_eq!(response["protocol"]["scheduler"]["state"], "waiting_review");
+    fs::write(temp.path().join("conflict.txt"), "parent current\n").unwrap();
+
+    let integration_id = first_branch_integration_id(&temp);
+    let error = run_json_expect_error(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("branch")
+            .arg("commit")
+            .arg(&integration_id)
+            .arg("--command-id")
+            .arg("phase17-conflict-retry-commit"),
+    );
+    assert_eq!(error["protocol"]["code"], "worktree_patch_conflict");
+    let conflict = branch_conflict_show(&temp, &integration_id);
+    let conflict_id = conflict["protocol"]["conflict"]["conflict_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let bad_worker_error = run_json_expect_error(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("branch")
+            .arg("conflict")
+            .arg("retry-from-parent")
+            .arg(&conflict_id)
+            .arg("--worker")
+            .arg("missing-worker")
+            .arg("--command-id")
+            .arg("phase17-conflict-retry-bad-worker")
+            .arg("--opencode-bin")
+            .arg(&fake)
+            .arg("--timeout-seconds")
+            .arg("10"),
+    );
+    assert_eq!(bad_worker_error["protocol"]["code"], "agent_not_found");
+    assert_eq!(
+        branch_conflict_show(&temp, &conflict_id)["protocol"]["conflict"]["state"],
+        "open"
+    );
+
+    let retried = branch_conflict_retry_from_parent(
+        &temp,
+        &conflict_id,
+        "phase17-conflict-retry-from-parent",
+        &fake,
+    );
+    assert_eq!(retried["protocol"]["conflict"]["state"], "rejected");
+    assert_eq!(
+        retried["protocol"]["rejected_integration"]["state"],
+        "rejected"
+    );
+    assert_eq!(
+        retried["protocol"]["scheduler"]["scheduler"]["state"],
+        "waiting_review"
+    );
+    assert_eq!(
+        inspect_work(&temp, &a)["protocol"]["projection"]["state"],
+        "reviewable"
+    );
+
+    let conn = Connection::open(temp.path().join(".rive/rive.db")).unwrap();
+    let rejected_integrations: i64 = conn
+        .query_row(
+            "select count(*) from branch_integrations where state='rejected'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rejected_integrations, 1);
+    let pending_integrations: i64 = conn
+        .query_row(
+            "select count(*) from branch_integrations where state='pending'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending_integrations, 1);
+    let superseded: i64 = conn
+        .query_row(
+            "select count(*) from scheduler_node_runs where state='superseded'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(superseded, 1);
 }
 
 #[test]
