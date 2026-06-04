@@ -2894,6 +2894,28 @@ impl EventStore {
         }
     }
 
+    pub fn get_workflow_template_version_by_hash(
+        &self,
+        template_id: &str,
+        template_hash: &str,
+    ) -> Result<Option<WorkflowTemplateVersionRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT template_id, version, template_hash, source_ref, spec_json, created_at
+            FROM workflow_template_versions
+            WHERE template_id = ?1 AND template_hash = ?2
+            ORDER BY version DESC
+            LIMIT 1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![template_id, template_hash])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_workflow_template_version(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn get_latest_workflow_template_version(
         &self,
         template_id: &str,
@@ -2987,6 +3009,29 @@ impl EventStore {
         )?;
         self.get_workflow_run(&input.workflow_run_id)?
             .ok_or_else(|| anyhow::anyhow!("workflow run not found: {}", input.workflow_run_id))
+    }
+
+    pub fn update_workflow_run_state(
+        &self,
+        workflow_run_id: &str,
+        state: &str,
+        completed_at: Option<DateTime<Utc>>,
+    ) -> Result<WorkflowRunRecord> {
+        self.conn.execute(
+            r#"
+            UPDATE workflow_runs
+            SET state = ?2,
+                completed_at = ?3
+            WHERE workflow_run_id = ?1
+            "#,
+            params![
+                workflow_run_id,
+                state,
+                completed_at.map(|time| time.to_rfc3339()),
+            ],
+        )?;
+        self.get_workflow_run(workflow_run_id)?
+            .ok_or_else(|| anyhow::anyhow!("workflow run not found: {}", workflow_run_id))
     }
 
     pub fn insert_workflow_run_node(&self, input: &InsertWorkflowRunNodeInput) -> Result<()> {

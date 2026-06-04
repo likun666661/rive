@@ -34,6 +34,7 @@ use rive::work::{
 };
 use rive::workflow::{
     WorkflowImportInput, WorkflowRunInput, WorkflowSchedulerRequest, WorkflowService,
+    WorkflowStatusInput,
 };
 use rive::workspace::{find_workspace, init_workspace};
 
@@ -454,12 +455,18 @@ enum WorkflowCommands {
         path: PathBuf,
         #[arg(long = "command-id")]
         command_id: String,
+        #[arg(long = "bump-if-changed")]
+        bump_if_changed: bool,
     },
     List,
     Show {
         template_id: String,
         #[arg(long)]
         version: Option<i64>,
+    },
+    Status {
+        #[arg(long = "run")]
+        workflow_run_id: String,
     },
     Run {
         template_id: String,
@@ -1516,14 +1523,22 @@ fn run() -> Result<()> {
                 });
                 print_json(&Envelope::new(protocol, display))
             }
-            WorkflowCommands::Import { path, command_id } => {
+            WorkflowCommands::Import {
+                path,
+                command_id,
+                bump_if_changed,
+            } => {
                 let workspace = find_workspace(&std::env::current_dir()?)
                     .map_err(|_| anyhow!("workspace not initialized"))?;
                 let store = EventStore::open(&workspace.db_path())?;
                 store.init_schema()?;
                 let snapshot_store = LocalSnapshotStore::new(&workspace);
                 let service = WorkflowService::new(&workspace, &store, &snapshot_store);
-                let protocol = service.import(WorkflowImportInput { path, command_id })?;
+                let protocol = service.import(WorkflowImportInput {
+                    path,
+                    command_id,
+                    bump_if_changed,
+                })?;
                 let display = serde_json::json!({
                     "summary": format!(
                         "Imported workflow {}@{} {}",
@@ -1561,6 +1576,23 @@ fn run() -> Result<()> {
                         "Workflow {}@{} {}",
                         protocol.template_id, protocol.version, protocol.template_hash
                     ),
+                });
+                print_json(&Envelope::new(protocol, display))
+            }
+            WorkflowCommands::Status { workflow_run_id } => {
+                let workspace = find_workspace(&std::env::current_dir()?)
+                    .map_err(|_| anyhow!("workspace not initialized"))?;
+                let store = EventStore::open(&workspace.db_path())?;
+                store.init_schema()?;
+                let snapshot_store = LocalSnapshotStore::new(&workspace);
+                let service = WorkflowService::new(&workspace, &store, &snapshot_store);
+                let protocol = service.status(WorkflowStatusInput { workflow_run_id })?;
+                let display = serde_json::json!({
+                    "summary": format!(
+                        "Workflow run {} effective state {} root {}",
+                        protocol.workflow_run_id, protocol.state, protocol.root_projection.state
+                    ),
+                    "debug_note": "Use protocol.debug.scheduler_node_runs stdout_ref/stderr_ref/prompt_ref for runner failure inspection.",
                 });
                 print_json(&Envelope::new(protocol, display))
             }
@@ -1731,6 +1763,8 @@ fn error_envelope(error: &anyhow::Error) -> ErrorEnvelope {
         ("workflow_template_version_conflict", "fix_arguments")
     } else if lower.contains("workflow template not found") {
         ("workflow_template_not_found", "fix_arguments")
+    } else if lower.contains("workflow run not found") {
+        ("workflow_run_not_found", "fix_arguments")
     } else if lower.contains("workflow scheduler execution not supported") {
         ("workflow_scheduler_not_supported", "fix_arguments")
     } else if lower.contains("unsupported workflow api version") {

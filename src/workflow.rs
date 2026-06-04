@@ -12,9 +12,9 @@ use uuid::Uuid;
 use crate::snapshot::SnapshotStore;
 use crate::store::{
     EventStore, InsertWorkflowImportCommandInput, InsertWorkflowRunInput,
-    InsertWorkflowRunNodeInput, UpdateWorkflowRunSchedulerInput, UpsertWorkflowTemplateInput,
-    WorkflowRunNodeRecord, WorkflowRunRecord, WorkflowTemplateRecord,
-    WorkflowTemplateVersionRecord,
+    InsertWorkflowRunNodeInput, SchedulerNodeRunRecord, SchedulerRunRecord,
+    UpdateWorkflowRunSchedulerInput, UpsertWorkflowTemplateInput, WorkflowRunNodeRecord,
+    WorkflowRunRecord, WorkflowTemplateRecord, WorkflowTemplateVersionRecord,
 };
 use crate::work::{
     AddWorkEdgeInput, BindWorkRootCommand, CreateWorkNodeInput, WorkEdgeType, WorkNodeKind,
@@ -95,9 +95,11 @@ pub struct WorkflowValidationProtocol {
 pub struct WorkflowImportProtocol {
     pub template_id: String,
     pub version: i64,
+    pub source_version: i64,
     pub template_hash: String,
     pub title: String,
     pub source_ref: String,
+    pub bump_if_changed: bool,
     pub idempotency_status: &'static str,
 }
 
@@ -136,15 +138,19 @@ pub struct WorkflowRunProtocol {
     pub params_hash: String,
     pub root_work_node_id: String,
     pub state: String,
+    pub stored_state: String,
+    pub effective_state_reason: String,
     pub idempotency_status: &'static str,
     pub scheduler: Option<WorkflowRunSchedulerProtocol>,
     pub nodes: Vec<WorkflowRunNodeProtocol>,
     pub root_projection: WorkProjectionProtocol,
+    pub debug: WorkflowRunDebugProtocol,
 }
 
 #[derive(Debug, Serialize)]
 pub struct WorkflowRunSchedulerProtocol {
     pub scheduler_run_id: String,
+    pub runner: String,
     pub state: String,
 }
 
@@ -156,10 +162,30 @@ pub struct WorkflowRunNodeProtocol {
     pub capability_policy: Value,
 }
 
+#[derive(Debug, Serialize)]
+pub struct WorkflowRunDebugProtocol {
+    pub summary: String,
+    pub scheduler_node_runs: Vec<WorkflowRunDebugNodeProtocol>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkflowRunDebugNodeProtocol {
+    pub node_run_id: String,
+    pub work_node_id: String,
+    pub dispatch_id: Option<String>,
+    pub worker_agent_id: String,
+    pub worker_run_id: Option<String>,
+    pub state: String,
+    pub stdout_ref: Option<String>,
+    pub stderr_ref: Option<String>,
+    pub prompt_ref: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct WorkflowImportInput {
     pub path: PathBuf,
     pub command_id: String,
+    pub bump_if_changed: bool,
 }
 
 #[derive(Debug)]
@@ -168,6 +194,11 @@ pub struct WorkflowRunInput {
     pub command_id: String,
     pub params: Vec<(String, String)>,
     pub scheduler_request: Option<WorkflowSchedulerRequest>,
+}
+
+#[derive(Debug)]
+pub struct WorkflowStatusInput {
+    pub workflow_run_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -209,20 +240,33 @@ impl<'a, B: SnapshotStore> WorkflowService<'a, B> {
         }
         self.store.init_work_schema()?;
         let loaded = LoadedWorkflow::load(&input.path)?;
-        let request_hash = loaded.import_request_hash();
+        let target_version = self.import_target_version(&loaded, input.bump_if_changed)?;
+        let request_hash = import_request_hash(
+            &loaded.spec.id,
+            target_version,
+            &loaded.template_hash,
+            input.bump_if_changed,
+        );
         if let Some(existing) = self.store.get_workflow_import_command(&input.command_id)? {
             let (template_id, version, template_hash, existing_request_hash) = existing;
             if template_id == loaded.spec.id
-                && version == loaded.spec.version
+                && version == target_version
                 && template_hash == loaded.template_hash
-                && existing_request_hash == request_hash
+                && import_request_hash_matches(
+                    &existing_request_hash,
+                    &request_hash,
+                    &loaded.template_hash,
+                    input.bump_if_changed,
+                )
             {
                 return Ok(WorkflowImportProtocol {
                     template_id,
                     version,
+                    source_version: loaded.spec.version,
                     template_hash,
                     title: loaded.spec.title,
                     source_ref: loaded.source_ref,
+                    bump_if_changed: input.bump_if_changed,
                     idempotency_status: "replayed",
                 });
             }
@@ -232,7 +276,7 @@ impl<'a, B: SnapshotStore> WorkflowService<'a, B> {
         self.store
             .upsert_workflow_template(&UpsertWorkflowTemplateInput {
                 template_id: loaded.spec.id.clone(),
-                version: loaded.spec.version,
+                version: target_version,
                 template_hash: loaded.template_hash.clone(),
                 title: loaded.spec.title.clone(),
                 source_ref: loaded.source_ref.clone(),
@@ -243,19 +287,47 @@ impl<'a, B: SnapshotStore> WorkflowService<'a, B> {
             .insert_workflow_import_command(&InsertWorkflowImportCommandInput {
                 command_id: input.command_id,
                 template_id: loaded.spec.id.clone(),
-                version: loaded.spec.version,
+                version: target_version,
                 template_hash: loaded.template_hash.clone(),
                 request_hash,
                 created_at: now,
             })?;
         Ok(WorkflowImportProtocol {
             template_id: loaded.spec.id,
-            version: loaded.spec.version,
+            version: target_version,
+            source_version: loaded.spec.version,
             template_hash: loaded.template_hash,
             title: loaded.spec.title,
             source_ref: loaded.source_ref,
+            bump_if_changed: input.bump_if_changed,
             idempotency_status: "inserted",
         })
+    }
+
+    fn import_target_version(&self, loaded: &LoadedWorkflow, bump_if_changed: bool) -> Result<i64> {
+        if !bump_if_changed {
+            return Ok(loaded.spec.version);
+        }
+        if let Some(existing_hash) = self
+            .store
+            .get_workflow_template_version_by_hash(&loaded.spec.id, &loaded.template_hash)?
+        {
+            return Ok(existing_hash.version);
+        }
+        if let Some(existing_version) = self
+            .store
+            .get_workflow_template_version(&loaded.spec.id, loaded.spec.version)?
+        {
+            if existing_version.template_hash != loaded.template_hash {
+                let latest = self
+                    .store
+                    .get_workflow_template(&loaded.spec.id)?
+                    .map(|template| template.latest_version)
+                    .unwrap_or(loaded.spec.version);
+                return Ok(latest + 1);
+            }
+        }
+        Ok(loaded.spec.version)
     }
 
     pub fn list(&self) -> Result<WorkflowTemplateListProtocol> {
@@ -419,9 +491,18 @@ impl<'a, B: SnapshotStore> WorkflowService<'a, B> {
         self.run_protocol(run, idempotency_status)
     }
 
+    pub fn status(&self, input: WorkflowStatusInput) -> Result<WorkflowRunProtocol> {
+        self.store.init_work_schema()?;
+        let run = self
+            .store
+            .get_workflow_run(&input.workflow_run_id)?
+            .ok_or_else(|| anyhow!("workflow run not found: {}", input.workflow_run_id))?;
+        self.run_protocol(run, "status")
+    }
+
     fn run_protocol(
         &self,
-        run: WorkflowRunRecord,
+        mut run: WorkflowRunRecord,
         idempotency_status: &'static str,
     ) -> Result<WorkflowRunProtocol> {
         let work_service = WorkService::new(self.workspace, self.store, self.blob_store);
@@ -432,16 +513,34 @@ impl<'a, B: SnapshotStore> WorkflowService<'a, B> {
             .into_iter()
             .map(workflow_run_node_protocol)
             .collect();
-        let scheduler = if let Some(scheduler_run_id) = &run.scheduler_run_id {
-            self.store
-                .get_scheduler_run(scheduler_run_id)?
-                .map(|scheduler| WorkflowRunSchedulerProtocol {
-                    scheduler_run_id: scheduler.scheduler_run_id,
-                    state: scheduler.state,
-                })
+        let scheduler_record = if let Some(scheduler_run_id) = &run.scheduler_run_id {
+            self.store.get_scheduler_run(scheduler_run_id)?
         } else {
-            None
+            self.store
+                .latest_scheduler_run_for_root(&run.root_work_node_id)?
         };
+        let node_runs = if let Some(scheduler) = &scheduler_record {
+            self.store
+                .list_scheduler_node_runs_for_scheduler(&scheduler.scheduler_run_id)?
+        } else {
+            Vec::new()
+        };
+        let (effective_state, effective_state_reason) =
+            effective_workflow_state(&run, scheduler_record.as_ref(), &root_projection);
+        let stored_state = run.state.clone();
+        if effective_state != run.state {
+            run = self.store.update_workflow_run_state(
+                &run.workflow_run_id,
+                &effective_state,
+                workflow_completed_at(&effective_state),
+            )?;
+        };
+        let scheduler = scheduler_record.map(|scheduler| WorkflowRunSchedulerProtocol {
+            scheduler_run_id: scheduler.scheduler_run_id,
+            runner: scheduler.runner,
+            state: scheduler.state,
+        });
+        let debug = workflow_run_debug_protocol(self.workspace, scheduler.as_ref(), &node_runs);
         Ok(WorkflowRunProtocol {
             workflow_run_id: run.workflow_run_id,
             template_id: run.template_id,
@@ -449,13 +548,143 @@ impl<'a, B: SnapshotStore> WorkflowService<'a, B> {
             template_hash: run.template_hash,
             params_hash: run.params_hash,
             root_work_node_id: run.root_work_node_id,
-            state: run.state,
+            state: effective_state,
+            stored_state,
+            effective_state_reason,
             idempotency_status,
             scheduler,
             nodes,
             root_projection,
+            debug,
         })
     }
+}
+
+fn effective_workflow_state(
+    run: &WorkflowRunRecord,
+    scheduler: Option<&SchedulerRunRecord>,
+    root_projection: &WorkProjectionProtocol,
+) -> (String, String) {
+    if root_projection.state == "done" {
+        return ("completed".to_string(), "root_projection_done".to_string());
+    }
+    if let Some(scheduler) = scheduler {
+        return match scheduler.state.as_str() {
+            "failed" => ("failed".to_string(), "scheduler_failed".to_string()),
+            "stalled" => ("stalled".to_string(), "scheduler_stalled".to_string()),
+            "waiting_review" => (
+                "waiting_review".to_string(),
+                "scheduler_waiting_review".to_string(),
+            ),
+            "running" => ("running".to_string(), "scheduler_running".to_string()),
+            "completed" => (
+                "stalled".to_string(),
+                format!("scheduler_completed_root_{}", root_projection.state),
+            ),
+            other => (other.to_string(), "scheduler_state".to_string()),
+        };
+    }
+    (run.state.clone(), "stored_state".to_string())
+}
+
+fn workflow_completed_at(state: &str) -> Option<DateTime<Utc>> {
+    matches!(state, "completed" | "failed" | "stalled").then(Utc::now)
+}
+
+fn workflow_run_debug_protocol(
+    workspace: &Workspace,
+    scheduler: Option<&WorkflowRunSchedulerProtocol>,
+    node_runs: &[SchedulerNodeRunRecord],
+) -> WorkflowRunDebugProtocol {
+    let scheduler_runner = scheduler.map(|scheduler| scheduler.runner.as_str());
+    let failed = node_runs.iter().filter(|run| run.state == "failed").count();
+    let active = node_runs
+        .iter()
+        .filter(|run| matches!(run.state.as_str(), "claimed" | "running"))
+        .count();
+    let summary = if failed > 0 {
+        "scheduler has failed node runs; inspect each node's stdout_ref/stderr_ref/prompt_ref"
+            .to_string()
+    } else if active > 0 {
+        "scheduler has active node runs".to_string()
+    } else if node_runs.is_empty() {
+        "no scheduler node runs recorded".to_string()
+    } else {
+        "scheduler node runs recorded".to_string()
+    };
+    WorkflowRunDebugProtocol {
+        summary,
+        scheduler_node_runs: node_runs
+            .iter()
+            .map(|run| workflow_debug_node_protocol(workspace, scheduler_runner, run))
+            .collect(),
+    }
+}
+
+fn workflow_debug_node_protocol(
+    workspace: &Workspace,
+    scheduler_runner: Option<&str>,
+    run: &SchedulerNodeRunRecord,
+) -> WorkflowRunDebugNodeProtocol {
+    let stdout_file = match scheduler_runner {
+        Some("opencode") | Some("codex") => "stdout.jsonl",
+        _ => "stdout.jsonl",
+    };
+    let debug_ref = |file_name: &str| {
+        run.worker_run_id
+            .as_ref()
+            .map(|run_id| format!("{}/{}", debug_run_ref(workspace, run_id), file_name))
+    };
+    WorkflowRunDebugNodeProtocol {
+        node_run_id: run.node_run_id.clone(),
+        work_node_id: run.work_node_id.clone(),
+        dispatch_id: run.dispatch_id.clone(),
+        worker_agent_id: run.worker_agent_id.clone(),
+        worker_run_id: run.worker_run_id.clone(),
+        state: run.state.clone(),
+        stdout_ref: debug_ref(stdout_file),
+        stderr_ref: debug_ref("stderr.log"),
+        prompt_ref: debug_ref("prompt.txt"),
+    }
+}
+
+fn debug_run_ref(workspace: &Workspace, run_id: &str) -> String {
+    workspace
+        .debug_runs_dir()
+        .join(run_id)
+        .strip_prefix(&workspace.root)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| format!(".rive/debug/runs/{run_id}"))
+}
+
+fn import_request_hash(
+    template_id: &str,
+    version: i64,
+    template_hash: &str,
+    bump_if_changed: bool,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(template_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(version.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(template_hash.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(if bump_if_changed {
+        b"bump".as_slice()
+    } else {
+        b"fixed".as_slice()
+    });
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn import_request_hash_matches(
+    existing: &str,
+    current: &str,
+    legacy_template_hash: &str,
+    bump_if_changed: bool,
+) -> bool {
+    existing == current || (!bump_if_changed && existing == legacy_template_hash)
 }
 
 struct LoadedWorkflow {
@@ -503,10 +732,6 @@ impl LoadedWorkflow {
             edge_count: self.spec.edges.len(),
             source_ref: self.source_ref.clone(),
         }
-    }
-
-    fn import_request_hash(&self) -> String {
-        self.template_hash.clone()
     }
 }
 

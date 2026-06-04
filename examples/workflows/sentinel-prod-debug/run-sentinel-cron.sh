@@ -82,12 +82,15 @@ if ! mkdir "$lock_dir" 2>/dev/null; then
 fi
 trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT
 
-if ! "$rive_bin" workflow show "$template_id" >/dev/null 2>&1; then
-  import_id="sentinel-prod-debug-import-$(date -u +%Y%m%d%H%M%S)"
-  log "importing workflow package $workflow_package"
-  "$rive_bin" workflow validate "$workflow_package" >/dev/null
-  "$rive_bin" workflow import "$workflow_package" --command-id "$import_id" >/dev/null
-fi
+validation_json="$("$rive_bin" workflow validate "$workflow_package")"
+template_hash="$(printf '%s' "$validation_json" | jq -r '.protocol.template_hash')"
+template_hash_short="${template_hash#sha256:}"
+template_hash_short="${template_hash_short:0:16}"
+import_id="sentinel-prod-debug-import-$template_hash_short"
+log "reconciling workflow package $workflow_package hash=$template_hash"
+"$rive_bin" workflow import "$workflow_package" \
+  --command-id "$import_id" \
+  --bump-if-changed >/dev/null
 
 if ! "$rive_bin" agent list | jq -e --arg worker "$worker" \
   '.protocol.agents[]? | select(.name == $worker and .role == "worker")' >/dev/null; then
@@ -112,6 +115,16 @@ limit 1;
   IFS='|' read -r stale_workflow stale_scheduler stale_root <<<"$stale_row"
   if [[ "${stale_scheduler:-}" == "__none__" ]]; then
     stale_scheduler=""
+  fi
+  if [[ -n "${stale_workflow:-}" ]]; then
+    stale_status_json="$("$rive_bin" workflow status --run "$stale_workflow" || true)"
+    stale_effective_state="$(printf '%s' "$stale_status_json" | jq -r '.protocol.state // empty')"
+    if [[ "$stale_effective_state" == "completed" || "$stale_effective_state" == "failed" ]]; then
+      log "latest candidate workflow_run=$stale_workflow is already effective_state=$stale_effective_state; starting fresh"
+      stale_workflow=""
+      stale_scheduler=""
+      stale_root=""
+    fi
   fi
 else
   stale_workflow=""
@@ -182,20 +195,15 @@ where workflow_run_id = '$(sql_quote "$workflow_run_id")';
 ")"
 fi
 
-workflow_state="$(sqlite3 "$db_path" "select state from workflow_runs where workflow_run_id = '$(sql_quote "$workflow_run_id")';")"
-scheduler_state=""
-root_state=""
-if [[ -n "${scheduler_run_id:-}" && "$scheduler_run_id" != "null" ]]; then
-  status_json="$("$rive_bin" scheduler status --run "$scheduler_run_id" || true)"
-  scheduler_state="$(printf '%s' "$status_json" | jq -r '.protocol.scheduler.state // empty')"
-  root_state="$(printf '%s' "$status_json" | jq -r '.protocol.root_work.state // empty')"
-fi
+status_json="$("$rive_bin" workflow status --run "$workflow_run_id" || true)"
+workflow_state="$(printf '%s' "$status_json" | jq -r '.protocol.state // empty')"
+scheduler_state="$(printf '%s' "$status_json" | jq -r '.protocol.scheduler.state // empty')"
+root_state="$(printf '%s' "$status_json" | jq -r '.protocol.root_projection.state // empty')"
+scheduler_run_id="$(printf '%s' "$status_json" | jq -r '.protocol.scheduler.scheduler_run_id // empty')"
 
 if [[ "$workflow_state" != "completed" && ! ( "$scheduler_state" == "completed" && "$root_state" == "done" ) ]]; then
   log "workflow_run=$workflow_run_id ended with state=$workflow_state scheduler_state=${scheduler_state:-unknown} root_state=${root_state:-unknown}; skipping Slack notification"
-  if [[ -n "$scheduler_run_id" && "$scheduler_run_id" != "null" ]]; then
-    "$rive_bin" scheduler status --run "$scheduler_run_id" || true
-  fi
+  printf '%s\n' "$status_json"
   exit 1
 fi
 

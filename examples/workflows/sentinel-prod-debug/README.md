@@ -5,7 +5,9 @@ This is a reusable Rive workflow package. It contains both the workflow DAG and 
 Import:
 
 ```sh
-rive workflow import examples/workflows/sentinel-prod-debug --command-id import-sentinel-v1
+rive workflow import examples/workflows/sentinel-prod-debug \
+  --command-id import-sentinel-v1 \
+  --bump-if-changed
 ```
 
 Instantiate without starting the scheduler:
@@ -62,12 +64,12 @@ examples/workflows/sentinel-prod-debug/run-sentinel-cron.sh
 The wrapper:
 
 - initializes the Rive workspace if needed;
-- imports this workflow package if missing;
+- reconciles this workflow package on every tick with `workflow import --bump-if-changed`, so prompt edits create a new immutable version instead of silently reusing an old one;
 - creates the configured worker agent if missing;
 - exports `SENTINEL_SKILL_DIR` and puts `sentinel` on `PATH`, so Codex workers can load the Sentinel skill and use the Sentinel CLI;
 - uses a lock directory under `.rive/run/` so cron cannot overlap runs;
 - starts or resumes a Codex-backed scheduler run;
-- waits for root Work DAG projection to finish;
+- uses `rive workflow status --run ...` for the effective workflow state, so a root that is already `done` is not mistaken for a stale run because of an old stored projection;
 - locates the `final-judge-and-slack` artifact from the Rive ledger.
 
 The workflow prompts explicitly instruct workers to read:

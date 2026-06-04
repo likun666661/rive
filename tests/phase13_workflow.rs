@@ -270,6 +270,11 @@ fn db_text(temp: &TempDir, sql: &str) -> String {
     conn.query_row(sql, [], |row| row.get(0)).unwrap()
 }
 
+fn db_execute(temp: &TempDir, sql: &str) {
+    let conn = Connection::open(temp.path().join(".rive/rive.db")).unwrap();
+    conn.execute(sql, []).unwrap();
+}
+
 fn import_workflow(temp: &TempDir, path: &Path, command_id: &str) -> Value {
     run_json(
         rive_cmd()
@@ -279,6 +284,19 @@ fn import_workflow(temp: &TempDir, path: &Path, command_id: &str) -> Value {
             .arg(path)
             .arg("--command-id")
             .arg(command_id),
+    )
+}
+
+fn import_workflow_bump_if_changed(temp: &TempDir, path: &Path, command_id: &str) -> Value {
+    run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("workflow")
+            .arg("import")
+            .arg(path)
+            .arg("--command-id")
+            .arg(command_id)
+            .arg("--bump-if-changed"),
     )
 }
 
@@ -348,6 +366,49 @@ fn workflow_import_registers_immutable_template_without_business_side_effects() 
             .arg("wf-import-1"),
     );
     assert_eq!(conflict["protocol"]["code"], "idempotency_conflict");
+}
+
+#[test]
+fn workflow_import_can_bump_version_when_prompt_hash_changes() {
+    let temp = init_workspace();
+    let package = write_workflow_package(&temp);
+
+    let v1 = import_workflow(&temp, &package, "wf-import-bump-base");
+    assert_eq!(v1["protocol"]["version"], 1);
+    let original_hash = v1["protocol"]["template_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    fs::write(
+        package.join("prompts/scan.md"),
+        "Changed prompt bytes for cron wrapper.\n",
+    )
+    .unwrap();
+
+    let bumped = import_workflow_bump_if_changed(&temp, &package, "wf-import-bump-changed");
+    assert_eq!(bumped["protocol"]["idempotency_status"], "inserted");
+    assert_eq!(bumped["protocol"]["version"], 2);
+    assert_eq!(bumped["protocol"]["source_version"], 1);
+    assert_eq!(bumped["protocol"]["bump_if_changed"], true);
+    assert_ne!(bumped["protocol"]["template_hash"], original_hash);
+
+    let show_latest = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("workflow")
+            .arg("show")
+            .arg("test.workflow"),
+    );
+    assert_eq!(show_latest["protocol"]["version"], 2);
+    assert_eq!(
+        show_latest["protocol"]["spec"]["nodes"]["scan"]["prompt"]["inline"],
+        "Changed prompt bytes for cron wrapper.\n"
+    );
+
+    let replay = import_workflow_bump_if_changed(&temp, &package, "wf-import-bump-changed");
+    assert_eq!(replay["protocol"]["idempotency_status"], "replayed");
+    assert_eq!(db_count(&temp, "workflow_template_versions"), 2);
 }
 
 #[test]
@@ -565,6 +626,78 @@ fn workflow_run_can_execute_scheduler_and_replay_without_relaunch() {
             .arg(&fake),
     );
     assert_eq!(conflict["protocol"]["code"], "idempotency_conflict");
+}
+
+#[test]
+fn workflow_status_repairs_effective_state_from_root_projection() {
+    let temp = init_workspace();
+    add_worker(&temp, "worker-a");
+    let package = write_workflow_package(&temp);
+    import_workflow(&temp, &package, "wf-import-status");
+    let fake = temp.path().join("fake-opencode-workflow-status");
+    write_fake_opencode_reporter(&fake);
+
+    let run = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("workflow")
+            .arg("run")
+            .arg("test.workflow")
+            .arg("--param")
+            .arg("slack_channel=#alerts")
+            .arg("--command-id")
+            .arg("wf-run-status")
+            .arg("--worker")
+            .arg("worker-a")
+            .arg("--max-parallel")
+            .arg("1")
+            .arg("--acceptance-mode")
+            .arg("auto-reported")
+            .arg("--opencode-bin")
+            .arg(&fake)
+            .arg("--timeout-seconds")
+            .arg("10"),
+    );
+    let workflow_run_id = run["protocol"]["workflow_run_id"].as_str().unwrap();
+    assert_eq!(run["protocol"]["state"], "completed");
+
+    db_execute(
+        &temp,
+        "UPDATE workflow_runs SET state='instantiated', scheduler_run_id=NULL, completed_at=NULL",
+    );
+
+    let status = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("workflow")
+            .arg("status")
+            .arg("--run")
+            .arg(workflow_run_id),
+    );
+    assert_eq!(status["protocol"]["stored_state"], "instantiated");
+    assert_eq!(status["protocol"]["state"], "completed");
+    assert_eq!(
+        status["protocol"]["effective_state_reason"],
+        "root_projection_done"
+    );
+    assert_eq!(status["protocol"]["scheduler"]["state"], "completed");
+    assert_eq!(
+        status["protocol"]["debug"]["scheduler_node_runs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        status["protocol"]["debug"]["scheduler_node_runs"][0]["stdout_ref"]
+            .as_str()
+            .unwrap()
+            .contains(".rive/debug/runs/")
+    );
+    assert_eq!(
+        db_text(&temp, "SELECT state FROM workflow_runs LIMIT 1"),
+        "completed"
+    );
 }
 
 #[test]
