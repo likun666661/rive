@@ -494,6 +494,16 @@ printf '{"final":"looks done but no team report"}\n'
     );
 }
 
+fn write_certificate_error_no_report_worker(path: &Path) {
+    write_executable(
+        path,
+        r#"#!/bin/sh
+set -eu
+printf '{"type":"error","message":"unknown certificate verification error"}\n'
+"#,
+    );
+}
+
 fn write_branch_worker(path: &Path) {
     let rive_bin = env!("CARGO_BIN_EXE_rive");
     let team_bin = env!("CARGO_BIN_EXE_team");
@@ -760,6 +770,46 @@ fn scheduler_rejects_stdout_success_without_report() {
         )
         .unwrap();
     assert_eq!(active_node_runs, 0);
+}
+
+#[test]
+fn scheduler_classifies_no_report_runner_stdout_errors() {
+    let temp = init_workspace();
+    add_worker(&temp, "worker-a");
+    add_worker(&temp, "worker-b");
+    let root = create_work(&temp, "phase16-cert-root", "root");
+    let node = create_work(&temp, "phase16-cert-node", "certificate probe");
+    add_edge(
+        &temp,
+        "decomposes-to",
+        &root,
+        &node,
+        "edge-phase16-cert-root-node",
+    );
+
+    let fake = temp.path().join("fake-opencode-certificate-no-report");
+    write_certificate_error_no_report_worker(&fake);
+    let error = run_json_expect_error(&mut scheduler_command(
+        &temp,
+        &fake,
+        &root,
+        "phase16-cert-no-report",
+    ));
+    assert_eq!(error["protocol"]["code"], "dispatch_not_reported");
+
+    let conn = Connection::open(temp.path().join(".rive/rive.db")).unwrap();
+    let (failure_kind, retryable, suggested_action, detail): (String, bool, String, String) = conn
+        .query_row(
+            "select failure_kind, retryable, suggested_action, detail from scheduler_node_failures",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(failure_kind, "certificate_error");
+    assert!(retryable);
+    assert_eq!(suggested_action, "retry_after_certificate_fix");
+    assert!(detail.contains("unknown certificate verification error"));
+    assert!(detail.contains("dispatch not reported"));
 }
 
 #[test]

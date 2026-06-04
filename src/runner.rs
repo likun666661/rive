@@ -2294,7 +2294,11 @@ impl<'a, A: RunnerAdapter> RunnerCore<'a, A> {
             dispatch.state,
             DispatchState::Open | DispatchState::Cancelled
         ) {
-            return Err(anyhow!("dispatch not reported: {}", dispatch.dispatch_id));
+            return Err(anyhow!(
+                "dispatch not reported: {}: {}",
+                dispatch.dispatch_id,
+                process_failure_excerpt(&output)
+            ));
         }
         let trace = self.trace_summary(input.run_id, &dispatch.dispatch_id)?;
         let binary = binary.display().to_string();
