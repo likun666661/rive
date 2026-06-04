@@ -38,6 +38,12 @@ func main() {
 	example13_StreamCollect()
 	example14_StreamTransform()
 	example15_CallbackTiming()
+
+	fmt.Println()
+	fmt.Println("========== I3 Bridge Adapter 示例 (RAG pipeline: Retriever + ChatModel 桥接) ==========")
+	fmt.Println()
+	example16_RAGPipeline()
+	example17_BridgePatternExplanation()
 }
 
 func example1_DAGBasic() {
@@ -960,5 +966,169 @@ func example15_CallbackTiming() {
 	fmt.Println("#   - EventLog 在 graph 级别提供了类似的可观测性")
 	fmt.Println("#   - CallbackWrapper 已覆盖 Invoke/Stream/Collect/Transform 包装")
 	fmt.Println("#   - 组件桥接、图级 callback 初始化链和完整图流式执行不在范围内")
+	fmt.Println()
+}
+
+// =============================================================================
+// I3 Bridge Adapter 示例: 领域组件参与通用图运行时
+//
+// 核心问题:
+// Graph/Workflow/Chain 运行时的基本单位是 Lambda (composableRunnable),
+// 但领域组件 (Retriever, ChatModel) 有其自身的接口约定。
+//
+// 解决方案:
+// Bridge Adapter 为每种领域组件定义轻量接口 + 适配函数 (toLambda),
+// 将领域语义包装为 Lambda,既不侵入组件自身,也不侵入图运行时。
+// 组件开发者按领域接口实现,通过 Bridge 即可参加图编排。
+// =============================================================================
+
+// mockRetriever is a canned retriever returning hardcoded documents.
+type mockRetriever struct{}
+
+func (r *mockRetriever) Retrieve(ctx context.Context, query string) ([]*compose.BridgeDocument, error) {
+	return []*compose.BridgeDocument{
+		{Content: "Rive is a local-first agent team runtime with Snapshot/WorkDAG/Dispatch systems.", Score: 0.95},
+		{Content: "Eino (CloudWeGo) features compose.Graph with DAG/Pregel dual-mode execution.", Score: 0.82},
+		{Content: "FieldMapping enables field-level data extraction between graph nodes.", Score: 0.71},
+	}, nil
+}
+
+// mockChatModel is a canned chat model returning a hardcoded response.
+type mockChatModel struct{}
+
+func (m *mockChatModel) Generate(ctx context.Context, messages []*compose.BridgeMessage) (string, error) {
+	time.Sleep(10 * time.Millisecond)
+	return "Rive is a local-first agent team runtime that uses Snapshot evidence, Work DAG scheduling, and Dispatch binding to coordinate multi-agent software engineering tasks. It supports worktree-isolated workspaces and ledger-based progress tracking.", nil
+}
+
+func example16_RAGPipeline() {
+	fmt.Println("--- Example 16: RAG Pipeline (Retriever → Prompt Assembly → ChatModel) ---")
+	fmt.Println()
+
+	fmt.Println("# 场景: 用户提问 → 检索相关文档 → 组装 prompt → 模型生成回答")
+	fmt.Println("#")
+	fmt.Println("#   拓扑:")
+	fmt.Println("#     START ──┬──> retriever ──┬──> assemble ──> model ──> END")
+	fmt.Println("#             │                │")
+	fmt.Println("#             └────────────────┘")
+	fmt.Println("#                (query 直传 + documents fan-in = FieldMapping)")
+	fmt.Println("#")
+	fmt.Println("#   桥接适配:")
+	fmt.Println("#     mockRetriever 实现 compose.Retriever 接口")
+	fmt.Println("#       → AsRetrieverNode() 将其桥接为 Workflow Lambda 节点")
+	fmt.Println("#     mockChatModel 实现 compose.ChatModel 接口")
+	fmt.Println("#       → AsChatModelNode() 将其桥接为 Workflow Lambda 节点")
+	fmt.Println("#     promptAssembler 经 AsPromptAssemblerNode() 桥接")
+	fmt.Println("#")
+	fmt.Println()
+
+	sysPrompt := "You are a technical assistant. Answer using only the provided context. Be concise and accurate."
+
+	// Workflow[string, map[string]any]: input is a query string, output is a result map.
+	wf := compose.NewWorkflow[string, map[string]any]()
+
+	// retriever: direct data flow from START (query string)
+	wf.AsRetrieverNode("retriever", &mockRetriever{}).
+		AddInput(compose.START)
+
+	// assemble: FieldMapping fan-in — query from START + documents from retriever
+	wf.AsPromptAssemblerNode("assemble", sysPrompt).
+		AddInput(compose.START, compose.MapFields("", "query")).
+		AddInput("retriever", compose.ToField("documents"))
+
+	// model: direct data flow from assemble
+	wf.AsChatModelNode("model", &mockChatModel{}).
+		AddInput("assemble")
+
+	// END: FieldMapping outputs
+	wf.End().
+		AddInput("model", compose.ToField("answer")).
+		AddInput(compose.START, compose.MapFields("", "original_query"))
+
+	r, err := wf.Compile(context.Background())
+	if err != nil {
+		fmt.Printf("  Compile error: %v\n\n", err)
+		return
+	}
+
+	result, err := r.Invoke(context.Background(), "What is Rive?")
+	if err != nil {
+		fmt.Printf("  Invoke error: %v\n\n", err)
+		return
+	}
+
+	// FieldMapping fan-in nests values under source node keys.
+	modelResult := result["model"].(map[string]any)
+	startResult := result["start"].(map[string]any)
+
+	fmt.Printf("  Query:  %q\n", "What is Rive?")
+	fmt.Printf("  Answer: %q\n", modelResult["answer"])
+	fmt.Printf("  Retained: original_query=%q\n", startResult["original_query"])
+	fmt.Println()
+	fmt.Println("#   关键点:")
+	fmt.Println("#     - retriever: AddInput(START) 直连,接收 query string → 输出 []*Document")
+	fmt.Println("#     - assemble: AddInput(START, MapFields) + AddInput(retriever, ToField)")
+	fmt.Println("#       → FieldMapping 在两个数据源之间做字段级聚合")
+	fmt.Println("#     - model: AddInput(assemble) 直连,接收 []*Message → 输出 string")
+	fmt.Println("#     - 领域组件 (mockRetriever/mockChatModel) 仅实现领域接口")
+	fmt.Println("#     - Bridge 适配器 (As*Node) 把它们包装成 Lambda 参与图编排")
+	fmt.Println()
+}
+
+func example17_BridgePatternExplanation() {
+	fmt.Println("--- Example 17: Bridge Adapter 模式说明 ---")
+	fmt.Println()
+	fmt.Println("┌─────────────────────────────────────────────────────────────────────────────┐")
+	fmt.Println("│                      Bridge Adapter 模式架构                               │")
+	fmt.Println("├─────────────────────────────────────────────────────────────────────────────┤")
+	fmt.Println("│                                                                             │")
+	fmt.Println("│  领域层 (Domain)             桥接层 (Bridge)          运行时 (Runtime)      │")
+	fmt.Println("│  ┌──────────────┐          ┌──────────────┐          ┌──────────────────┐  │")
+	fmt.Println("│  │ Retriever    │──bridge──│ toLambda()   │──Lambda──│ Graph[I,O]       │  │")
+	fmt.Println("│  │ .Retrieve()  │          │              │          │  .AddLambdaNode  │  │")
+	fmt.Println("│  └──────────────┘          └──────────────┘          │  .AddEdge        │  │")
+	fmt.Println("│                                                       │  .Compile()      │  │")
+	fmt.Println("│  ┌──────────────┐          ┌──────────────┐          │  .Invoke()       │  │")
+	fmt.Println("│  │ ChatModel    │──bridge──│ toLambda()   │──Lambda──│                  │  │")
+	fmt.Println("│  │ .Generate()  │          │              │          │  Workflow[I,O]   │  │")
+	fmt.Println("│  └──────────────┘          └──────────────┘          │  .AsRetrieverNode│  │")
+	fmt.Println("│                                                       │  .AsChatModelNode│  │")
+	fmt.Println("│  ┌──────────────┐          ┌──────────────┐          │  .AddInput()     │  │")
+	fmt.Println("│  │ Tool         │──bridge──│ toLambda()   │──Lambda──│                  │  │")
+	fmt.Println("│  │ .Execute()   │          │              │          │  Chain[I,O]      │  │")
+	fmt.Println("│  └──────────────┘          └──────────────┘          │  .AppendLambda   │  │")
+	fmt.Println("│                                                       └──────────────────┘  │")
+	fmt.Println("│                                                                             │")
+	fmt.Println("└─────────────────────────────────────────────────────────────────────────────┘")
+	fmt.Println()
+	fmt.Println("# 为什么 Bridge Adapter 让领域组件能参与通用图运行时?")
+	fmt.Println()
+	fmt.Println("  1. 统一合约 (Lambda):")
+	fmt.Println("     Graph/Workflow/Chain 只认 Lambda (composableRunnable) 作为可执行单元。")
+	fmt.Println("     Bridge 将任何一个实现领域接口的结构体包装成 Lambda,无须修改图运行时。")
+	fmt.Println()
+	fmt.Println("  2. 接口隔离 (Domain Interface):")
+	fmt.Println("     领域组件定义自己的接口 (Retriever.Retrieve, ChatModel.Generate)。")
+	fmt.Println("     实现者只需关心领域逻辑,不依赖 graph/compose 包的类型系统。")
+	fmt.Println()
+	fmt.Println("  3. 零侵入 (Non-intrusive):")
+	fmt.Println("     bridge 函数是纯适配逻辑,不修改组件自身,不污染图运行时。")
+	fmt.Println("     新增领域组件类型只需添加一个 bridge + 接口,编译时正交。")
+	fmt.Println()
+	fmt.Println("  4. FieldMapping 衔接 (Composition over Coupling):")
+	fmt.Println("     不同组件输入输出类型不同 (string → []*Document → []*Message → string)。")
+	fmt.Println("     FieldMapping 在 bridge 节点之间做字段提取、转换、注入,避免硬编码耦合。")
+	fmt.Println()
+	fmt.Println("  5. 三重抽象复用 (Graph / Workflow / Chain):")
+	fmt.Println("     同一套 Bridge Lambda 可用于三种编排抽象:")
+	fmt.Println("     - Graph: 最大灵活性,手动 AddEdge + AddLambdaNode")
+	fmt.Println("     - Workflow: 声明式 AddInput + FieldMapping + As*Node 便捷方法")
+	fmt.Println("     - Chain: Builder 风格 AppendLambda")
+	fmt.Println()
+	fmt.Println("# 扩展清单 (本教育子集未实现):")
+	fmt.Println("  - Tool bridge: Tool.Execute() → Lambda (参考 Eino Tool 接口)")
+	fmt.Println("  - StreamChatModel bridge: ChatModel.GenerateStream() → StreamableLambda")
+	fmt.Println("  - Embedding bridge: Embedder.Embed() → Lambda")
+	fmt.Println("  - 完整的错误传递与重试语义 (callback + state 集成)")
 	fmt.Println()
 }

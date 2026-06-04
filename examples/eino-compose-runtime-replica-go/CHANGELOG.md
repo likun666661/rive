@@ -1,6 +1,102 @@
-# CHANGELOG — 第二章 & 第三章示例与文档更新
+# CHANGELOG — 第二/三/四章 & I3 Bridge Adapter 示例与文档更新
 
-本文档记录对 `examples/eino-compose-runtime-replica-go` 的第二章 (FieldMapping / Workflow / Chain / Parallel / Branch) 与第三章 (Runnable Stream / Collect / Transform / Callback) 示例补全与文档更新。
+本文档记录对 `examples/eino-compose-runtime-replica-go` 的第二章 (FieldMapping / Workflow / Chain / Parallel / Branch)、第三章 (Runnable Stream / Collect / Transform / Callback)、第四章 (ChatModel + Retriever 组件接口)、I3 Bridge Adapter 与桥接审计 (R1/R2) 的示例补全与文档更新。
+
+---
+
+## Ch4: Chapter 4 — ChatModel + Retriever Component Interfaces
+
+参考 Eino 组件模型第五章 (ChatModel) 和第六章 (Retriever),实现独立的 `compose.ChatModel` 和 `compose.Retriever` 接口、Fake 实现、组件 Lambda 桥接与回调集成。
+
+### 变更范围
+
+| 文件 | 变更类型 | 说明 |
+|------|---------|------|
+| `compose/chatmodel.go` | 新增 | ChatModel 接口 (Generate/Stream)、Message/RoleType 类型、FakeChatModel、ChatModelComponent |
+| `compose/chatmodel_test.go` | 新增 | 19 个单元测试: 消息构造、FakeChatModel 默认/自定义/流式、ChatModelComponent 四模式降级、回调集成 |
+| `compose/retriever.go` | 新增 | Retriever 接口 (Retrieve)、Document/Query 类型、FakeRetriever、RetrieverConfig、NewRetrieverLambda |
+| `compose/retriever_test.go` | 新增 | 17 个单元测试: FakeRetriever 默认/自定义/错误、NewRetrieverLambda 四模式降级、回调集成、多 handler |
+| `compose/bridge.go` | 已有 | Bridge Adapter 模式 (BridgeDocument/BridgeMessage/BridgeRetriever/BridgeChatModel + Workflow 便捷方法) |
+| `compose/bridge_test.go` | 已有 | 7 个单元测试: RAG pipeline 端到端 + FieldMapping 聚合验证 |
+| `compose/runnable_test.go` | 新增 | 12 个测试: 四模式降级矩阵、类型转换、graphRunnable 流回退 |
+| `compose/stream_test.go` | 新增 | 20 个测试: Pipe/Copy/Merge/Concat 并发安全 |
+| `compose/callbacks_test.go` | 新增 | 25 个测试: 5 阶段时序、上下文隔离、TimingChecker、CbStreamReader |
+| `compose/workflow_test.go` | 新增 | 16 个测试: 链式/Fan-in/路径冲突/staticValue/并发 |
+| `research/ch4-r1-chatmodel-retriever-contract.md` | 新增 | R1 研究笔记: ChatModel/Retriever 组件契约与复刻版桥接需求 |
+| `research/ch4-r2-replica-bridge-audit.md` | 新增 | R2 审计: 当前复刻版 I1/I2/I3 桥接插入点分析、关键缺口、修复优先级 |
+
+### ChatModel 组件设计
+
+- **接口**: `ChatModel.Generate(ctx, []*Message) (*Message, error)` + `Stream(ctx, []*Message) (StreamReader[*Message], error)`
+- **类型**: `Message{Role, Content}`, `RoleType` (system/human/assistant/tool)
+- **FakeChatModel**: 选项模式 (WithChatGenerateFunc/WithChatStreamFunc),默认 echo 行为
+- **ChatModelComponent**: `GetRunnable()` 返回 `composableRunnable{i, s}`,支持 Invoke/Stream 双模式
+- **组件常量**: `ComponentOfChatModel = "ChatModel"`
+
+### Retriever 组件设计
+
+- **接口**: `Retriever.Retrieve(ctx, *Query) ([]*Document, error)`
+- **类型**: `Document{Content, Metadata}`, `Query{Text, K}`
+- **FakeRetriever**: 支持 Retriever 接口 + `RetrieveFn` 自定义函数 + `Err` 错误注入
+- **NewRetrieverLambda**: 将 Retriever 包装为 `composableRunnable{i}`,支持 CallbackWrapper
+- **组件常量**: `ComponentOfRetriever = "Retriever"`
+
+### 与 bridge.go I3 Bridge Adapter 的关系
+
+| 文件 | 接口/类型 | 用途 |
+|------|----------|------|
+| `bridge.go` | `BridgeRetriever (string query)`, `BridgeChatModel (string output)`, `BridgeDocument`, `BridgeMessage` | I3 教学用简化 Bridge,专为 Workflow `As*Node` 便捷方法设计 |
+| `retriever.go` | `Retriever (*Query query)`, `Document`, `Query` | 接近 Eino 正式接口,支持 Callback、Lambda 包装 |
+| `chatmodel.go` | `ChatModel (*Message + Stream)`, `Message`, `RoleType` | 接近 Eino 正式接口,支持 Invoke/Stream 双模式 |
+
+两套实现互补: bridge.go 展示 Workflow 层的声明式桥接,RAG pipeline 示例 (example16) 通过 `AsRetrieverNode/AsChatModelNode/AsPromptAssemblerNode` 串联; retriever.go/chatmodel.go 展示 Eino 正式组件体系与运行时集成模式。
+
+### Ch4 桥接审计 (R2) 关键发现
+
+六层抽象 (Runnable/Stream/Callbacks/FieldMapping/Graph/Workflow/Chain) 均已实现至 90%+。三个关键桥接缺口:
+
+1. **validateFieldMapping 编译时调用缺失**: `field_mapping.go` 中 `validateFieldMapping()` 已完整实现,但 `graph.compile()` 未调用它。类型错误推迟到运行时才发现。
+2. **GraphBranch 运行时路由缺失**: Workflow 的分支依赖关系和 `noDataFlow=true` 语义在运行时不执行。Chain 通过内联分支评估绕过。
+3. **reportSkip 调用链缺失**: 多分支未选中节点会被永久阻塞而不被 skip。
+
+详见 `research/ch4-r2-replica-bridge-audit.md`。
+
+---
+
+## I3: Bridge Adapter — ChatModel + Retriever RAG Pipeline 演示
+
+### 变更范围
+
+| 文件 | 变更类型 | 说明 |
+|------|---------|------|
+| `compose/bridge.go` | 新增 | Bridge Adapter 模式: Retriever/ChatModel/Message/Document 领域接口 + bridge 适配器 + Workflow 便捷方法 |
+| `compose/bridge_test.go` | 新增 | 7 个单元测试: retriever/chatmodel/promptAssembler Lambda 测试 + RAG pipeline Workflow 端到端测试 |
+| `cmd/example/main.go` | 更新 | 新增 2 个 I3 示例 (example16/17),示例总数增至 17 |
+| `README.md` | 更新 | 新增 I3 Bridge Adapter 模式章节,含架构图、RAG pipeline 示例、便捷方法对照表 |
+| `CHANGELOG.md` | 更新 | 本文件 |
+| `FINAL_SUMMARY.md` | 更新 | 新增 I3 Bridge Adapter 摘要 |
+
+### 新增示例说明
+
+#### Example 16: RAG Pipeline (Retriever → Prompt Assembly → ChatModel)
+- 完整 RAG 流水线: 用户提问 → 文档检索 → 提示词组装 → 模型生成
+- 拓扑: `START → retriever → assemble → model → END`
+- 展示 FieldMapping 在异质节点间的字段级数据聚合 (query + documents → prompt messages)
+- mockRetriever/mockChatModel 实现 compose.Retriever/compose.ChatModel 接口
+- AsRetrieverNode / AsChatModelNode / AsPromptAssemblerNode 便捷桥接方法
+
+#### Example 17: Bridge Adapter 模式说明
+- 三层架构图: 领域层 → 桥接层 → 运行时
+- 五个桥接原理: 统一合约 (Lambda) / 接口隔离 / 零侵入 / FieldMapping 衔接 / 三重抽象复用
+- 扩展清单: Tool bridge / StreamChatModel bridge / Embedding bridge
+
+### Bridge Adapter 设计要点
+
+1. **领域接口**: Retriever.Retrieve / ChatModel.Generate — 与 graph 运行时无关
+2. **桥接函数**: toLambda() 将领域接口包装为 composableRunnable → AddLambdaNode
+3. **Workflow 便捷方法**: AsRetrieverNode / AsChatModelNode / AsPromptAssemblerNode 在 Workflow 上提供声明式桥接
+4. **FieldMapping 衔接**: MapFields("", "query") (FromAll) + ToField("documents") 实现异质类型节点间的数据聚合
+5. **零侵入**: 组件开发者仅实现领域接口,包外的 bridge 适配器完成图运行时接入
 
 ---
 
@@ -53,7 +149,9 @@ README.md 第三章新增内容:
 
 ### 状态
 
-- 所有测试通过 (`go test ./...`)
+- 所有测试通过 (`go test ./...`) — compose 包 130+ 测试 PASS
+- 代码编译通过 (`go build ./...`)、`go vet ./...` 无问题
 - 代码格式化通过 (`gofmt -w .`)
 - 示例程序运行通过 (`go run ./cmd/example`)
-- 15 个示例覆盖 Chapter 1 (Graph/DAG/Pregel/Info/EventLog) + Chapter 2 (FieldMapping/Workflow/Chain/Parallel/Branch) + Chapter 3 (Stream/Collect/Transform/Callback)
+- 17 个示例覆盖 Chapter 1 (Graph/DAG/Pregel/Info/EventLog) + Chapter 2 (FieldMapping/Workflow/Chain/Parallel/Branch) + Chapter 3 (Stream/Collect/Transform/Callback) + Chapter 4 Bridge (RAG Pipeline + Bridge Pattern)
+- 已知缺口已在 `research/ch4-r2-replica-bridge-audit.md` 完整记录

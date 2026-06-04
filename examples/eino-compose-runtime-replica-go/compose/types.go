@@ -19,11 +19,12 @@ const (
 type ComponentType string
 
 const (
-	ComponentOfGraph    ComponentType = "Graph"
-	ComponentOfLambda   ComponentType = "Lambda"
-	ComponentOfWorkflow ComponentType = "Workflow"
-	ComponentOfChain    ComponentType = "Chain"
-	ComponentOfUnknown  ComponentType = "Unknown"
+	ComponentOfGraph     ComponentType = "Graph"
+	ComponentOfLambda    ComponentType = "Lambda"
+	ComponentOfWorkflow  ComponentType = "Workflow"
+	ComponentOfChain     ComponentType = "Chain"
+	ComponentOfChatModel ComponentType = "ChatModel"
+	ComponentOfUnknown   ComponentType = "Unknown"
 )
 
 const (

@@ -1,6 +1,6 @@
 # Eino Compose Runtime Replica (Go MVP)
 
-受 Eino (CloudWeGo) 启发的第二章骨架示例与验证项目,覆盖核心编译边界与 DAG/Pregel 执行引擎,并实现三层编排抽象 (FieldMapping / Workflow / Chain / Parallel / Branch)。本项目为学习与研究用途的章节级骨架,非 Eino 的完整产品复刻。
+受 Eino (CloudWeGo) 启发的第二/三/四章骨架示例与验证项目,覆盖核心编译边界与 DAG/Pregel 执行引擎,并实现三层编排抽象 (FieldMapping / Workflow / Chain / Parallel / Branch) + Runnable Stream/Callback 教学示例 + ChatModel/Retriever 组件接口与 Bridge Adapter 模式。本项目为学习与研究用途的章节级骨架,非 Eino 的完整产品复刻。
 
 ## 架构总览
 
@@ -169,6 +169,107 @@ chain.AppendBranch(branch)
 
 ---
 
+---
+
+## I3 Bridge Adapter 模式: 领域组件与通用图运行时桥接 (ChatModel + Retriever)
+
+> **本章讲解 bridge adapter 设计模式,展示如何让 Retriever / ChatModel 等非图原生组件参与通用图运行时,并以 RAG pipeline 为教学示例。**
+
+### 核心问题
+
+Graph/Workflow/Chain 运行时的基本单位是 `Lambda` (`composableRunnable`),但领域组件有其自身的接口约定:
+- `Retriever` 关心 `Retrieve(ctx, query) ([]Document, error)`
+- `ChatModel` 关心 `Generate(ctx, messages) (string, error)`
+
+直接将这些组件硬编码进图运行时会破坏接口隔离,让组件与 graph runtime 相互耦合。
+
+### 解决方案: Bridge Adapter 模式
+
+```
+领域层 (Domain)             桥接层 (Bridge)          运行时 (Runtime)
+┌──────────────┐          ┌──────────────┐          ┌──────────────────┐
+│ Retriever    │──bridge──│ toLambda()   │──Lambda──│ Graph[I,O]       │
+│ .Retrieve()  │          │              │          │  .AddLambdaNode  │
+└──────────────┘          └──────────────┘          │  .AddEdge        │
+                                                     │  .Compile()      │
+┌──────────────┐          ┌──────────────┐          │  .Invoke()       │
+│ ChatModel    │──bridge──│ toLambda()   │──Lambda──│                  │
+│ .Generate()  │          │              │          │  Workflow[I,O]   │
+└──────────────┘          └──────────────┘          │  .AsRetrieverNode│
+                                                     │  .AsChatModelNode│
+┌──────────────┐          ┌──────────────┐          │  .AddInput()     │
+│ Tool         │──bridge──│ toLambda()   │──Lambda──│                  │
+│ .Execute()   │          │              │          │  Chain[I,O]      │
+└──────────────┘          └──────────────┘          │  .AppendLambda   │
+                                                     └──────────────────┘
+```
+
+### 桥接适配原理
+
+1. **统一合约 (Lambda)**: Graph/Workflow/Chain 只认 Lambda 作为可执行单元。Bridge 将任何一个实现领域接口的结构体包装成 Lambda,无须修改图运行时。
+
+2. **接口隔离**: 领域组件定义自己的接口,实现者只需关心领域逻辑,不依赖 graph/compose 包的类型系统。
+
+3. **零侵入**: bridge 函数是纯适配逻辑,不修改组件自身,不污染图运行时。新增领域组件类型只需添加一个 bridge + 接口。
+
+4. **FieldMapping 衔接**: 不同组件输入输出类型不同 (`string → []*Document → []*Message → string`)。FieldMapping 在 bridge 节点之间做字段提取、转换、注入。
+
+5. **三重抽象复用**: 同一套 Bridge Lambda 可用于 Graph / Workflow / Chain 三种编排抽象。
+
+### RAG Pipeline 示例
+
+```go
+// 定义领域组件 (仅实现接口,无须感知图运行时)
+type MyRetriever struct{}
+func (r *MyRetriever) Retrieve(ctx context.Context, query string) ([]*compose.Document, error) {
+    return fetchDocs(query)
+}
+
+type MyChatModel struct{}
+func (m *MyChatModel) Generate(ctx context.Context, msgs []*compose.Message) (string, error) {
+    return callLLM(msgs)
+}
+
+// 用 Workflow + Bridge 编排 RAG pipeline
+wf := compose.NewWorkflow[*RAGInput, map[string]any]()
+
+wf.AsRetrieverNode("retriever", &MyRetriever{}).
+    AddInput(compose.START, compose.FromField("Query"))
+
+wf.AsPromptAssemblerNode("assemble", systemPrompt).
+    AddInput(compose.START, compose.FromField("Query")).
+    AddInput("retriever", compose.ToField("documents"))
+
+wf.AsChatModelNode("model", &MyChatModel{}).
+    AddInput("assemble")
+
+wf.End().
+    AddInput("model", compose.ToField("answer")).
+    AddInput(compose.START, compose.MapFields("Query", "original_query"))
+
+r, _ := wf.Compile(ctx)
+result, _ := r.Invoke(ctx, &RAGInput{Query: "What is Rive?"})
+// result["answer"] contains the generated response
+// result["original_query"] retains the user query
+```
+
+### 便捷方法对照
+
+| Bridge 方法 | 等效 Graph 调用 | 说明 |
+|---|---|---|
+| `wf.AsRetrieverNode(key, retriever)` | `wf.AddLambdaNode(key, bridge.toLambda())` | 将 Retriever 桥接为 Lambda 节点 |
+| `wf.AsChatModelNode(key, model)` | `wf.AddLambdaNode(key, bridge.toLambda())` | 将 ChatModel 桥接为 Lambda 节点 |
+| `wf.AsPromptAssemblerNode(key, prompt)` | `wf.AddLambdaNode(key, bridge.toLambda())` | 创建提示词组装 Lambda 节点 |
+
+### 扩展清单 (本教育子集未实现)
+
+- **Tool bridge**: `Tool.Execute()` → Lambda
+- **StreamChatModel bridge**: `GenerateStream()` → `StreamableLambda`
+- **Embedding bridge**: `Embedder.Embed()` → Lambda
+- **完整的错误传递与重试语义** (callback + state 集成)
+
+---
+
 ## 第三章功能 (Runnable Stream / Collect / Transform / Callback 教学示例)
 
 > **注意**: 本章实现了 Runnable 四模式、基础 Pipe stream、Collect/Transform 降级和 CallbackWrapper 教学路径。**组件桥接、图级流式执行、stream field mapping 和流式分支不在当前范围内。**
@@ -313,7 +414,7 @@ gofmt -w .
 
 ```
 examples/eino-compose-runtime-replica-go/
-├── cmd/example/main.go          # 综合示例 (15 个场景,覆盖 Chapter 1/2/3)
+├── cmd/example/main.go          # 综合示例 (17 个场景,覆盖 Chapter 1/2/3/4)
 ├── compose/
 │   ├── types.go                 # NodeTriggerMode, ComponentType, 哨兵错误, START/END
 │   ├── runnable.go              # Runnable[I,O], Lambda, composableRunnable
@@ -335,11 +436,16 @@ examples/eino-compose-runtime-replica-go/
 │   ├── event_log.go             # EventLog: 10 种事件类型, 线程安全
 │   ├── stream.go                # PipeStreamReader/PipeStreamWriter, Copy, Merge, Concat
 │   ├── callbacks.go             # RunInfo, Handler, CallbackWrapper, stream callback copies
+│   ├── bridge.go                # Bridge Adapter: BridgeRetriever/BridgeChatModel + Workflow 便捷方法
+│   ├── retriever.go             # Retriever 接口, Document/Query 类型, FakeRetriever, NewRetrieverLambda
+│   ├── chatmodel.go             # ChatModel 接口, Message/RoleType, FakeChatModel, ChatModelComponent
 │   └── utils.go                 # 辅助函数
 ├── research/
 │   ├── ch2-implementation-contract.md  # 第二章实现契约
 │   ├── ch2-verification.md             # 第二章完整验证记录
-│   └── ch3-runtime-contract.md         # 第三章 Runnable/Stream/Callback 契约
+│   ├── ch3-runtime-contract.md         # 第三章 Runnable/Stream/Callback 契约
+│   ├── ch4-r1-chatmodel-retriever-contract.md  # 第四章组件契约研究
+│   └── ch4-r2-replica-bridge-audit.md  # 第四章桥接审计
 ├── README.md                    # 本文档
 ├── CHANGELOG.md                 # 变更日志
 ├── FINAL_SUMMARY.md             # 最终验证摘要
@@ -357,16 +463,17 @@ examples/eino-compose-runtime-replica-go/
 
 ## 明确未实现的边界
 
-**本复刻版是教育子集 (educational subset)。组件桥接 (ChatModel/Tool/Retriever)、完整图流式执行、stream field mapping 和流式分支不在当前范围内。**
+**本复刻版是教育子集 (educational subset)。ChatModel/Retriever 组件接口已实现 (Chapter 4),Bridge Adapter 模式已演示 (I3)。完整图流式执行、stream field mapping、Workflow 分支运行时路由仍为已知缺口。**
 
 本复刻版聚焦于 Eino Compose Runtime 的核心图编译与执行引擎,以下为明确未实现的部分:
 
 ### 运行时不支持
-- **组件桥接 (ChatModel/Tool/Retriever)**: 当前仅有 Lambda 抽象,可通过 AddLambdaNode 等价替代
+- **组件桥接 (ChatModel/Tool/Retriever)**: ChatModel/Retriever 接口已实现 (retriever.go/chatmodel.go)。Bridge Adapter 模式 (bridge.go) 已展示 Workflow 声明式桥接。Tool bridge 未实现。
 - **图级 Stream 执行管线**: Runnable 四模式已经实现,但 graph runner 主路径仍以 Invoke 为主
 - **streamFieldMap 流式映射**: 依赖图级 stream channel,当前未接入
 - **Stream ChainBranch**: 流式分支暂未接入 Chain Builder
-- **组件级 Callback 桥接**: CallbackWrapper 已实现,但未接 ChatModel/Tool 组件体系与图级初始化链
+- **validateFieldMapping 编译时调用缺失 (GAP-I1-1)**: `validateFieldMapping()` 已完整实现但 `graph.compile()` 未调用
+- **GraphBranch 运行时路由缺失 (GAP-I1-2)**: Workflow 分支不可用;Chain 通过内联绕过
 - **State 传递 (graph.state)**: 字段已定义但未使用
 - **Checkpoint / Recovery**: 可恢复执行的中断-恢复机制不在范围内
 - **Fan-in 智能合并**: 当前 DAG Fan-in 默认输出 map[string]any 或单值直传

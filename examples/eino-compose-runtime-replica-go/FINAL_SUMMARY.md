@@ -1,10 +1,12 @@
-# Eino Compose Runtime Replica — 最终验证摘要 (第二章 + 第三章骨架,教学子集,非完整产品复刻)
+# Eino Compose Runtime Replica — 最终验证摘要 (第二/三/四章 + I3 Bridge Adapter,教学子集,非完整产品复刻)
 
 ## 验证状态
 
 - **gofmt**: 通过 (所有 Go 文件均已格式化)
-- **go test ./...**: 通过 (compose 包全部测试 PASS,cmd/example 无测试文件)
-- **go run ./cmd/example**: 通过 (15 个示例全部正常运行)
+- **go build ./...**: 通过 (所有包编译零错误零警告)
+- **go vet ./...**: 通过 (静态分析无问题)
+- **go test ./...**: 通过 (compose 包 130+ 测试全部 PASS,cmd/example 无测试文件)
+- **go run ./cmd/example**: 通过 (17 个示例全部正常运行)
 
 ---
 
@@ -137,12 +139,54 @@
 
 ---
 
+### 四、第四章: ChatModel + Retriever Component Interfaces (ch4)
+
+> **本章实现独立的 `compose.ChatModel` 和 `compose.Retriever` 接口 (参考 Eino 组件模型第五/六章)、Fake 实现、组件 Lambda 桥接与回调集成、测试覆盖及 I3 桥接审计 (R1/R2)。**
+
+#### 23. ChatModel 接口与组件 (chatmodel.go)
+- `ChatModel` 接口: `Generate(ctx, []*Message) (*Message, error)` + `Stream(ctx, []*Message) (StreamReader[*Message], error)`
+- `Message{Role, Content}` / `RoleType` (System/Human/Assistant/Tool)
+- `FakeChatModel`: 选项模式,默认 echo 行为
+- `ChatModelComponent`: `GetRunnable()` 返回 `composableRunnable{i, s}`
+
+#### 24. Retriever 接口与组件 (retriever.go)
+- `Retriever` 接口: `Retrieve(ctx, *Query) ([]*Document, error)`
+- `Document{Content, Metadata}` / `Query{Text, K}`
+- `FakeRetriever`: 支持自定义 `RetrieveFn` + 错误注入
+- `NewRetrieverLambda(cfg *RetrieverConfig)`: 包装 Retriever → composableRunnable + CallbackWrapper 集成
+- 组件常量: `ComponentOfRetriever = "Retriever"`, `ComponentOfChatModel = "ChatModel"`
+
+#### 25. 四模式降级测试覆盖 (retriever_test.go / chatmodel_test.go)
+- ChatModel: 19 个测试 — Invoke/Stream/Collect/Transform 四模式 + 回调 OnStart/OnEnd/OnError/Stream
+- Retriever: 17 个测试 — 默认/自定义/错误 Fake + Lambda Invoke/Stream/Collect/Transform + 多 handler + 回调上下文隔离
+
+#### 26. R1 研究提案 (ch4-r1-chatmodel-retriever-contract.md)
+- Eino 组件契约分析: ChatModel/Retriever/Message/Document/Tool 类型系统
+- Bridge Adapter 三层职责: 方法签名适配 / 组件元数据提取 / 类型安全校验
+- Sync vs Stream 语义与 runnablePacker 12 降级函数矩阵
+- 回调边界: Typer/Checker 接口、组件级 CallbackInput/Output
+- 最小可行实现 (MVP) 路径与 Phase 1-5 优先级
+
+#### 27. R2 桥接审计 (ch4-r2-replica-bridge-audit.md)
+- I1 插入点 (Graph ↔ FieldMapping/Workflow/Callback): 14 个桥接点,4 个关键缺口
+- I2 插入点 (FieldMapping): 12 个桥接点,4 个关键缺口
+- I3 插入点 (Workflow): 14 个桥接点,4 个关键缺口
+- **三个关键缺口**:
+  1. `validateFieldMapping` 未被 `graph.compile()` 调用 — 类型错误推迟到运行时
+  2. GraphBranch 运行时路由缺失 — Workflow 分支不可用 (Chain 通过内联绕过)
+  3. `reportSkip` 调用链缺失 — 未选中分支节点永久阻塞
+- 线程安全约束全部通过 (无锁安全 / sync.Mutex / sync.Map)
+- Chain 层 subGraph 接口已定义,支持嵌套 Chain;Workflow 尚未实现
+
+---
+
 ## 关键文件导览
 
 | 文件 | 职责 |
 |---|---|
 | `types.go` | 类型常量 (NodeTriggerMode, ComponentType, runType)、START/END 哨兵、sentinel errors |
 | `runnable.go` | Runnable[I,O] 接口、composableRunnable、Lambda、InvokableLambda 泛型构造函数 |
+| `runnable_test.go` | 12 测试: 四模式降级矩阵、类型转换、graphRunnable 流回退 |
 | `graph.go` | graph 内部结构、AddNode/Edge/ControlEdge/Branch、addEdgeWithMappings、compile() 主流程、Kahn 环检测 |
 | `generic_graph.go` | Graph[I,O] 公开 API、NewGraph、Compile、GetGraphInfo、graphRunnable |
 | `graph_node.go` | graphNode、compileIfNeeded (子图递归) |
@@ -153,16 +197,29 @@
 | `pregel.go` | pregelChannel: AnyPredecessor 语义,简单取值即消费 |
 | `branch.go` | GraphBranch、NewGraphBranch 泛型条件分支 |
 | `field_mapping.go` | FieldMapping / FieldPath / validateFieldMapping / fieldMap / takeOne / assignOne / convertTo |
+| `field_mapping_test.go` | 28+ 测试: 6 构造器、validateFieldMapping、fieldMap、takeOne、convertTo |
 | `workflow.go` | Workflow[I,O] / WorkflowNode / WorkflowBranch / AddInput / AddDependency / SetStaticValue / compile |
+| `workflow_test.go` | 16 测试: 基本链式、Fan-in、路径冲突、staticValue、并发 |
 | `chain.go` | Chain[I,O] Builder / AppendLambda / AppendParallel / AppendBranch / addNode / preNodeKeys |
 | `chain_parallel.go` | Parallel / AddLambda / outputKey 冲突检测 |
 | `chain_branch.go` | ChainBranch / NewChainBranch / NewChainMultiBranch / AddLambda |
+| `chain_test.go` | 17 测试: 线性/Parallel/Branch/MultiBranch/子图嵌套/编译锁 |
 | `introspect.go` | GraphInfo、GraphNodeInfo、GraphEdgeInfo (编译时拓扑导出) |
 | `event_log.go` | EventLog、10 种事件类型、线程安全记录与格式化 |
 | `utils.go` | 辅助工具函数 |
+| `bridge.go` | Bridge Adapter: Retriever/ChatModel 领域接口 + toLambda() 桥接函数 + Workflow 便捷方法 |
+| `bridge_test.go` | Bridge Adapter 测试: 7 个测试,覆盖独立 Lambda + RAG pipeline 端到端 |
+| `retriever.go` | Retriever 接口 (Retrieve)、Document/Query 类型、FakeRetriever、RetrieverConfig、NewRetrieverLambda |
+| `retriever_test.go` | 17 测试: FakeRetriever 三模式、Lambda 四模式降级、回调集成、多 handler |
+| `chatmodel.go` | ChatModel 接口 (Generate/Stream)、Message/RoleType、FakeChatModel、ChatModelComponent |
+| `chatmodel_test.go` | 19 测试: 消息构造、FakeChatModel 四模式、ChatModelComponent 四模式降级、回调集成 |
 | `stream.go` | PipeStreamReader/PipeStreamWriter、Copy、Merge、Concat |
+| `stream_test.go` | 20 测试: Pipe/Copy/Merge/Concat 并发安全 |
 | `callbacks.go` | RunInfo、Handler、HandlerBuilder、CallbackWrapper、流输入/输出副本 |
-| `cmd/example/main.go` | 综合示例程序 (15 个场景,覆盖 Graph/DAG/Pregel/FieldMapping/Workflow/Chain/Parallel/Branch/Stream/Collect/Transform/Callback) |
+| `callbacks_test.go` | 25 测试: 5 阶段时序、上下文隔离、TimingChecker、CbStreamReader |
+| `graph_test.go` | 80+ 测试: DAG/Pregel/边界/EventLog/Branch/Callback 集成 |
+| `cmd/example/main.go` | 综合示例程序 (17 个场景,覆盖 Graph/DAG/Pregel/FieldMapping/Workflow/Chain/Parallel/Branch/Stream/Collect/Transform/Callback/Bridge/RAG) |
+| `research/` | 6 个研究文档: ch2 实现契约与验证、ch3 运行时契约、ch4 R1 组件契约、ch4 R2 桥接审计 |
 
 ---
 
@@ -190,16 +247,17 @@ go run ./cmd/example/
 
 ## 明确未实现的边界
 
-**本复刻版是教育子集 (educational subset)。组件桥接 (ChatModel/Tool/Retriever)、完整图流式执行、stream field mapping 和流式分支不在当前范围内。**
+**本复刻版是教育子集 (educational subset)。ChatModel/Retriever 组件接口已实现 (Chapter 4),Bridge Adapter 模式已演示 (I3)。以下为明确未实现的部分:**
 
-本 MVP 复刻版聚焦于 Eino Compose Runtime 的核心图编译与执行引擎,以下为明确未实现的部分:
+本复刻版聚焦于 Eino Compose Runtime 的核心图编译与执行引擎。以下为明确未实现的部分:
 
 ### 运行时不支持
-- **组件桥接 (ChatModel/Tool/Retriever)**: 当前仅有 Lambda 抽象,可通过 AddLambdaNode 等价替代
+- **组件桥接 (ChatModel/Tool/Retriever)**: Bridge Adapter 模式 (bridge.go) 已展示 Workflow 声明式桥接。ChatModel/Retriever 独立接口 (retriever.go/chatmodel.go) 已实现。Tool bridge / Embedding bridge 未实现。
 - **图级 Stream 执行管线**: Runnable 四模式已经实现,但 graph runner 主路径仍以 Invoke 为主
-- **streamFieldMap 流式映射**: 依赖图级 stream channel,当前未接入
+- **streamFieldMap 流式映射**: 依赖图级 stream channel,当前未接入 (见 `field_mapping.go:448` stub)
 - **Stream ChainBranch**: 流式分支暂未接入 Chain Builder
-- **组件级 Callback 桥接**: CallbackWrapper 已实现,但未接 ChatModel/Tool 组件体系与图级初始化链
+- **validateFieldMapping 编译时调用**: `validateFieldMapping()` 已完整实现但 `graph.compile()` 未调用 — 类型错误推迟到运行时 (GAP-I1-1)
+- **GraphBranch 运行时路由**: Workflow 分支不可用 (GAP-I1-2)。Chain 通过内联分支评估绕过。
 - **State 传递 (graph.state)**: 字段已定义但未使用
 - **Checkpoint / Recovery**: 可恢复执行机制不在范围内
 - **Fan-in 智能合并 (Merge 配置)**: 当前默认 map[string]any 合并
@@ -208,9 +266,49 @@ go run ./cmd/example/
 - **可视化 / DOT 导出**: 无 graph 拓扑可视化
 - **JSON Schema 校验**: 无编译时 node 输入输出类型的 schema 校验
 - **DevOps 工具**: 无 tracing / metrics / profiling 集成
+- **组件级 Callback 桥接**: CallbackWrapper 已实现并在 `NewRetrieverLambda` 中集成。ChatModel/Tool 的 Typer/Checker 接口与组件级 CallbackInput/Output 未实现。
 
 ### 类型系统局限
 - `fmtType()` 仅覆盖 `string/int/float64/bool` 四种基础类型,其余返回 `"any"`
+
+---
+
+### I3: Bridge Adapter — 领域组件参与通用图运行时
+
+> **本章实现 Bridge Adapter 模式: 为 Retriever / ChatModel 定义领域接口,通过 bridge 适配器包装为 Lambda,使其能在 Workflow/Graph/Chain 三层编排中参与图运行时,并以 RAG pipeline 为教学示例。Chapter 4 (retriever.go/chatmodel.go) 提供接近 Eino 正式实现的独立组件接口与测试。**
+
+#### 28. 领域接口定义 (bridge.go)
+- `BridgeRetriever` 接口: `Retrieve(ctx, query string) ([]*BridgeDocument, error)`
+- `BridgeChatModel` 接口: `Generate(ctx, messages []*BridgeMessage) (string, error)`
+- `BridgeDocument` / `BridgeMessage`: 领域数据传输对象
+- `retrieverBridge` / `chatModelBridge` / `promptAssemblerBridge`: bridge 适配结构体
+
+#### 29. toLambda() 桥接函数
+- 每个 bridge 实现 `toLambda()` 方法,将领域接口包装为 `InvokableLambda`
+- 零侵入: 组件不需要依赖 compose 包,只需实现领域接口
+- 零修改: 图运行时 (graph/runner) 不需要改动任何代码
+
+#### 30. Workflow 便捷方法
+- `AsRetrieverNode(key, retriever)`: 桥接 BridgeRetriever → Workflow Lambda 节点
+- `AsChatModelNode(key, model)`: 桥接 BridgeChatModel → Workflow Lambda 节点
+- `AsPromptAssemblerNode(key, systemPrompt)`: 创建提示词组装 Lambda 节点
+
+#### 31. RAG Pipeline 端到端测试 (bridge_test.go)
+- 7 个单元测试,覆盖:
+  - retriever/chatModel/promptAssembler 独立 Lambda 测试
+  - 完整 RAG 流程: `query → retriever → assemble(prompt) → model → END`
+  - FieldMapping 在异质节点间的字段级聚合验证
+  - 便捷方法 (AsRetrieverNode/AsChatModelNode) 创建验证
+
+#### 32. RAG Pipeline Demo (cmd/example/main.go)
+- Example 16: 可运行的 RAG 流水线,使用 mock Retriever + mock ChatModel
+- Example 17: Bridge Adapter 模式架构图 + 五个核心设计原理说明
+- 展示 FieldMapping 衔接异质类型节点 (string → []*BridgeDocument → []*BridgeMessage → string)
+
+#### 33. Chapter 4 独立组件接口 (retriever.go/chatmodel.go)
+- `ChatModel` 接口正式实现: `Generate` + `Stream` 双模式,`Message`/`RoleType` 类型
+- `Retriever` 接口正式实现: `Retrieve`, `Document`/`Query` 类型
+- 与 bridge.go 互补: bridge.go 展示 Workflow 声明式桥接,retriever.go/chatmodel.go 展示 Eino 正式组件体系
 
 ---
 
@@ -229,4 +327,6 @@ Go Eino Compose Runtime Replica 成功实现了 Eino 的核心设计理念:
 9. **Stream 教学模式**: Pipe stream、Copy、Merge、Concat、Collect/Transform 概念演示
 10. **CallbackWrapper**: OnStart/OnEnd/OnError 与流输入/输出回调副本
 11. **零外部依赖**: 仅依赖 Go 标准库
-12. **充分测试覆盖**: compose 包全量测试通过,demo 程序 15 个场景覆盖全部功能
+12. **Bridge Adapter (I3)**: 领域接口与图运行时之间的无侵入适配层,让 Retriever/ChatModel 参与图编排
+13. **Chapter 4 Component Interfaces**: 独立的 ChatModel/Retriever 接口 + Fake 实现 + Lambda 桥接 + 四模式降级测试
+14. **桥接审计 (R1/R2)**: 六层抽象 90%+ 完成度,3 个关键缺口已在 `research/ch4-r2-replica-bridge-audit.md` 记录
