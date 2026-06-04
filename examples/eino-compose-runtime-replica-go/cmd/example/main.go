@@ -10,7 +10,7 @@ import (
 )
 
 func main() {
-	fmt.Println("=== Eino Compose Runtime Replica — Chapter 1 / 2 / 3 综合示例 ===")
+	fmt.Println("=== Eino Compose Runtime Replica — Chapter 1 / 2 / 3 / 4 综合示例 ===")
 	fmt.Println()
 
 	fmt.Println("========== 第一章示例 (Graph/DAG/Pregel/Info/EventLog) ==========")
@@ -44,6 +44,11 @@ func main() {
 	fmt.Println()
 	example16_RAGPipeline()
 	example17_BridgePatternExplanation()
+
+	fmt.Println()
+	fmt.Println("========== 第四章示例 (Checkpoint / Interrupt / Resume) ==========")
+	fmt.Println()
+	example18_CheckpointInterruptResume()
 }
 
 func example1_DAGBasic() {
@@ -1130,5 +1135,66 @@ func example17_BridgePatternExplanation() {
 	fmt.Println("  - StreamChatModel bridge: ChatModel.GenerateStream() → StreamableLambda")
 	fmt.Println("  - Embedding bridge: Embedder.Embed() → Lambda")
 	fmt.Println("  - 完整的错误传递与重试语义 (callback + state 集成)")
+	fmt.Println()
+}
+
+type checkpointApprovalState struct {
+	Original string
+}
+
+func example18_CheckpointInterruptResume() {
+	fmt.Println("--- Example 18: Checkpoint / Interrupt / Resume ---")
+	fmt.Println()
+	store := compose.NewInMemoryCheckPointStore()
+
+	g := compose.NewGraph[string, string]()
+	g.AddLambdaNode("approval", compose.InvokableLambda(func(ctx context.Context, input string) (string, error) {
+		wasInterrupted, _, state := compose.GetInterruptState[checkpointApprovalState](ctx)
+		if !wasInterrupted {
+			return "", compose.StatefulInterrupt(ctx,
+				map[string]any{"reason": "need human approval"},
+				checkpointApprovalState{Original: input},
+			)
+		}
+		isResume, hasData, decision := compose.GetResumeContext[string](ctx)
+		if !isResume || !hasData {
+			return "", compose.StatefulInterrupt(ctx, "approval still pending", state)
+		}
+		return fmt.Sprintf("%s -> approved by %s", state.Original, decision), nil
+	}))
+	g.AddEdge(compose.START, "approval")
+	g.AddEdge("approval", compose.END)
+
+	r, err := g.Compile(context.Background(),
+		compose.WithGraphName("checkpoint_example"),
+		compose.WithNodeTriggerMode(compose.AllPredecessor),
+	)
+	if err != nil {
+		fmt.Printf("  Compile error: %v\n\n", err)
+		return
+	}
+
+	firstCtx := compose.WithCheckPoint(context.Background(), "example18-cp", store)
+	_, err = r.Invoke(firstCtx, "draft-answer")
+	info, ok := compose.ExtractInterruptInfo(err)
+	if !ok || len(info.InterruptContexts) == 0 {
+		fmt.Printf("  Expected interrupt, got: %v\n\n", err)
+		return
+	}
+	interruptID := info.InterruptContexts[0].ID
+	fmt.Printf("  Interrupted at: %s\n", info.InterruptContexts[0].Address.String())
+	fmt.Printf("  Interrupt ID:  %s\n", interruptID)
+
+	resumeCtx := compose.ResumeWithData(
+		compose.WithCheckPoint(context.Background(), "example18-cp", store),
+		interruptID,
+		"operator",
+	)
+	result, err := r.Invoke(resumeCtx, "")
+	if err != nil {
+		fmt.Printf("  Resume error: %v\n\n", err)
+		return
+	}
+	fmt.Printf("  Resume result: %s\n", result)
 	fmt.Println()
 }

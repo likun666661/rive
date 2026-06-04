@@ -1,6 +1,6 @@
 # Eino Compose Runtime Replica (Go MVP)
 
-受 Eino (CloudWeGo) 启发的第二/三/四章骨架示例与验证项目,覆盖核心编译边界与 DAG/Pregel 执行引擎,并实现三层编排抽象 (FieldMapping / Workflow / Chain / Parallel / Branch) + Runnable Stream/Callback 教学示例 + ChatModel/Retriever 组件接口与 Bridge Adapter 模式。本项目为学习与研究用途的章节级骨架,非 Eino 的完整产品复刻。
+受 Eino (CloudWeGo) 启发的第二/三/四章骨架示例与验证项目,覆盖核心编译边界与 DAG/Pregel 执行引擎,并实现三层编排抽象 (FieldMapping / Workflow / Chain / Parallel / Branch) + Runnable Stream/Callback 教学示例 + ChatModel/Retriever 组件接口与 Bridge Adapter 模式 + Checkpoint/Interrupt/Resume 教学子集。本项目为学习与研究用途的章节级骨架,非 Eino 的完整产品复刻。
 
 ## 架构总览
 
@@ -28,6 +28,13 @@ Graph Builder  ──>  Compile  ──>  Runnable[I, O]
   ├── StreamReader 生产-收集模式演示
   ├── Transform 流式变换管道演示
   └── Callback 生命周期计时演示
+
+第四章: Checkpoint / Interrupt / Resume 教学子集
+  ├── Address / AddressSegment 结构化执行点身份
+  ├── InterruptSignal 树 + 扁平 InterruptContext 视图
+  ├── context 型 CheckPointStore / CheckPointID 恢复入口
+  ├── GetInterruptState / GetResumeContext 定向恢复
+  └── PipeStreamReader 物化与恢复示例
 ```
 
 ### 三层抽象对比
@@ -168,6 +175,43 @@ chain.AppendBranch(branch)
 ```
 
 ---
+
+---
+
+## 第四章功能 (Checkpoint / Interrupt / Resume)
+
+### 核心问题
+
+图运行时不是单个函数调用,而是可嵌套、可并发、可流式的执行网络。某个节点或工具需要暂停时,运行时必须保存“到底卡在哪个结构化执行点”,并在恢复时把数据送回同一个地址,否则会重复执行已完成副作用或把用户输入路由到错误节点。
+
+### 教学子集设计
+
+- **Address**: `AddressSegment{Type, ID, SubID}` 组成稳定分层地址,例如 `runnable:root;node:approval;tool:lookup:call_1`。
+- **InterruptSignal**: 支持树状 `Subs`,便于表达批量工具/子图里的多个 root cause；面向用户暴露扁平 `InterruptContext`。
+- **Checkpoint**: `CheckPointStore` 保存原始输入与 `interruptID -> Address/State` 映射；当前示例使用 `InMemoryCheckPointStore`。
+- **Resume**: `ResumeWithData` / `BatchResumeWithData` 注入恢复数据；`GetResumeContext` 区分“我是直接目标”和“我是通往后代目标的 conduit”。
+- **Graph runner 集成**: 节点执行前自动追加 `node:<key>` 地址段；节点返回 interrupt 时 runner 保存 checkpoint,调用方可用同一个 checkpoint ID 恢复。
+- **Stream materialization**: `MaterializeStream` / `RestoreStream` 演示在 checkpoint 边界把一次性 `PipeStreamReader` 转成持久值再还原。
+
+```go
+store := compose.NewInMemoryCheckPointStore()
+ctx := compose.WithCheckPoint(context.Background(), "cp1", store)
+
+_, err := graph.Invoke(ctx, "draft")
+info, _ := compose.ExtractInterruptInfo(err)
+id := info.InterruptContexts[0].ID
+
+resumeCtx := compose.ResumeWithData(
+    compose.WithCheckPoint(context.Background(), "cp1", store),
+    id,
+    "approved",
+)
+out, err := graph.Invoke(resumeCtx, "")
+```
+
+### 边界
+
+这不是完整 Eino checkpoint 实现。当前教育子集不持久化 channel manager 全量状态、不做子图 checkpoint 转发、不做序列化注册/迁移、不支持工具 rerun skip handler。它重点复刻地址、信号树、checkpoint store 和定向 resume 这四个核心模式。
 
 ---
 

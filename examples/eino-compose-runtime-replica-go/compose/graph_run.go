@@ -25,6 +25,14 @@ type runner struct {
 
 func (r *runner) run(ctx context.Context, input any) (any, error) {
 	r.runStepCount = 0
+	var err error
+	ctx, input, err = restoreCheckPointContext(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	if r.graphName != "" {
+		ctx = AppendAddressSegment(ctx, AddressSegmentRunnable, r.graphName)
+	}
 
 	cm := newChannelManager()
 	r.initChannels(cm)
@@ -74,7 +82,12 @@ func (r *runner) run(ctx context.Context, input any) (any, error) {
 
 		completedTasks := tm.wait()
 
-		r.resolveCompletedTasks(cm, completedTasks)
+		if err := r.resolveCompletedTasks(ctx, cm, completedTasks); err != nil {
+			if info, ok := ExtractInterruptInfo(err); ok {
+				_ = saveInterruptCheckPoint(ctx, input, info)
+			}
+			return nil, err
+		}
 
 		if endVal, ok := cm.getEndChannel(); ok {
 			lastEndValue = endVal
@@ -155,6 +168,7 @@ func (r *runner) createTasks(ctx context.Context, readyNodes map[string]any) []*
 			nodeKey: nodeKey,
 			call:    cc,
 			input:   input,
+			ctx:     AppendAddressSegment(ctx, AddressSegmentNode, nodeKey),
 		}
 		tasks = append(tasks, t)
 	}
@@ -162,11 +176,31 @@ func (r *runner) createTasks(ctx context.Context, readyNodes map[string]any) []*
 	return tasks
 }
 
-func (r *runner) resolveCompletedTasks(cm *channelManager, completedTasks []*task) {
+func (r *runner) resolveCompletedTasks(ctx context.Context, cm *channelManager, completedTasks []*task) error {
+	var taskErrs []error
 	for _, t := range completedTasks {
 		if t.err != nil {
-			continue
+			taskErrs = append(taskErrs, t.err)
 		}
+	}
+	if len(taskErrs) == 1 {
+		return taskErrs[0]
+	}
+	if len(taskErrs) > 1 {
+		allInterrupts := true
+		for _, err := range taskErrs {
+			if _, ok := ExtractInterruptInfo(err); !ok {
+				allInterrupts = false
+				break
+			}
+		}
+		if allInterrupts {
+			return CompositeInterrupt(ctx, "multiple graph nodes interrupted", nil, taskErrs...)
+		}
+		return taskErrs[0]
+	}
+
+	for _, t := range completedTasks {
 
 		cc := t.call
 		if cc == nil {
@@ -205,4 +239,5 @@ func (r *runner) resolveCompletedTasks(cm *channelManager, completedTasks []*tas
 			_ = branchTarget
 		}
 	}
+	return nil
 }

@@ -121,7 +121,9 @@ func (tm *taskManager) setStep(step int) {
 func (tm *taskManager) submit(ctx context.Context, tasks []*task) {
 	var wg sync.WaitGroup
 	for _, t := range tasks {
-		t.ctx = ctx
+		if t.ctx == nil {
+			t.ctx = ctx
+		}
 		t.done = make(chan struct{}, 1)
 
 		tm.mu.Lock()
@@ -156,7 +158,7 @@ func (tm *taskManager) submit(ctx context.Context, tasks []*task) {
 				actionFn = cw.Invoke(actionFn)
 			}
 
-			output, err := actionFn(ctx, tt.input)
+			output, err := actionFn(tt.ctx, tt.input)
 			tt.output = output
 			tt.err = err
 

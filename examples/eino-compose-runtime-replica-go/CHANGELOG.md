@@ -4,6 +4,31 @@
 
 ---
 
+## Ch4B: Checkpoint / Interrupt / Resume 教学子集
+
+参考 Eino 技术手册 `04-checkpoint-interrupt-resume.md`,实现可运行的教育子集: 结构化执行地址、InterruptSignal 树、checkpoint store、resume data 路由和 graph runner interrupt 保存/恢复。
+
+### 变更范围
+
+| 文件 | 变更类型 | 说明 |
+|------|---------|------|
+| `compose/address.go` | 新增 | `Address` / `AddressSegment` / `AppendAddressSegment`,支持 runnable/node/tool 分层地址和 SubID |
+| `compose/interrupt.go` | 新增 | `Interrupt` / `StatefulInterrupt` / `CompositeInterrupt`,`InterruptSignal` 树和 `InterruptContext` 扁平视图 |
+| `compose/resume.go` | 新增 | `ResumeWithData` / `BatchResumeWithData` / `GetInterruptState` / `GetResumeContext` |
+| `compose/checkpoint.go` | 新增 | `CheckPointStore`、`InMemoryCheckPointStore`、`WithCheckPoint`、stream materialization helper |
+| `compose/graph_run.go` | 更新 | runner 在 graph/node scope 追加地址,interrupt 时保存 checkpoint 并返回 interrupt error |
+| `compose/graph_manager.go` | 更新 | task 执行使用每个节点自己的 context,让地址/resume 信息进入 lambda |
+| `compose/checkpoint_test.go` | 新增 | 覆盖地址字符串、graph interrupt/resume、复合中断、conduit resume、stream 物化 |
+| `cmd/example/main.go` | 更新 | 新增 Example 18: Checkpoint / Interrupt / Resume |
+| `research/ch4-checkpoint-interrupt-resume-contract.md` | 新增 | 研究笔记: Chapter 04 问题、设计思路、复刻版边界 |
+| `README.md` / `FINAL_SUMMARY.md` | 更新 | 新增第四章 checkpoint 教学说明 |
+
+### 教学边界
+
+当前实现刻意保留为教育子集: 不复制 Eino 完整 channel checkpoint、子图 checkpoint 转发、序列化注册、状态迁移和工具 rerun skip handler。它解决的是复刻框架里最关键的四个模式: 结构化地址、树状中断信号、持久 checkpoint、定向恢复数据分发。
+
+---
+
 ## Ch4: Chapter 4 — ChatModel + Retriever Component Interfaces
 
 参考 Eino 组件模型第五章 (ChatModel) 和第六章 (Retriever),实现独立的 `compose.ChatModel` 和 `compose.Retriever` 接口、Fake 实现、组件 Lambda 桥接与回调集成。

@@ -1,4 +1,4 @@
-# Eino Compose Runtime Replica — 最终验证摘要 (第二/三/四章 + I3 Bridge Adapter,教学子集,非完整产品复刻)
+# Eino Compose Runtime Replica — 最终验证摘要 (第二/三/四章 + I3 Bridge Adapter + Checkpoint,教学子集,非完整产品复刻)
 
 ## 验证状态
 
@@ -6,7 +6,7 @@
 - **go build ./...**: 通过 (所有包编译零错误零警告)
 - **go vet ./...**: 通过 (静态分析无问题)
 - **go test ./...**: 通过 (compose 包 130+ 测试全部 PASS,cmd/example 无测试文件)
-- **go run ./cmd/example**: 通过 (17 个示例全部正常运行)
+- **go run ./cmd/example**: 通过 (18 个示例全部正常运行)
 
 ---
 
@@ -177,6 +177,41 @@
   3. `reportSkip` 调用链缺失 — 未选中分支节点永久阻塞
 - 线程安全约束全部通过 (无锁安全 / sync.Mutex / sync.Map)
 - Chain 层 subGraph 接口已定义,支持嵌套 Chain;Workflow 尚未实现
+
+---
+
+### 五、第四章: Checkpoint / Interrupt / Resume 教学子集
+
+#### 28. 结构化执行地址 (address.go)
+- `AddressSegment{Type, ID, SubID}` 表达 runnable / node / tool 等执行层级。
+- `Address.String()` 输出稳定表示: `runnable:root;node:approval;tool:lookup:call_1`。
+- `AppendAddressSegment(ctx, typ, id, opts...)` 在进入新执行 scope 时扩展地址,并注入 checkpoint 恢复状态。
+
+#### 29. InterruptSignal 树 (interrupt.go)
+- `Interrupt` / `StatefulInterrupt` / `CompositeInterrupt` 覆盖简单中断、带状态中断和复合中断。
+- `InterruptSignal.Subs` 保留树形结构,`InterruptContext` 提供面向用户的扁平 root cause 视图。
+- `SignalToPersistenceMaps` 将信号树落成 `interruptID -> Address/State` map,供 checkpoint 持久化。
+
+#### 30. Resume + CheckPointStore (resume.go / checkpoint.go)
+- `WithCheckPoint(ctx, id, store)` 将 checkpoint store/id 注入运行上下文。
+- `ResumeWithData` / `BatchResumeWithData` 将恢复数据定向到 interrupt ID。
+- `GetInterruptState[T]` 读取同一地址上一次中断保存的状态。
+- `GetResumeContext[T]` 区分直接目标 (`hasData=true`) 与通往后代目标的 conduit (`hasData=false`)。
+
+#### 31. Runner 集成 (graph_run.go / graph_manager.go)
+- graph runner 为 graph 和 node 自动追加 runnable/node 地址段。
+- 节点返回 interrupt error 时,runner 保存 checkpoint 并原样返回 interrupt。
+- task manager 使用每个节点自己的 context,确保地址/resume 信息能进入 lambda。
+
+#### 32. Stream 物化示例
+- `MaterializeStream[T]` 将一次性 `PipeStreamReader[T]` drain 成 `MaterializedStream[T]`。
+- `RestoreStream[T]` 将持久化 chunk 重新包装成 reader。
+
+#### 33. 明确不包含
+- 完整 Eino channel checkpoint 复制/恢复。
+- 嵌套子图 checkpoint 转发和迁移。
+- 序列化类型注册与 checkpoint state migration。
+- ToolsNode rerun skip handler。
 
 ---
 
