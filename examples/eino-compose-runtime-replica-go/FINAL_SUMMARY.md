@@ -1,10 +1,10 @@
-# Eino Compose Runtime Replica — 最终验证摘要 (第二章骨架,非完整产品复刻)
+# Eino Compose Runtime Replica — 最终验证摘要 (第二章 + 第三章骨架,教学子集,非完整产品复刻)
 
 ## 验证状态
 
 - **gofmt**: 通过 (所有 Go 文件均已格式化)
 - **go test ./...**: 通过 (compose 包全部测试 PASS,cmd/example 无测试文件)
-- **go run ./cmd/example**: 通过 (11 个示例全部正常运行)
+- **go run ./cmd/example**: 通过 (15 个示例全部正常运行)
 
 ---
 
@@ -102,6 +102,41 @@
 
 ---
 
+### 三、第三章: Runnable Stream / Collect / Transform / Callback 教学示例
+
+> **本章实现 Runnable 四模式、基础 Pipe stream、Collect/Transform 降级和 CallbackWrapper 教学路径。组件桥接、图级流式执行、stream field mapping 和流式分支不在当前范围内。**
+
+#### 18. composableRunnable 四字段设计 (runnable.go)
+- `i`: invoke 执行函数体
+- `s`: stream 执行函数体
+- `c`: collect 执行函数体
+- `t`: transform 执行函数体
+- **四模式降级矩阵**: invoke/stream/collect/transform 都能在缺原生函数时按规则 fallback
+
+#### 19. Pipe stream 教学版实现 (stream.go)
+- `PipeStreamReader[T]` / `PipeStreamWriter[T]`: 模拟 Eino 的流式读写抽象
+- `NewPipe` / `PipeStreamReaderFromSlice` / `PipeStreamReaderFromValue`: 常用构造路径
+- `Copy`: 教学版流扇出
+- `Merge` / `Concat`: 教学版流扇入和折叠
+
+#### 20. Stream Collect 收集模式
+- 流式分块按序收集为完整结果
+- `StreamReader → Recv(token_i) → Concat → 完整结果`
+- Eino 完整版支持多种 merge 策略 (append/concat/mergeMap)
+
+#### 21. Stream Transform 变换模式
+- 流式处理管道: `生产 → Transform(fn) → Collect`
+- 三种变换: 逐 chunk 变换 / 带状态变换 / 批量变换
+- Eino 中由 compose.Transform 实现
+
+#### 22. CallbackWrapper 回调计时 (callbacks.go)
+- 回调生命周期: `OnStart → Execute → OnEnd/OnError`
+- 支持流输入/流输出回调副本: `OnStartWithStreamInput` / `OnEndWithStreamOutput`
+- HandlerBuilder 可根据注册 handler 计算需要的 timing
+- EventLog 在 graph 级别提供等效可观测性
+
+---
+
 ## 关键文件导览
 
 | 文件 | 职责 |
@@ -125,7 +160,9 @@
 | `introspect.go` | GraphInfo、GraphNodeInfo、GraphEdgeInfo (编译时拓扑导出) |
 | `event_log.go` | EventLog、10 种事件类型、线程安全记录与格式化 |
 | `utils.go` | 辅助工具函数 |
-| `cmd/example/main.go` | 综合示例程序 (11 个场景,覆盖 Graph/DAG/Pregel/FieldMapping/Workflow/Chain/Parallel/Branch) |
+| `stream.go` | PipeStreamReader/PipeStreamWriter、Copy、Merge、Concat |
+| `callbacks.go` | RunInfo、Handler、HandlerBuilder、CallbackWrapper、流输入/输出副本 |
+| `cmd/example/main.go` | 综合示例程序 (15 个场景,覆盖 Graph/DAG/Pregel/FieldMapping/Workflow/Chain/Parallel/Branch/Stream/Collect/Transform/Callback) |
 
 ---
 
@@ -153,14 +190,16 @@ go run ./cmd/example/
 
 ## 明确未实现的边界
 
+**本复刻版是教育子集 (educational subset)。组件桥接 (ChatModel/Tool/Retriever)、完整图流式执行、stream field mapping 和流式分支不在当前范围内。**
+
 本 MVP 复刻版聚焦于 Eino Compose Runtime 的核心图编译与执行引擎,以下为明确未实现的部分:
 
 ### 运行时不支持
 - **组件桥接 (ChatModel/Tool/Retriever)**: 当前仅有 Lambda 抽象,可通过 AddLambdaNode 等价替代
-- **Stream 执行 (Stream/Collect/Transform)**: composableRunnable 的 stream 方法仅回退到 invoke
-- **streamFieldMap 流式映射**: 依赖完整 stream reader,当前 Stub
-- **Stream ChainBranch**: 流式分支暂未实现
-- **Callback 机制 (OnStart/OnEnd/OnError)**: 不在当前范围内
+- **图级 Stream 执行管线**: Runnable 四模式已经实现,但 graph runner 主路径仍以 Invoke 为主
+- **streamFieldMap 流式映射**: 依赖图级 stream channel,当前未接入
+- **Stream ChainBranch**: 流式分支暂未接入 Chain Builder
+- **组件级 Callback 桥接**: CallbackWrapper 已实现,但未接 ChatModel/Tool 组件体系与图级初始化链
 - **State 传递 (graph.state)**: 字段已定义但未使用
 - **Checkpoint / Recovery**: 可恢复执行机制不在范围内
 - **Fan-in 智能合并 (Merge 配置)**: 当前默认 map[string]any 合并
@@ -186,5 +225,8 @@ Go Eino Compose Runtime Replica 成功实现了 Eino 的核心设计理念:
 5. **声明式数据流**: Workflow 的 AddInput/AddDependency/SetStaticValue 替代手动 AddEdge
 6. **Builder 风格管道**: Chain 的 Append* 系列,自动节点命名与拓扑连接
 7. **内建并行与分支**: Parallel 并行节点组 + ChainBranch 条件路由
-8. **零外部依赖**: 仅依赖 Go 标准库
-9. **充分测试覆盖**: compose 包全量测试通过,demo 程序 11 个场景覆盖全部功能
+8. **Runnable 四模式**: composableRunnable 支持 Invoke/Stream/Collect/Transform 降级矩阵
+9. **Stream 教学模式**: Pipe stream、Copy、Merge、Concat、Collect/Transform 概念演示
+10. **CallbackWrapper**: OnStart/OnEnd/OnError 与流输入/输出回调副本
+11. **零外部依赖**: 仅依赖 Go 标准库
+12. **充分测试覆盖**: compose 包全量测试通过,demo 程序 15 个场景覆盖全部功能

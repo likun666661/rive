@@ -21,6 +21,8 @@ type chanCall struct {
 	controls      map[string]bool
 	fieldMappings map[string][]*FieldMapping
 	preHandlers   []handlerPair
+	callbacks     []*Handler
+	nodeInfo      *GraphNodeInfo
 }
 
 type channelManager struct {
@@ -143,7 +145,18 @@ func (tm *taskManager) submit(ctx context.Context, tasks []*task) {
 				return
 			}
 
-			output, err := tt.call.action.invoke(ctx, tt.input)
+			actionFn := tt.call.action.invoke
+			if len(tt.call.callbacks) > 0 && tt.call.nodeInfo != nil {
+				ri := &RunInfo{
+					Name:      tt.call.nodeInfo.Name,
+					Type:      string(tt.call.nodeInfo.Component),
+					Component: tt.call.nodeInfo.Component,
+				}
+				cw := NewCallbackWrapper(ri, tt.call.callbacks)
+				actionFn = cw.Invoke(actionFn)
+			}
+
+			output, err := actionFn(ctx, tt.input)
 			tt.output = output
 			tt.err = err
 

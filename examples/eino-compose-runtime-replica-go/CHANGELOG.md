@@ -1,83 +1,59 @@
-# CHANGELOG — 第二章示例与文档更新
+# CHANGELOG — 第二章 & 第三章示例与文档更新
 
-本文档记录对 `examples/eino-compose-runtime-replica-go` 的第二章 (FieldMapping / Workflow / Chain / Parallel / Branch) 示例补全与文档更新。
+本文档记录对 `examples/eino-compose-runtime-replica-go` 的第二章 (FieldMapping / Workflow / Chain / Parallel / Branch) 与第三章 (Runnable Stream / Collect / Transform / Callback) 示例补全与文档更新。
 
 ---
 
-## I4: Examples README Changelog — 第二章示例与文档
+## M1: Final merge docs — 第三章教学示例与文档补全
 
 ### 变更范围
 
 | 文件 | 变更类型 | 说明 |
 |------|---------|------|
-| `cmd/example/main.go` | 重写 | 新增 6 个第二章示例 (example6-11),保留原有 5 个第一章示例 |
-| `README.md` | 重写 | 中文文档,涵盖 FieldMapping / Workflow / Chain / Parallel / Branch 的问题-方案-设计说明 |
-| `CHANGELOG.md` | 重写 | 本文件 |
-| `FINAL_SUMMARY.md` | 更新 | 增加第二章功能摘要 |
+| `cmd/example/main.go` | 新增 | 新增 4 个第三章教学示例 (example12-15),示例总数增至 15 |
+| `compose/runnable.go` | 更新 | Runnable 扩展为 Invoke/Stream/Collect/Transform 四模式与 fallback 矩阵 |
+| `compose/stream.go` | 新增 | 基础 Pipe stream、Copy、Merge、Concat |
+| `compose/callbacks.go` | 新增 | RunInfo、HandlerBuilder、CallbackWrapper、流输入/输出回调副本 |
+| `README.md` | 更新 | 新增第三章功能章节,更新架构总览、包结构说明 |
+| `CHANGELOG.md` | 更新 | 本文件,记录第三章变更 |
+| `FINAL_SUMMARY.md` | 更新 | 新增第三章功能摘要,明确教学子集边界 |
 
 ### 新增示例说明
 
-#### Example 6: FieldMapping 字段映射
-- 展示六个构造函数 (`MapFields`, `FromField`, `ToField`, `MapFieldPaths`, `FromFieldPath`, `ToFieldPath`)
-- 展示 `WithCustomExtractor` 自定义提取器
-- 可运行示例: Workflow 中使用 `FromField` / `ToField` 实现跨节点字段级别数据传递
-- 输出类型: `*SearchInput → map[string]any`,通过 FieldMapping 提取/注入字段
+#### Example 12: Runnable Stream 概念演示
+- 展示 `composableRunnable` 四字段设计 (`i` / `s` / `c` / `t`)
+- 说明 Invoke/Stream/Collect/Transform fallback 矩阵
+- 通过 Graph + InvokableLambda 演示 Runnable[I,O].Invoke 公开 API
+- 源码追踪: `compose/runnable.go` 的四模式降级逻辑
 
-#### Example 7: Workflow 声明式编排
-- 演示三节点 pipeline (enrich → score → END)
-- 使用 `AddInput` + `FromField` 替代手动 `AddEdge`
-- 多前驱汇聚到 END (score 的 Confidence + START 的 Query)
-- 输出类型: `*SearchInput → *FinalOutput`
+#### Example 13: Stream Collect 模式
+- 基础 Pipe stream 实现: `NewPipe` / `Recv` / `Send` / `Copy` / `Merge` / `Concat`
+- 模拟流式 Lambda 输出 5 个 token
+- Collect 按序收集所有分块为完整结果
+- 说明 Eino 完整版的 merge 策略 (append/concat/mergeMap)
 
-#### Example 8: Chain Builder 线性管道
-- 演示 `AppendLambda` 三次构建线性管道 (lower → reverse → prefix)
-- 展示 `preNodeKeys` 自动追踪尾部节点
-- 输出类型: `string → string`
+#### Example 14: Stream Transform 模式
+- 流式管道: `生产 → Transform(ToUpper) → Collect`
+- 三种变换模式说明: 逐 chunk 变换 / 带状态变换 / 批量变换
+- 教学演示,完整图流式执行不在范围内
 
-#### Example 9: Parallel 并行执行
-- 演示 `NewParallel` + `AddLambda` 构建并行节点组
-- `AppendParallel` 嵌入 Chain,合并节点通过 `map[string]any` 区分来源
-- 输出类型: `string → string`
-
-#### Example 10: Branch 条件分支
-- 演示 `NewChainBranch` + `AddLambda` 构建条件分支
-- `AppendBranch` 嵌入 Chain
-- 短文本 (≤5) 走 short 路径,长文本 (>5) 走 long 路径
-- 两次 `Invoke` 验证不同输入路由到不同分支
-
-#### Example 11: 跳过的特性
-- 列出本复刻版明确跳过的 Eino 能力及跳过理由
-- 包含组件桥接、Stream 执行、Callback、Checkpoint 等 15 项
+#### Example 15: Callback 计时模式
+- 回调生命周期: `OnStart → Execute → OnEnd/OnError`
+- 计时 trace 实现: 记录开始时间、计算耗时
+- CallbackWrapper 覆盖 Invoke/Stream/Collect/Transform 包装与流回调副本
+- EventLog 在 graph 级别的等效可观测性演示
 
 ### 文档更新说明
 
-README.md 以中文重写,核心内容包括:
-
-1. **FieldMapping 解决的问题**:
-   - 相邻节点输入/输出类型不匹配
-   - 前驱输出是大结构体,后继只需一个字段
-   - 多个前驱的不同字段需要汇聚
-
-2. **Workflow 解决的问题**:
-   - 手动 AddEdge 声明分散,代码冗长
-   - 字段映射需额外配置
-   - 控制依赖与数据依赖混在一起
-
-3. **Chain 解决的问题**:
-   - 线性管道需手动 AddEdge,重复繁琐
-   - 没有内建 "this then that" 语义
-
-4. **Parallel 解决的问题**:
-   - 同一输入执行多个独立操作,需手动创建扇出拓扑
-
-5. **Branch 解决的问题**:
-   - 根据输入内容条件性选择路径,普通图只能静态连接
-
-6. **跳过的 Eino 能力**: 组件桥接、Stream、Callback、Checkpoint、可视化等
+README.md 第三章新增内容:
+1. composableRunnable 四字段设计与四模式 fallback 矩阵
+2. 基础 Pipe stream、Copy、Merge、Concat 实现说明
+3. Collect / Transform / CallbackWrapper 教学模式
+4. 明确组件桥接、图级流式执行、stream field mapping 和流式分支不在当前范围内
 
 ### 状态
 
 - 所有测试通过 (`go test ./...`)
 - 代码格式化通过 (`gofmt -w .`)
 - 示例程序运行通过 (`go run ./cmd/example`)
-- 文档以中文编写,符合契约要求
+- 15 个示例覆盖 Chapter 1 (Graph/DAG/Pregel/Info/EventLog) + Chapter 2 (FieldMapping/Workflow/Chain/Parallel/Branch) + Chapter 3 (Stream/Collect/Transform/Callback)

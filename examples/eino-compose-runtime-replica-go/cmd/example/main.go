@@ -4,12 +4,13 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	compose "github.com/rive/eino-compose-runtime-replica-go/compose"
 )
 
 func main() {
-	fmt.Println("=== Eino Compose Runtime Replica — Chapter 1 & 2 综合示例 ===")
+	fmt.Println("=== Eino Compose Runtime Replica — Chapter 1 / 2 / 3 综合示例 ===")
 	fmt.Println()
 
 	fmt.Println("========== 第一章示例 (Graph/DAG/Pregel/Info/EventLog) ==========")
@@ -29,6 +30,14 @@ func main() {
 	example9_Parallel()
 	example10_Branch()
 	example11_SkippedFeatures()
+
+	fmt.Println()
+	fmt.Println("========== 第三章示例 (Runnable Stream / Collect / Transform / Callback) ==========")
+	fmt.Println()
+	example12_RunnableStream()
+	example13_StreamCollect()
+	example14_StreamTransform()
+	example15_CallbackTiming()
 }
 
 func example1_DAGBasic() {
@@ -596,13 +605,13 @@ func example11_SkippedFeatures() {
 	fmt.Println("├─────────────────────────────────────────────────────────────────────┤")
 	fmt.Println("│ 组件桥接 (ChatModel/Tool/Retriever)  │ 依赖外部组件接口体系         │")
 	fmt.Println("│ AddChatModelNode / AppendChatModel   │ 当前仅有 Lambda 抽象         │")
-	fmt.Println("│ Stream 执行 (Stream/Collect)         │ StreamReader 抽象未完成      │")
-	fmt.Println("│ streamFieldMap 流式字段映射          │ 依赖完整 stream reader       │")
-	fmt.Println("│ Stream ChainBranch                   │ 流式分支 Stub               │")
-	fmt.Println("│ Callback 机制 (OnStart/OnEnd/OnError)│ 不在当前范围内               │")
+	fmt.Println("│ 图级 Stream 执行管线                  │ runner 仍以 Invoke 为主路径  │")
+	fmt.Println("│ streamFieldMap 流式字段映射          │ 依赖图级 stream channel      │")
+	fmt.Println("│ Stream ChainBranch                   │ 流式分支未接入 Chain Builder │")
+	fmt.Println("│ 组件级 Callback 桥接                  │ 未接 ChatModel/Tool 组件体系 │")
 	fmt.Println("│ State 传递 (graph.state)             │ 字段定义但未使用             │")
 	fmt.Println("│ Checkpoint / Recovery                │ 可恢复执行机制不在范围内     │")
-	fmt.Println("│ values_merge 的 StreamReader merge    │ StreamReader 未完成          │")
+	fmt.Println("│ values_merge 的 StreamReader merge    │ 未接图级 stream fan-in      │")
 	fmt.Println("│ 编译时类型推断 (toValidateMap)       │ 推迟到后续版本               │")
 	fmt.Println("│ Graph 可视化 / DOT 导出              │ 周边工具未实现               │")
 	fmt.Println("│ JSON Schema 编译校验                 │ 类型系统限制                  │")
@@ -613,7 +622,343 @@ func example11_SkippedFeatures() {
 	fmt.Println()
 	fmt.Println("  可替代方案:")
 	fmt.Println("  - 组件桥接: 通过 AddLambdaNode + InvokableLambda 包装实现等价功能")
-	fmt.Println("  - 流式处理: composableRunnable 已预留 s 字段，可后续扩展")
+	fmt.Println("  - 流式处理: Runnable 四模式、Pipe stream、Collect/Transform 教学路径已实现")
+	fmt.Println("  - 回调处理: CallbackWrapper 已覆盖 OnStart/OnEnd/OnError 与流输入/输出回调副本")
 	fmt.Println("  - 类型推断: 当前通过 fmtType() 返回简单类型名，复杂类型标注为 \"any\"")
+	fmt.Println()
+}
+
+// =============================================================================
+// 第三章示例: Runnable Stream / Collect / Transform / Callback 教学示例
+//
+// 注意: 本章实现 Runnable 四模式、基础 Pipe stream 与 CallbackWrapper。
+// 组件桥接、图级流式执行、stream field mapping 和流式分支不在当前范围内。
+// =============================================================================
+
+// StreamReader 模拟 Eino 的 StreamReader 抽象,用于教学演示
+type StreamReader[T any] struct {
+	ch  chan T
+	err chan error
+}
+
+func NewStreamReader[T any](capacity int) *StreamReader[T] {
+	return &StreamReader[T]{
+		ch:  make(chan T, capacity),
+		err: make(chan error, 1),
+	}
+}
+
+func (sr *StreamReader[T]) Send(v T) {
+	sr.ch <- v
+}
+
+func (sr *StreamReader[T]) SendError(e error) {
+	sr.err <- e
+}
+
+func (sr *StreamReader[T]) Close() {
+	close(sr.ch)
+}
+
+func (sr *StreamReader[T]) Recv() (T, error) {
+	select {
+	case v, ok := <-sr.ch:
+		if !ok {
+			var zero T
+			return zero, nil
+		}
+		return v, nil
+	case e := <-sr.err:
+		var zero T
+		return zero, e
+	}
+}
+
+// =============================================================================
+// Stream 示例: 展示 composableRunnable 的 stream 回退机制
+// =============================================================================
+
+// example12_RunnableStream 演示 Runnable 的 Stream 概念
+//
+// # 问题
+// 在 Eino 中,某些组件(如 ChatModel)支持流式输出,允许逐个 token 返回结果。
+// Runnable 接口通过 composableRunnable 的 s (stream) 字段预留了此能力。
+//
+// # 当前状态
+// composableRunnable 已支持 Invoke/Stream/Collect/Transform 四种模式,
+// 并按 Eino 的降级矩阵在缺少原生模式时自动 fallback。
+// 本示例展示 invoke-only Lambda 的 Stream fallback。
+//
+// # 教学目的
+// 理解 Stream 回退机制: 当 Lambda 未设置 s 时,Stream 自动 fallback 到 Invoke。
+// 这是 Eino 中 "invoke 是 stream 的子集" 设计原则的体现。
+func example12_RunnableStream() {
+	fmt.Println("--- Example 12: Runnable Stream 概念演示 ---")
+	fmt.Println()
+
+	fmt.Println("# 12.1 composableRunnable 四字段设计")
+	fmt.Println("#")
+	fmt.Println("#   composableRunnable {")
+	fmt.Println("#     i: func(ctx,input) invoke 执行体")
+	fmt.Println("#     s: func(ctx,input) stream 执行体")
+	fmt.Println("#     c: func(ctx,stream) collect 执行体")
+	fmt.Println("#     t: func(ctx,stream) transform 执行体")
+	fmt.Println("#   }")
+	fmt.Println("#")
+	fmt.Println("#   调用路径:")
+	fmt.Println("#     invoke()    → i → s → c → t")
+	fmt.Println("#     stream()    → s → t → i → c")
+	fmt.Println("#     collect()   → c → t → i → s")
+	fmt.Println("#     transform() → t → s → c → i")
+	fmt.Println()
+
+	fmt.Println("# 12.2 InvokableLambda 仅设置 i 字段 (s == nil)")
+	fmt.Println("# Stream 回退机制: 当 s==nil 时,stream() 自动 fallback 到 invoke()")
+	fmt.Println()
+
+	lambda := compose.InvokableLambda(func(ctx context.Context, in string) (string, error) {
+		return "[PROCESSED] " + in, nil
+	})
+
+	g := compose.NewGraph[string, string]()
+	g.AddLambdaNode("runnable_demo", lambda)
+	g.AddEdge(compose.START, "runnable_demo")
+	g.AddEdge("runnable_demo", compose.END)
+
+	r, err := g.Compile(context.Background(),
+		compose.WithGraphName("stream_demo"),
+		compose.WithNodeTriggerMode(compose.AllPredecessor),
+	)
+	if err != nil {
+		fmt.Printf("  Compile error: %v\n", err)
+		return
+	}
+
+	result, err := r.Invoke(context.Background(), "hello")
+	if err != nil {
+		fmt.Printf("  Invoke error: %v\n", err)
+		return
+	}
+	fmt.Printf("  Input:  %q\n", "hello")
+	fmt.Printf("  Output: %q\n", result)
+	fmt.Println()
+	fmt.Println("#   源码追踪 (compose/runnable.go):")
+	fmt.Println("#     func (cr *composableRunnable) stream(ctx, input) {")
+	fmt.Println("#       if cr.s != nil { return cr.s(ctx, input) }  // 优先 stream")
+	fmt.Println("#       if cr.t != nil { return cr.t(ctx, streamFromItems(input)) }")
+	fmt.Println("#       if cr.i != nil { return streamFromItems(cr.i(ctx,input)) }")
+	fmt.Println("#       if cr.c != nil { return streamFromItems(cr.c(ctx, streamFromItems(input))) }")
+	fmt.Println("#     }")
+	fmt.Println()
+}
+
+// example13_StreamCollect 演示 Stream Collect 模式
+//
+// # 问题
+// Eino 中的 StreamReader 支持分块接收数据,Collect 将所有分块收集为完整结果。
+// 在完整产品中,Collect 需要处理 StreamReader 的合并策略(如 append/concat)。
+//
+// # 当前实现
+// 本示例使用教学版 StreamReader[t] 演示 Collect 概念:
+//   - 模拟一个生成 5 个 token 的流式 Lambda
+//   - 通过 Collect 将所有 token 收集为完整字符串
+//
+// # 教学目的
+// 理解 Eino 中 Stream 的生产-收集模式。当前教育子集已实现 Runnable Collect
+// 降级路径和基础 Pipe stream,但完整图级流式执行不在本章范围内。
+func example13_StreamCollect() {
+	fmt.Println("--- Example 13: Stream Collect 模式 ---")
+	fmt.Println()
+
+	fmt.Println("# 13.1 模拟流式 Lambda (输出 5 个 token)")
+	fmt.Println()
+
+	sr := NewStreamReader[string](5)
+
+	go func() {
+		defer sr.Close()
+		for _, token := range []string{"He", "llo", " ", "Wor", "ld"} {
+			sr.Send(token)
+		}
+	}()
+
+	fmt.Println("# 13.2 Collect: 收集所有分块")
+	var collected string
+	for {
+		token, err := sr.Recv()
+		if err != nil {
+			fmt.Printf("  Collect error: %v\n", err)
+			return
+		}
+		if token == "" {
+			break
+		}
+		fmt.Printf("  Recv token: %q\n", token)
+		collected += token
+	}
+	fmt.Printf("  Collected: %q\n\n", collected)
+
+	fmt.Println("# 13.3 说明")
+	fmt.Println("#   - StreamReader.Recv() 每次读取一个分块")
+	fmt.Println("#   - Collect 将所有分块按序拼接 (相当于 Merge.Strategy=Concat)")
+	fmt.Println("#   - Eino 完整版支持 StreamReader merge 策略 (append/concat/mergeMap)")
+	fmt.Println("#   - 本教育子集实现了基础 Pipe stream 与 Runnable Collect 降级")
+	fmt.Println("#   - 完整图流式执行、stream field mapping 和流式分支不在范围内")
+	fmt.Println()
+}
+
+// example14_StreamTransform 演示 Stream Transform 模式
+//
+// # 问题
+// Eino 的 Transform 允许在流式处理中对每个分块应用变换函数,常用的有:
+//   - 逐 chunk 转换 (如 lowercasing, masking)
+//   - 带状态的流式变换 (如计数器, 滑动窗口)
+//   - 缓冲批量变换 (如 chunk-batching)
+//
+// # 当前实现
+// 本示例使用教学版 StreamReader[t] 演示 Transform:
+//   - 生成 5 个 token
+//   - 通过 Transform 对上每个 token 转为大写
+//   - 最后通过 Collect 收集
+//
+// # 教学目的
+// 理解 Stream 处理的管道模式: 生产 → Transform → Collect。
+// 这是 Eino 中 Compose Framework 流式分支的基础概念。
+func example14_StreamTransform() {
+	fmt.Println("--- Example 14: Stream Transform 模式 ---")
+	fmt.Println()
+
+	fmt.Println("# 14.1 流式管道: 生产 → Transform(ToUpper) → Collect")
+	fmt.Println()
+
+	sr := NewStreamReader[string](5)
+
+	go func() {
+		defer sr.Close()
+		for _, token := range []string{"he", "ll", "o ", "wo", "rld"} {
+			sr.Send(token)
+		}
+	}()
+
+	toUpper := func(s string) string { return strings.ToUpper(s) }
+
+	fmt.Println("  Pipeline: StreamReader → Transform → Collect")
+	var result string
+	for {
+		token, err := sr.Recv()
+		if err != nil {
+			fmt.Printf("  Error: %v\n", err)
+			return
+		}
+		if token == "" {
+			break
+		}
+		transformed := toUpper(token)
+		fmt.Printf("  %q → Transform → %q\n", token, transformed)
+		result += transformed
+	}
+	fmt.Printf("  Final: %q\n\n", result)
+
+	fmt.Println("# 14.2 Transform 模式变体说明")
+	fmt.Println("#   逐 chunk 变换: StreamReader[T] → Transform(fn) → StreamReader[U]")
+	fmt.Println("#   带状态变换:  fn 中维护计数器/滑动窗口/状态机")
+	fmt.Println("#   批量变换:    收集 N 个 chunk 后一次处理")
+	fmt.Println("#   Eino 中这些由 compose.Transform 实现,当前为教学演示")
+	fmt.Println()
+}
+
+// example15_CallbackTiming 演示 Callback 计时模式
+//
+// # 问题
+// Eino 提供 OnStart / OnEnd / OnError 三类回调,用于追踪、日志、计时、熔断。
+// 这是可观测性的核心机制,在完整产品中贯穿所有 Runnable 执行。
+//
+// # 当前实现
+// 本示例使用教学版 callbackTimedRunnable 演示回调计时:
+//   - OnStart: 记录开始时间
+//   - OnEnd:   记录结束时间,计算耗时
+//   - OnError: 记录错误
+//
+// 同时演示如何使用 Graph + Lambda 实现等价功能。
+//
+// # 教学目的
+// 理解 Eino 的回调生命周期 (Start → Execute → End/Error),
+// 以及计时 trace 如何作为回调实现。当前教育子集提供 CallbackWrapper,
+// 但尚未接入组件桥接和完整图级 callback 初始化链。
+func example15_CallbackTiming() {
+	fmt.Println("--- Example 15: Callback 计时模式 ---")
+	fmt.Println()
+
+	fmt.Println("# 15.1 回调生命周期: OnStart → Invoke → OnEnd/OnError")
+	fmt.Println()
+
+	type timingCallback struct {
+		onStart func(nodeKey string, input string) context.Context
+		onEnd   func(nodeKey string, output string, elapsed time.Duration)
+		onError func(nodeKey string, err error, elapsed time.Duration)
+	}
+
+	runWithCallback := func(
+		nodeKey string,
+		input string,
+		fn func(context.Context, string) (string, error),
+		cb timingCallback,
+	) (string, error) {
+		ctx := cb.onStart(nodeKey, input)
+		start := time.Now()
+
+		output, err := fn(ctx, input)
+		elapsed := time.Since(start)
+
+		if err != nil {
+			cb.onError(nodeKey, err, elapsed)
+			return "", err
+		}
+		cb.onEnd(nodeKey, output, elapsed)
+		return output, nil
+	}
+
+	cb := timingCallback{
+		onStart: func(nodeKey, input string) context.Context {
+			fmt.Printf("  [OnStart]  node=%q  input=%q\n", nodeKey, input)
+			return context.Background()
+		},
+		onEnd: func(nodeKey, output string, elapsed time.Duration) {
+			fmt.Printf("  [OnEnd]    node=%q  output=%q  elapsed=%v\n", nodeKey, output, elapsed)
+		},
+		onError: func(nodeKey string, err error, elapsed time.Duration) {
+			fmt.Printf("  [OnError]  node=%q  err=%v  elapsed=%v\n", nodeKey, err, elapsed)
+		},
+	}
+
+	successFn := func(ctx context.Context, s string) (string, error) {
+		time.Sleep(50 * time.Millisecond)
+		return "[RESULT] " + s, nil
+	}
+
+	output, _ := runWithCallback("demo_node", "test_input", successFn, cb)
+	_ = output
+	fmt.Println()
+
+	fmt.Println("# 15.2 使用 Graph + EventLog 实现等价的可观测性")
+	fmt.Println()
+
+	el := compose.NewEventLog()
+	el.LogGraphStart("callback_demo")
+	el.LogNodeStart("step_1", 1, "raw_data")
+	el.LogNodeEnd("step_1", 1, "processed_data")
+	el.LogGraphEnd("callback_demo", 1)
+	fmt.Println("  EventLog (等效于回调日志):")
+	for _, line := range strings.Split(strings.TrimSpace(el.String()), "\n") {
+		fmt.Printf("  %s\n", line)
+	}
+	fmt.Println()
+
+	fmt.Println("# 15.3 说明")
+	fmt.Println("#   - OnStart/OnEnd/OnError 三类回调覆盖完整生命周期")
+	fmt.Println("#   - 回调可用于计时 trace、日志、熔断、重试")
+	fmt.Println("#   - EventLog 在 graph 级别提供了类似的可观测性")
+	fmt.Println("#   - CallbackWrapper 已覆盖 Invoke/Stream/Collect/Transform 包装")
+	fmt.Println("#   - 组件桥接、图级 callback 初始化链和完整图流式执行不在范围内")
 	fmt.Println()
 }

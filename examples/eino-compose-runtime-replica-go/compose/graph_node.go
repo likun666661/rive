@@ -3,10 +3,11 @@ package compose
 import "context"
 
 type graphNode struct {
-	name string
-	cr   *composableRunnable
-	g    *graph
-	info *GraphNodeInfo
+	name     string
+	cr       *composableRunnable
+	g        *graph
+	info     *GraphNodeInfo
+	handlers []*Handler
 }
 
 func (gn *graphNode) compileIfNeeded(ctx context.Context, option *graphCompileOptions) (*composableRunnable, error) {

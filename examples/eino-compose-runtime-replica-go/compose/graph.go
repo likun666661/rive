@@ -113,6 +113,18 @@ func (g *graph) AddBranch(key string, branch *GraphBranch) error {
 	return nil
 }
 
+func (g *graph) SetNodeHandler(key string, handlers ...*Handler) error {
+	if err := g.checkCompiled(); err != nil {
+		return err
+	}
+	node, ok := g.nodes[key]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrNodeNotFound, key)
+	}
+	node.handlers = append(node.handlers, handlers...)
+	return nil
+}
+
 func (g *graph) addEdgeWithMappings(fromNodeKey, toNodeKey string, noDirectDependency bool, isControl bool, mappings ...*FieldMapping) error {
 	if err := g.checkCompiled(); err != nil {
 		return err
@@ -193,6 +205,8 @@ func (g *graph) compile(ctx context.Context) (*runner, error) {
 			writeTo:       make(map[string]bool),
 			controls:      make(map[string]bool),
 			fieldMappings: make(map[string][]*FieldMapping),
+			callbacks:     node.handlers,
+			nodeInfo:      node.info,
 		}
 	}
 

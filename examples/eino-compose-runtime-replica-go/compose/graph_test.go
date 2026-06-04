@@ -1270,8 +1270,16 @@ func TestLambdaStreamFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stream fallback failed: %v", err)
 	}
-	if output != "result" {
-		t.Fatalf("expected result, got %v", output)
+	sr, ok := output.(streamReader)
+	if !ok {
+		t.Fatalf("expected streamReader, got %T: %v", output, output)
+	}
+	v, err := sr.Recv()
+	if err != nil {
+		t.Fatalf("recv failed: %v", err)
+	}
+	if v != "result" {
+		t.Fatalf("expected result, got %v", v)
 	}
 }
 
@@ -2853,5 +2861,1000 @@ func TestCompiledGraphRecompileWithModeSwitch(t *testing.T) {
 	}
 	if info2.MaxSteps != 25 {
 		t.Fatalf("expected MaxSteps=25, got %d", info2.MaxSteps)
+	}
+}
+
+// --- Stream / runnable fallback matrix tests ---
+
+func mustCollectStreamResult(t *testing.T, raw any) any {
+	t.Helper()
+	sr, ok := raw.(streamReader)
+	if !ok {
+		t.Fatalf("expected streamReader, got %T: %v", raw, raw)
+	}
+	items, err := recvAll(sr)
+	if err != nil {
+		t.Fatalf("failed to read stream: %v", err)
+	}
+	return collected(items)
+}
+
+func TestRunnableFallbackMatrixInvokeOnly(t *testing.T) {
+	cr := &composableRunnable{
+		i: func(ctx context.Context, input any) (any, error) {
+			return "invoke_result", nil
+		},
+	}
+
+	out, err := cr.invoke(context.Background(), "input")
+	if err != nil {
+		t.Fatalf("invoke failed: %v", err)
+	}
+	if out != "invoke_result" {
+		t.Fatalf("expected invoke_result, got %v", out)
+	}
+
+	out, err = cr.stream(context.Background(), "input")
+	if err != nil {
+		t.Fatalf("stream fallback to invoke failed: %v", err)
+	}
+	if got := mustCollectStreamResult(t, out); got != "invoke_result" {
+		t.Fatalf("expected fallback invoke_result, got %v", got)
+	}
+}
+
+func TestRunnableFallbackMatrixStreamOnly(t *testing.T) {
+	cr := &composableRunnable{
+		s: func(ctx context.Context, input any) (any, error) {
+			return streamFromItems("stream_result"), nil
+		},
+	}
+
+	out, err := cr.invoke(context.Background(), "input")
+	if err != nil {
+		t.Fatalf("invoke fallback to stream failed: %v", err)
+	}
+	if out != "stream_result" {
+		t.Fatalf("expected stream_result, got %v", out)
+	}
+
+	out, err = cr.stream(context.Background(), "input")
+	if err != nil {
+		t.Fatalf("stream failed: %v", err)
+	}
+	if got := mustCollectStreamResult(t, out); got != "stream_result" {
+		t.Fatalf("expected stream_result, got %v", got)
+	}
+}
+
+func TestRunnableFallbackMatrixBothSet(t *testing.T) {
+	cr := &composableRunnable{
+		i: func(ctx context.Context, input any) (any, error) {
+			return "invoke_result", nil
+		},
+		s: func(ctx context.Context, input any) (any, error) {
+			return "stream_result", nil
+		},
+	}
+
+	invOut, err := cr.invoke(context.Background(), "input")
+	if err != nil {
+		t.Fatalf("invoke failed: %v", err)
+	}
+	if invOut != "invoke_result" {
+		t.Fatalf("invoke should return invoke_result, got %v", invOut)
+	}
+
+	strOut, err := cr.stream(context.Background(), "input")
+	if err != nil {
+		t.Fatalf("stream failed: %v", err)
+	}
+	if strOut != "stream_result" {
+		t.Fatalf("stream should return stream_result (not fallback to invoke), got %v", strOut)
+	}
+}
+
+func TestRunnableFallbackMatrixNeitherSet(t *testing.T) {
+	cr := &composableRunnable{}
+
+	if !cr.nil() {
+		t.Fatal("nil() should return true")
+	}
+
+	_, err := cr.invoke(context.Background(), "input")
+	if err == nil {
+		t.Fatal("invoke should fail when both are nil")
+	}
+	if !strings.Contains(err.Error(), "Invoke not supported") {
+		t.Fatalf("expected 'Invoke not supported' error, got: %v", err)
+	}
+
+	_, err = cr.stream(context.Background(), "input")
+	if err == nil {
+		t.Fatal("stream should fail when both are nil")
+	}
+	if !strings.Contains(err.Error(), "Stream not supported") {
+		t.Fatalf("expected 'Stream not supported' error, got: %v", err)
+	}
+}
+
+func TestRunnableFallbackMatrixNilCheck(t *testing.T) {
+	crI := &composableRunnable{i: func(ctx context.Context, input any) (any, error) { return nil, nil }}
+	if crI.nil() {
+		t.Fatal("nil() should return false when i is set")
+	}
+
+	crS := &composableRunnable{s: func(ctx context.Context, input any) (any, error) { return nil, nil }}
+	if crS.nil() {
+		t.Fatal("nil() should return false when s is set")
+	}
+
+	crEmpty := &composableRunnable{}
+	if !crEmpty.nil() {
+		t.Fatal("nil() should return true when neither is set")
+	}
+}
+
+// --- Registered concat vs fallback last chunk tests ---
+
+func TestStreamRegisteredConcatPriority(t *testing.T) {
+	crI := &composableRunnable{i: func(ctx context.Context, input any) (any, error) {
+		return "from_invoke", nil
+	}}
+	out, err := crI.stream(context.Background(), "data")
+	if err != nil {
+		t.Fatalf("stream fallback for invoke-only should work: %v", err)
+	}
+	if got := mustCollectStreamResult(t, out); got != "from_invoke" {
+		t.Fatalf("expected fallback to return from_invoke, got %v", got)
+	}
+
+	crS := &composableRunnable{s: func(ctx context.Context, input any) (any, error) {
+		return streamFromItems("from_stream"), nil
+	}}
+	out, err = crS.stream(context.Background(), "data")
+	if err != nil {
+		t.Fatalf("stream for stream-only should work: %v", err)
+	}
+	if got := mustCollectStreamResult(t, out); got != "from_stream" {
+		t.Fatalf("expected from_stream, got %v", got)
+	}
+}
+
+func TestStreamFallbackPreservesInvokeError(t *testing.T) {
+	testErr := errors.New("invoke boom")
+	cr := &composableRunnable{
+		i: func(ctx context.Context, input any) (any, error) {
+			return nil, testErr
+		},
+	}
+	_, err := cr.stream(context.Background(), "data")
+	if err == nil {
+		t.Fatal("expected stream fallback to propagate invoke error")
+	}
+	if !errors.Is(err, testErr) {
+		t.Fatalf("expected testErr, got %v", err)
+	}
+}
+
+func TestStreamFallbackWithComplexInput(t *testing.T) {
+	type Complex struct {
+		Value string
+	}
+	cr := &composableRunnable{
+		i: func(ctx context.Context, input any) (any, error) {
+			c, ok := input.(Complex)
+			if !ok {
+				return nil, fmt.Errorf("type mismatch")
+			}
+			return "processed:" + c.Value, nil
+		},
+	}
+	out, err := cr.stream(context.Background(), Complex{Value: "hello"})
+	if err != nil {
+		t.Fatalf("stream fallback with complex type failed: %v", err)
+	}
+	if got := mustCollectStreamResult(t, out); got != "processed:hello" {
+		t.Fatalf("expected processed:hello, got %v", got)
+	}
+}
+
+// --- Merge close semantics tests (DAG channel) ---
+
+func TestDAGChannelCloseAfterGet(t *testing.T) {
+	dc := newDAGChannel([]string{}, []string{"a"})
+	dc.reportValues("a", "value_a")
+
+	val, ok, err := dc.get()
+	if err != nil {
+		t.Fatalf("first get failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected value to be ready on first get")
+	}
+	if val != "value_a" {
+		t.Fatalf("expected value_a, got %v", val)
+	}
+
+	_, ok, err = dc.get()
+	if err != nil {
+		t.Fatalf("second get should not error: %v", err)
+	}
+	if ok {
+		t.Fatal("expected second get to return false (channel consumed)")
+	}
+}
+
+func TestDAGChannelCloseAfterMergeGet(t *testing.T) {
+	dc := newDAGChannel([]string{}, []string{"x", "y"})
+	dc.setMergeConfig(func(values map[string]any) (any, error) {
+		return "merged:" + values["x"].(string) + "_" + values["y"].(string), nil
+	})
+	dc.reportValues("x", "hello")
+	dc.reportValues("y", "world")
+
+	val, ok, err := dc.get()
+	if err != nil {
+		t.Fatalf("first get with merge failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected value to be ready on first merge get")
+	}
+	if val != "merged:hello_world" {
+		t.Fatalf("expected merged:hello_world, got %v", val)
+	}
+
+	_, ok, err = dc.get()
+	if err != nil {
+		t.Fatalf("second get should not error: %v", err)
+	}
+	if ok {
+		t.Fatal("expected second get to return false (merge channel consumed)")
+	}
+}
+
+func TestDAGChannelCloseAfterMultiNoMerge(t *testing.T) {
+	dc := newDAGChannel([]string{}, []string{"a", "b"})
+	dc.reportValues("a", "val_a")
+	dc.reportValues("b", "val_b")
+
+	val, ok, err := dc.get()
+	if err != nil {
+		t.Fatalf("first get failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected value to be ready")
+	}
+	m, ok2 := val.(map[string]any)
+	if !ok2 {
+		t.Fatalf("expected map[string]any, got %T", val)
+	}
+	if m["a"] != "val_a" || m["b"] != "val_b" {
+		t.Fatalf("expected val_a,val_b in map, got %v", m)
+	}
+
+	_, ok, err = dc.get()
+	if err != nil {
+		t.Fatalf("second get should not error: %v", err)
+	}
+	if ok {
+		t.Fatal("expected second get to return false (map wrapped channel consumed)")
+	}
+}
+
+func TestDAGChannelMergeClosesNoMidConsume(t *testing.T) {
+	dc := newDAGChannel([]string{}, []string{"a", "b"})
+	dc.reportValues("a", "first")
+
+	_, ok, _ := dc.get()
+	if ok {
+		t.Fatal("expected not ready when only one of two data predecessors reported")
+	}
+
+	dc.reportValues("b", "second")
+
+	val, ok, err := dc.get()
+	if err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected value after both reported")
+	}
+
+	m, ok2 := val.(map[string]any)
+	if !ok2 {
+		t.Fatalf("expected map[string]any, got %T", val)
+	}
+	if len(m) != 2 {
+		t.Fatalf("expected 2 entries in map, got %d", len(m))
+	}
+
+	_, ok, _ = dc.get()
+	if ok {
+		t.Fatal("expected consumed after merge close")
+	}
+}
+
+// --- Merge close semantics tests (Pregel channel) ---
+
+func TestPregelChannelCloseAfterGet(t *testing.T) {
+	pc := newPregelChannel()
+	pc.reportValues("a", "value_a")
+
+	val, ok, err := pc.get()
+	if err != nil {
+		t.Fatalf("first get failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected value to be ready on first get")
+	}
+	if val != "value_a" {
+		t.Fatalf("expected value_a, got %v", val)
+	}
+
+	_, ok, err = pc.get()
+	if err != nil {
+		t.Fatalf("second get should not error: %v", err)
+	}
+	if ok {
+		t.Fatal("expected second get to return false (channel consumed)")
+	}
+}
+
+func TestPregelChannelCloseAfterMergeGet(t *testing.T) {
+	pc := newPregelChannel()
+	pc.setMergeConfig(func(values map[string]any) (any, error) {
+		return "merged_pregel", nil
+	})
+	pc.reportValues("x", "hello")
+	pc.reportValues("y", "world")
+
+	val, ok, err := pc.get()
+	if err != nil {
+		t.Fatalf("first get with merge failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected value to be ready on first merge get")
+	}
+	if val != "merged_pregel" {
+		t.Fatalf("expected merged_pregel, got %v", val)
+	}
+
+	_, ok, err = pc.get()
+	if err != nil {
+		t.Fatalf("second get should not error: %v", err)
+	}
+	if ok {
+		t.Fatal("expected second get to return false (pregel merge channel consumed)")
+	}
+}
+
+func TestPregelChannelMergeOnlyWhenMultiple(t *testing.T) {
+	pc := newPregelChannel()
+	mergeCalled := false
+	pc.setMergeConfig(func(values map[string]any) (any, error) {
+		mergeCalled = true
+		return "should_not_call", nil
+	})
+
+	pc.reportValues("sole", "just_one")
+
+	val, ok, err := pc.get()
+	if err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected value to be ready")
+	}
+	if val != "just_one" {
+		t.Fatalf("expected just_one (single value, no merge), got %v", val)
+	}
+	if mergeCalled {
+		t.Fatal("merge should not be called when only one value exists")
+	}
+}
+
+func TestDAGChannelMergeCalledEvenWithSingleValue(t *testing.T) {
+	dc := newDAGChannel([]string{}, []string{"sole"})
+	mergeCalled := false
+	dc.setMergeConfig(func(values map[string]any) (any, error) {
+		mergeCalled = true
+		return "merged_single", nil
+	})
+
+	dc.reportValues("sole", "one")
+
+	val, ok, err := dc.get()
+	if err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected value to be ready")
+	}
+	if val != "merged_single" {
+		t.Fatalf("expected merged_single (DAG merge called even with single value), got %v", val)
+	}
+	if !mergeCalled {
+		t.Fatal("DAG merge IS called even with single value (unlike Pregel)")
+	}
+}
+
+func TestDAGChannelMergeWithError(t *testing.T) {
+	dc := newDAGChannel([]string{}, []string{"a", "b"})
+	dc.reportValues("a", "val_a")
+	dc.reportValues("b", "val_b")
+	dc.setMergeConfig(func(values map[string]any) (any, error) {
+		return nil, errors.New("merge explosion")
+	})
+
+	_, ok, err := dc.get()
+	if err == nil {
+		t.Fatal("expected merge error, got nil")
+	}
+	if !strings.Contains(err.Error(), "merge explosion") {
+		t.Fatalf("expected 'merge explosion' error, got: %v", err)
+	}
+	if ok {
+		t.Fatal("expected ok=false when merge errors")
+	}
+}
+
+func TestPregelChannelMergeWithError(t *testing.T) {
+	pc := newPregelChannel()
+	pc.reportValues("a", "val_a")
+	pc.reportValues("b", "val_b")
+	pc.setMergeConfig(func(values map[string]any) (any, error) {
+		return nil, errors.New("pregel merge boom")
+	})
+
+	_, ok, err := pc.get()
+	if err == nil {
+		t.Fatal("expected merge error, got nil")
+	}
+	if !strings.Contains(err.Error(), "pregel merge boom") {
+		t.Fatalf("expected 'pregel merge boom' error, got: %v", err)
+	}
+	if ok {
+		t.Fatal("expected ok=false when merge errors")
+	}
+}
+
+// --- DAG channel close with control dependencies ---
+
+func TestDAGChannelCloseWithControlAfterGet(t *testing.T) {
+	dc := newDAGChannel([]string{"c1"}, []string{"d1"})
+	dc.reportValues("d1", "data_val")
+	dc.reportDependency("c1")
+
+	val, ok, err := dc.get()
+	if err != nil {
+		t.Fatalf("first get failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected value ready")
+	}
+	if val != "data_val" {
+		t.Fatalf("expected data_val, got %v", val)
+	}
+
+	_, ok, err = dc.get()
+	if err != nil {
+		t.Fatalf("second get should not error: %v", err)
+	}
+	if ok {
+		t.Fatal("expected channel consumed after get with control dep")
+	}
+}
+
+func TestDAGChannelCloseAfterAllSkipped(t *testing.T) {
+	dc := newDAGChannel([]string{"c1", "c2"}, []string{})
+	dc.reportSkip("c1")
+	allSkipped := dc.reportSkip("c2")
+	if !allSkipped {
+		t.Fatal("expected allSkipped=true")
+	}
+
+	_, ok, err := dc.get()
+	if err != nil {
+		t.Fatalf("get on all-skipped channel should not error: %v", err)
+	}
+	if ok {
+		t.Fatal("expected no value after all skipped")
+	}
+}
+
+// --- Stream Copy semantics: verify invoke/stream consistency ---
+
+func TestStreamCopyInputNotMutatedByInvoke(t *testing.T) {
+	type Mutable struct {
+		Value string
+	}
+	input := &Mutable{Value: "original"}
+	original := input.Value
+
+	cr := &composableRunnable{
+		i: func(ctx context.Context, input any) (any, error) {
+			return "ok", nil
+		},
+	}
+
+	_, err := cr.stream(context.Background(), input)
+	if err != nil {
+		t.Fatalf("stream failed: %v", err)
+	}
+	if input.Value != original {
+		t.Fatal("stream fallback should not mutate input")
+	}
+}
+
+func TestRunnableStreamFallbackReturnsLastChunkValue(t *testing.T) {
+	cr := &composableRunnable{
+		i: func(ctx context.Context, input any) (any, error) {
+			return "last_and_only_chunk", nil
+		},
+	}
+	out, err := cr.stream(context.Background(), "data")
+	if err != nil {
+		t.Fatalf("stream fallback failed: %v", err)
+	}
+	if got := mustCollectStreamResult(t, out); got != "last_and_only_chunk" {
+		t.Fatalf("expected last_and_only_chunk (sole result treated as last chunk), got %v", got)
+	}
+}
+
+// --- Graph callback integration tests ---
+
+func TestGraphNodeCallbackOnStartOnEndInvoke(t *testing.T) {
+	var callOrder []string
+
+	handler := &Handler{
+		OnStart: func(ctx context.Context, info *RunInfo, input any) context.Context {
+			callOrder = append(callOrder, fmt.Sprintf("OnStart:%s:%v", info.Name, input))
+			return ctx
+		},
+		OnEnd: func(ctx context.Context, info *RunInfo, output any) context.Context {
+			callOrder = append(callOrder, fmt.Sprintf("OnEnd:%s:%v", info.Name, output))
+			return ctx
+		},
+	}
+
+	g := NewGraph[string, string]()
+	g.AddLambdaNode("echo", InvokableLambda(nodeIdentity))
+	g.SetNodeCallbacks("echo", handler)
+	g.AddEdge(START, "echo")
+	g.AddEdge("echo", END)
+
+	r, err := g.Compile(context.Background(),
+		WithGraphName("callback_invoke"),
+		WithNodeTriggerMode(AnyPredecessor),
+	)
+	if err != nil {
+		t.Fatalf("Compile failed: %v", err)
+	}
+
+	result, err := r.Invoke(context.Background(), "hello")
+	if err != nil {
+		t.Fatalf("Invoke failed: %v", err)
+	}
+	if result != "hello" {
+		t.Fatalf("expected hello, got %q", result)
+	}
+
+	if len(callOrder) != 2 {
+		t.Fatalf("expected 2 callback events, got %d: %v", len(callOrder), callOrder)
+	}
+	if callOrder[0] != "OnStart:echo:hello" {
+		t.Errorf("first callback: expected OnStart:echo:hello, got %s", callOrder[0])
+	}
+	if callOrder[1] != "OnEnd:echo:hello" {
+		t.Errorf("second callback: expected OnEnd:echo:hello, got %s", callOrder[1])
+	}
+}
+
+func TestGraphNodeCallbackOnError(t *testing.T) {
+	var (
+		startCalled bool
+		endCalled   bool
+		errorCalled bool
+		receivedErr string
+	)
+
+	handler := &Handler{
+		OnStart: func(ctx context.Context, info *RunInfo, input any) context.Context {
+			startCalled = true
+			return ctx
+		},
+		OnEnd: func(ctx context.Context, info *RunInfo, output any) context.Context {
+			endCalled = true
+			return ctx
+		},
+		OnError: func(ctx context.Context, info *RunInfo, err error) context.Context {
+			errorCalled = true
+			receivedErr = err.Error()
+			return ctx
+		},
+	}
+
+	g := NewGraph[string, string]()
+	g.AddLambdaNode("fail", InvokableLambda(nodeFailing))
+	g.SetNodeCallbacks("fail", handler)
+	g.AddEdge(START, "fail")
+	g.AddEdge("fail", END)
+
+	r, err := g.Compile(context.Background(),
+		WithGraphName("callback_error"),
+		WithNodeTriggerMode(AnyPredecessor),
+	)
+	if err != nil {
+		t.Fatalf("Compile failed: %v", err)
+	}
+
+	_, err = r.Invoke(context.Background(), "trigger")
+	if err == nil {
+		t.Fatal("expected error from failing node")
+	}
+
+	if !startCalled {
+		t.Error("OnStart was not called")
+	}
+	if endCalled {
+		t.Error("OnEnd should not be called on error")
+	}
+	if !errorCalled {
+		t.Error("OnError was not called")
+	}
+	if receivedErr != "forced failure" {
+		t.Errorf("OnError expected 'forced failure', got %q", receivedErr)
+	}
+}
+
+func TestGraphMultiNodeCallbackOrder(t *testing.T) {
+	var callOrder []string
+
+	handlerA := &Handler{
+		OnStart: func(ctx context.Context, info *RunInfo, input any) context.Context {
+			callOrder = append(callOrder, fmt.Sprintf("A-OnStart:%v", input))
+			return ctx
+		},
+		OnEnd: func(ctx context.Context, info *RunInfo, output any) context.Context {
+			callOrder = append(callOrder, fmt.Sprintf("A-OnEnd:%v", output))
+			return ctx
+		},
+	}
+	handlerB := &Handler{
+		OnStart: func(ctx context.Context, info *RunInfo, input any) context.Context {
+			callOrder = append(callOrder, fmt.Sprintf("B-OnStart:%v", input))
+			return ctx
+		},
+		OnEnd: func(ctx context.Context, info *RunInfo, output any) context.Context {
+			callOrder = append(callOrder, fmt.Sprintf("B-OnEnd:%v", output))
+			return ctx
+		},
+	}
+
+	g := NewGraph[string, string]()
+	g.AddLambdaNode("upper", InvokableLambda(nodeToUpper))
+	g.AddLambdaNode("reverse", InvokableLambda(nodeReverse))
+	g.SetNodeCallbacks("upper", handlerA)
+	g.SetNodeCallbacks("reverse", handlerB)
+	g.AddEdge(START, "upper")
+	g.AddEdge("upper", "reverse")
+	g.AddEdge("reverse", END)
+
+	r, err := g.Compile(context.Background(),
+		WithGraphName("callback_order"),
+		WithNodeTriggerMode(AllPredecessor),
+	)
+	if err != nil {
+		t.Fatalf("Compile failed: %v", err)
+	}
+
+	result, err := r.Invoke(context.Background(), "ab")
+	if err != nil {
+		t.Fatalf("Invoke failed: %v", err)
+	}
+	if result != "BA" {
+		t.Fatalf("expected BA, got %q", result)
+	}
+
+	if len(callOrder) != 4 {
+		t.Fatalf("expected 4 callback events, got %d: %v", len(callOrder), callOrder)
+	}
+	// Expected: A-OnStart:ab, A-OnEnd:AB, B-OnStart:AB, B-OnEnd:BA
+	if callOrder[0] != "A-OnStart:ab" {
+		t.Errorf("event 0: expected A-OnStart:ab, got %s", callOrder[0])
+	}
+	if callOrder[1] != "A-OnEnd:AB" {
+		t.Errorf("event 1: expected A-OnEnd:AB, got %s", callOrder[1])
+	}
+	if callOrder[2] != "B-OnStart:AB" {
+		t.Errorf("event 2: expected B-OnStart:AB, got %s", callOrder[2])
+	}
+	if callOrder[3] != "B-OnEnd:BA" {
+		t.Errorf("event 3: expected B-OnEnd:BA, got %s", callOrder[3])
+	}
+}
+
+func TestGraphNodeCallbackPregelMode(t *testing.T) {
+	var callOrder []string
+
+	handler := &Handler{
+		OnStart: func(ctx context.Context, info *RunInfo, input any) context.Context {
+			callOrder = append(callOrder, fmt.Sprintf("OnStart:%v", input))
+			return ctx
+		},
+		OnEnd: func(ctx context.Context, info *RunInfo, output any) context.Context {
+			callOrder = append(callOrder, fmt.Sprintf("OnEnd:%v", output))
+			return ctx
+		},
+	}
+
+	g := NewGraph[int, int]()
+	g.AddLambdaNode("inc", InvokableLambda(func(ctx context.Context, in int) (int, error) {
+		return in + 1, nil
+	}))
+	g.SetNodeCallbacks("inc", handler)
+	g.AddEdge(START, "inc")
+	g.AddEdge("inc", END)
+
+	r, err := g.Compile(context.Background(),
+		WithGraphName("callback_pregel"),
+		WithNodeTriggerMode(AnyPredecessor),
+	)
+	if err != nil {
+		t.Fatalf("Compile failed: %v", err)
+	}
+
+	result, err := r.Invoke(context.Background(), 41)
+	if err != nil {
+		t.Fatalf("Invoke failed: %v", err)
+	}
+	if result != 42 {
+		t.Fatalf("expected 42, got %d", result)
+	}
+
+	if len(callOrder) != 2 {
+		t.Fatalf("expected 2 callback events, got %d: %v", len(callOrder), callOrder)
+	}
+	if callOrder[0] != "OnStart:41" {
+		t.Errorf("expected OnStart:41, got %s", callOrder[0])
+	}
+	if callOrder[1] != "OnEnd:42" {
+		t.Errorf("expected OnEnd:42, got %s", callOrder[1])
+	}
+}
+
+func TestGraphNodeCallbackMidGraphErrorStopsDownstreamCallbacks(t *testing.T) {
+	var callOrder []string
+
+	handlerA := &Handler{
+		OnStart: func(ctx context.Context, info *RunInfo, input any) context.Context {
+			callOrder = append(callOrder, "A-OnStart")
+			return ctx
+		},
+		OnEnd: func(ctx context.Context, info *RunInfo, output any) context.Context {
+			callOrder = append(callOrder, "A-OnEnd")
+			return ctx
+		},
+	}
+	handlerB := &Handler{
+		OnStart: func(ctx context.Context, info *RunInfo, input any) context.Context {
+			callOrder = append(callOrder, "B-OnStart")
+			return ctx
+		},
+		OnEnd: func(ctx context.Context, info *RunInfo, output any) context.Context {
+			callOrder = append(callOrder, "B-OnEnd")
+			return ctx
+		},
+		OnError: func(ctx context.Context, info *RunInfo, err error) context.Context {
+			callOrder = append(callOrder, "B-OnError")
+			return ctx
+		},
+	}
+	handlerC := &Handler{
+		OnStart: func(ctx context.Context, info *RunInfo, input any) context.Context {
+			callOrder = append(callOrder, "C-OnStart")
+			return ctx
+		},
+	}
+
+	g := NewGraph[string, string]()
+	g.AddLambdaNode("first", InvokableLambda(nodeIdentity))
+	g.AddLambdaNode("second", InvokableLambda(nodeFailing))
+	g.AddLambdaNode("third", InvokableLambda(nodeReverse))
+	g.SetNodeCallbacks("first", handlerA)
+	g.SetNodeCallbacks("second", handlerB)
+	g.SetNodeCallbacks("third", handlerC)
+	g.AddEdge(START, "first")
+	g.AddEdge("first", "second")
+	g.AddEdge("second", "third")
+	g.AddEdge("third", END)
+
+	r, err := g.Compile(context.Background(),
+		WithGraphName("callback_mid_error"),
+		WithNodeTriggerMode(AllPredecessor),
+	)
+	if err != nil {
+		t.Fatalf("Compile failed: %v", err)
+	}
+
+	_, err = r.Invoke(context.Background(), "data")
+	if err == nil {
+		t.Fatal("expected error from mid-graph failure")
+	}
+
+	if len(callOrder) != 4 {
+		t.Fatalf("expected 4 callback events (A-OnStart,A-OnEnd,B-OnStart,B-OnError), got %d: %v", len(callOrder), callOrder)
+	}
+	if callOrder[0] != "A-OnStart" {
+		t.Errorf("event 0: expected A-OnStart, got %s", callOrder[0])
+	}
+	if callOrder[1] != "A-OnEnd" {
+		t.Errorf("event 1: expected A-OnEnd, got %s", callOrder[1])
+	}
+	if callOrder[2] != "B-OnStart" {
+		t.Errorf("event 2: expected B-OnStart, got %s", callOrder[2])
+	}
+	if callOrder[3] != "B-OnError" {
+		t.Errorf("event 3: expected B-OnError, got %s", callOrder[3])
+	}
+}
+
+func TestGraphNodeCallbackWithoutHandlersPreservesInvoke(t *testing.T) {
+	g := NewGraph[string, string]()
+	g.AddLambdaNode("echo", InvokableLambda(nodeIdentity))
+	g.AddEdge(START, "echo")
+	g.AddEdge("echo", END)
+
+	r, err := g.Compile(context.Background(),
+		WithGraphName("no_callbacks"),
+		WithNodeTriggerMode(AnyPredecessor),
+	)
+	if err != nil {
+		t.Fatalf("Compile failed: %v", err)
+	}
+
+	result, err := r.Invoke(context.Background(), "test")
+	if err != nil {
+		t.Fatalf("Invoke failed: %v", err)
+	}
+	if result != "test" {
+		t.Fatalf("expected test, got %q", result)
+	}
+}
+
+func TestSetNodeCallbacksUnknownNode(t *testing.T) {
+	g := NewGraph[string, string]()
+	g.AddLambdaNode("echo", InvokableLambda(nodeIdentity))
+
+	handler := &Handler{
+		OnStart: func(ctx context.Context, info *RunInfo, input any) context.Context { return ctx },
+	}
+
+	err := g.SetNodeCallbacks("ghost", handler)
+	if err == nil {
+		t.Fatal("expected error for unknown node")
+	}
+	if !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("expected ErrNodeNotFound, got %v", err)
+	}
+}
+
+func TestSetNodeCallbacksAfterCompile(t *testing.T) {
+	g := NewGraph[string, string]()
+	g.AddLambdaNode("echo", InvokableLambda(nodeIdentity))
+	g.AddEdge(START, "echo")
+	g.AddEdge("echo", END)
+
+	_, err := g.Compile(context.Background(),
+		WithGraphName("compiled"),
+		WithNodeTriggerMode(AnyPredecessor),
+	)
+	if err != nil {
+		t.Fatalf("Compile failed: %v", err)
+	}
+
+	handler := &Handler{
+		OnStart: func(ctx context.Context, info *RunInfo, input any) context.Context { return ctx },
+	}
+
+	err = g.SetNodeCallbacks("echo", handler)
+	if err == nil {
+		t.Fatal("expected ErrGraphCompiled")
+	}
+	if !errors.Is(err, ErrGraphCompiled) {
+		t.Fatalf("expected ErrGraphCompiled, got %v", err)
+	}
+}
+
+func TestGraphNodeMultipleHandlers(t *testing.T) {
+	g := NewGraph[string, string]()
+
+	var h1calls []string
+	var h2calls []string
+
+	h1 := &Handler{
+		OnStart: func(ctx context.Context, info *RunInfo, input any) context.Context {
+			h1calls = append(h1calls, "h1-start")
+			return ctx
+		},
+		OnEnd: func(ctx context.Context, info *RunInfo, output any) context.Context {
+			h1calls = append(h1calls, "h1-end")
+			return ctx
+		},
+	}
+	h2 := &Handler{
+		OnStart: func(ctx context.Context, info *RunInfo, input any) context.Context {
+			h2calls = append(h2calls, "h2-start")
+			return ctx
+		},
+		OnEnd: func(ctx context.Context, info *RunInfo, output any) context.Context {
+			h2calls = append(h2calls, "h2-end")
+			return ctx
+		},
+	}
+
+	g.AddLambdaNode("echo", InvokableLambda(nodeIdentity))
+	g.SetNodeCallbacks("echo", h1, h2)
+	g.AddEdge(START, "echo")
+	g.AddEdge("echo", END)
+
+	r, err := g.Compile(context.Background(),
+		WithGraphName("multi_handlers"),
+		WithNodeTriggerMode(AnyPredecessor),
+	)
+	if err != nil {
+		t.Fatalf("Compile failed: %v", err)
+	}
+
+	result, err := r.Invoke(context.Background(), "x")
+	if err != nil {
+		t.Fatalf("Invoke failed: %v", err)
+	}
+	if result != "x" {
+		t.Fatalf("expected x, got %q", result)
+	}
+
+	if len(h1calls) != 2 || h1calls[0] != "h1-start" || h1calls[1] != "h1-end" {
+		t.Errorf("handler 1: expected [h1-start h1-end], got %v", h1calls)
+	}
+	if len(h2calls) != 2 || h2calls[0] != "h2-start" || h2calls[1] != "h2-end" {
+		t.Errorf("handler 2: expected [h2-start h2-end], got %v", h2calls)
+	}
+}
+
+func TestRunnableStreamPriorityRegisteredOverFallback(t *testing.T) {
+	cr := &composableRunnable{
+		i: func(ctx context.Context, input any) (any, error) {
+			return "fallback", nil
+		},
+		s: func(ctx context.Context, input any) (any, error) {
+			return "registered", nil
+		},
+	}
+	out, err := cr.stream(context.Background(), "input")
+	if err != nil {
+		t.Fatalf("stream failed: %v", err)
+	}
+	if out != "registered" {
+		t.Fatalf("expected registered (s takes priority over i for stream), got %v", out)
+	}
+}
+
+func TestRunnableInvokeUnchangedByStreamRegistration(t *testing.T) {
+	cr := &composableRunnable{
+		i: func(ctx context.Context, input any) (any, error) {
+			return "invoke_only", nil
+		},
+		s: func(ctx context.Context, input any) (any, error) {
+			return "stream_only", nil
+		},
+	}
+	out, err := cr.invoke(context.Background(), "input")
+	if err != nil {
+		t.Fatalf("invoke failed: %v", err)
+	}
+	if out != "invoke_only" {
+		t.Fatalf("expected invoke_only (invoke always uses i), got %v", out)
 	}
 }
