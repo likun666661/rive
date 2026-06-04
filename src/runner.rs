@@ -838,12 +838,6 @@ impl<'a> SchedulerService<'a> {
         if input.timeout_seconds == 0 {
             return Err(anyhow!("runner timeout must be greater than zero"));
         }
-        if let Some(existing) = self
-            .event_store
-            .get_scheduler_run_by_command_id(&input.command_id)?
-        {
-            return self.scheduler_run_response(existing, false, "replayed");
-        }
         let inferred_scheduler_run_id =
             if input.scheduler_run_id.is_none() && input.root_work_node_id.is_none() {
                 input.work_node_id.as_ref().and_then(|work_node_id| {
@@ -889,12 +883,6 @@ impl<'a> SchedulerService<'a> {
             backend_from_env().ensure_available(self.workspace)?;
         }
         let workers = self.resolve_workers(&input.workers)?;
-        let stale_nodes = self.supersede_retryable_attempts(
-            &root_work_node_id,
-            source_run.as_ref(),
-            input.work_node_id.as_deref(),
-            input.failed,
-        )?;
         let worker_ids = workers
             .iter()
             .map(|worker| worker.agent_id.clone())
@@ -930,6 +918,12 @@ impl<'a> SchedulerService<'a> {
         };
         let mut child_executed = false;
         if should_execute {
+            let stale_nodes = self.supersede_retryable_attempts(
+                &root_work_node_id,
+                source_run.as_ref(),
+                input.work_node_id.as_deref(),
+                input.failed,
+            )?;
             match self.execute_scheduler_with_initial_nodes(
                 &scheduler_run,
                 &workers,

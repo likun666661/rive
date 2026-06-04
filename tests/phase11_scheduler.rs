@@ -1532,6 +1532,60 @@ fn work_retry_reruns_failed_node_without_manual_ledger_edits() {
         )
         .unwrap();
     assert_eq!(reported, 1);
+    let scheduler_runs_before_conflict: i64 = conn
+        .query_row("select count(*) from scheduler_runs", [], |row| row.get(0))
+        .unwrap();
+    let node_runs_before_conflict: i64 = conn
+        .query_row("select count(*) from scheduler_node_runs", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let dispatches_before_conflict: i64 = conn
+        .query_row("select count(*) from dispatches", [], |row| row.get(0))
+        .unwrap();
+    drop(conn);
+
+    let conflict = run_json_expect_error(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("work")
+            .arg("retry")
+            .arg(&a)
+            .arg("--worker")
+            .arg("worker-a")
+            .arg("--worker")
+            .arg("worker-b")
+            .arg("--command-id")
+            .arg("phase16-work-retry-command")
+            .arg("--max-parallel")
+            .arg("1")
+            .arg("--acceptance-mode")
+            .arg("manual")
+            .arg("--opencode-bin")
+            .arg(&worker)
+            .arg("--timeout-seconds")
+            .arg("10"),
+    );
+    assert_eq!(conflict["protocol"]["code"], "idempotency_conflict");
+
+    let conn = Connection::open(temp.path().join(".rive/rive.db")).unwrap();
+    let scheduler_runs_after_conflict: i64 = conn
+        .query_row("select count(*) from scheduler_runs", [], |row| row.get(0))
+        .unwrap();
+    let node_runs_after_conflict: i64 = conn
+        .query_row("select count(*) from scheduler_node_runs", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let dispatches_after_conflict: i64 = conn
+        .query_row("select count(*) from dispatches", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        scheduler_runs_after_conflict,
+        scheduler_runs_before_conflict
+    );
+    assert_eq!(node_runs_after_conflict, node_runs_before_conflict);
+    assert_eq!(dispatches_after_conflict, dispatches_before_conflict);
 }
 
 #[test]
