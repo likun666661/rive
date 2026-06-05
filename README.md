@@ -35,6 +35,16 @@ Rive 是本地优先 agent team runtime 的体系文档。
 
 - [Rive agent skill](./skills/rive/SKILL.md) — 给 Codex / OpenCode 等外部 agent 读取的 Rive 操作手册，用来把用户目标组织成 Work DAG、调度 worker、集成 worktree ref，并按 ledger/projection 回报结果。
 
+## Runner Environment
+
+Rive 启动 OpenCode / Codex worker 时不会假设自己来自交互式 shell，因此不要依赖 `~/.zshrc` 一定会被加载。外部 provider key、证书路径等运行时变量可以放在：
+
+- `~/.config/rive/runner.env`
+- `<workspace>/.rive/runner.env`
+- `RIVE_RUNNER_ENV_FILE=/path/to/env` 指定的文件
+
+文件格式是简单的 `KEY=value` 或 `export KEY=value`。Rive 会在启动 runner child 前加载这些变量，然后再写入自己的 `RIVE_*` 协议变量和 PATH，避免 env 文件覆盖调度协议。
+
 ## Examples
 
 - [Eino technical manual dogfood](./examples/eino-technical-manual/) — 用 Rive Work DAG + OpenCode workers 阅读 CloudWeGo Eino 代码并产出技术手册的真实 dogfood 示例。

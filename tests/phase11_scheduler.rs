@@ -506,6 +506,31 @@ printf '{{"type":"step_finish","tokens":{{"input":7,"output":3,"reasoning":1,"ca
     );
 }
 
+fn write_env_required_scheduler_worker(path: &Path) {
+    let rive_bin = env!("CARGO_BIN_EXE_rive");
+    let team_bin = env!("CARGO_BIN_EXE_team");
+    write_executable(
+        path,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+if [ "${{DEEPSEEK_API_KEY:-}}" != "runner-secret" ]; then
+  echo "missing runner env file key" >&2
+  exit 12
+fi
+COUNT_FILE="$RIVE_WORKSPACE/phase11-env-invocations.txt"
+printf '1\n' >> "$COUNT_FILE"
+PROMPT_FILE="$RIVE_WORKSPACE/.rive/debug/runs/$RIVE_RUN_ID/prompt.txt"
+WORK_ID=$(sed -n 's/^- id: \(work_[a-z0-9]*\)$/\1/p' "$PROMPT_FILE" | head -n 1)
+RESULT="phase11-env-$WORK_ID.txt"
+printf 'RIVE_PHASE11_ENV_OK\n' > "$RIVE_WORKSPACE/$RESULT"
+SNAPSHOT_ID=$("{rive_bin}" snapshot capture --path "$RIVE_WORKSPACE/$RESULT" --label phase11-env-worker --agent "$RIVE_AGENT_ID" --dispatch "$RIVE_DISPATCH_ID" | sed -n 's/.*"snapshot_id": "\([^"]*\)".*/\1/p' | head -n 1)
+printf 'scheduler env worker done\n' | "{team_bin}" report --dispatch "$RIVE_DISPATCH_ID" --status done --snapshot "$SNAPSHOT_ID" --artifact-ref "file:$RESULT" --command-id "phase11-env-report-$RIVE_RUN_ID" --stdin >/dev/null
+"#
+        ),
+    );
+}
+
 fn write_no_report_worker(path: &Path) {
     write_executable(
         path,
@@ -670,6 +695,32 @@ fn scheduler_auto_reported_runs_ready_nodes_and_accepts_root() {
         )
         .unwrap();
     assert_eq!(accepted_events, 4);
+}
+
+#[test]
+fn scheduler_loads_runner_env_file_for_opencode_children() {
+    let temp = init_workspace();
+    add_worker(&temp, "worker-a");
+    add_worker(&temp, "worker-b");
+    let (root, _, _, _) = setup_graph(&temp);
+    let fake = temp.path().join("fake-opencode-env-required");
+    write_env_required_scheduler_worker(&fake);
+    let env_file = temp.path().join("runner.env");
+    fs::write(&env_file, "DEEPSEEK_API_KEY=runner-secret\n").unwrap();
+
+    let mut command = scheduler_command(&temp, &fake, &root, "phase11-sched-env-file");
+    command.env("RIVE_RUNNER_ENV_FILE", &env_file);
+    let response = run_json(&mut command);
+
+    assert_eq!(response["protocol"]["scheduler"]["state"], "completed");
+    assert_eq!(response["protocol"]["root_work"]["state"], "done");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("phase11-env-invocations.txt"))
+            .unwrap()
+            .lines()
+            .count(),
+        3
+    );
 }
 
 #[test]

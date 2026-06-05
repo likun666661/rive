@@ -542,6 +542,7 @@ impl<'a> OrchestratorRunner<'a> {
                 .arg("json")
                 .arg("--dangerously-skip-permissions")
                 .arg(&prompt);
+            apply_runner_env_sources(&mut command, &self.workspace.root)?;
             apply_orchestrator_env(
                 &mut command,
                 OrchestratorEnvInput {
@@ -3098,6 +3099,7 @@ impl RunnerAdapter for OpenCodeAdapter {
             .arg("json")
             .arg("--dangerously-skip-permissions")
             .arg(input.prompt);
+        apply_runner_env_sources(&mut command, &input.workspace.root)?;
         apply_common_env(&mut command, &input);
         Ok(command)
     }
@@ -3158,6 +3160,7 @@ impl RunnerAdapter for CodexAdapter {
         }
         command.arg(input.prompt);
         command.env("CODEX_HOME", prepare_isolated_codex_home(input.run_dir)?);
+        apply_runner_env_sources(&mut command, &input.workspace.root)?;
         apply_common_env(&mut command, &input);
         Ok(command)
     }
@@ -3487,6 +3490,83 @@ fn work_ref_binding_key(binding: &WorkRefBindingRecord) -> String {
         binding.workspace_ref.as_deref().unwrap_or(""),
         binding.diff_ref.as_deref().unwrap_or("")
     )
+}
+
+fn apply_runner_env_sources(command: &mut Command, workspace_root: &Path) -> Result<()> {
+    let mut paths = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let global = PathBuf::from(home).join(".config/rive/runner.env");
+        if global.exists() {
+            paths.push(global);
+        }
+    }
+    let workspace_env = workspace_root.join(".rive/runner.env");
+    if workspace_env.exists() {
+        paths.push(workspace_env);
+    }
+    if let Some(value) = std::env::var_os("RIVE_RUNNER_ENV_FILE") {
+        for path in std::env::split_paths(&value) {
+            if !path.exists() {
+                return Err(anyhow!("runner env file not found: {}", path.display()));
+            }
+            paths.push(path);
+        }
+    }
+    for path in paths {
+        apply_runner_env_file(command, &path)?;
+    }
+    Ok(())
+}
+
+fn apply_runner_env_file(command: &mut Command, path: &Path) -> Result<()> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read runner env file: {}", path.display()))?;
+    for (index, raw_line) in content.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim();
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            anyhow!(
+                "invalid runner env file line {} in {}",
+                index + 1,
+                path.display()
+            )
+        })?;
+        let key = key.trim();
+        if !is_valid_env_key(key) {
+            return Err(anyhow!(
+                "invalid runner env key on line {} in {}",
+                index + 1,
+                path.display()
+            ));
+        }
+        let value = parse_env_value(value.trim());
+        command.env(key, value);
+    }
+    Ok(())
+}
+
+fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn parse_env_value(value: &str) -> String {
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+    value.to_string()
 }
 
 fn apply_common_env(command: &mut Command, input: &RunnerProcessInput<'_>) {
