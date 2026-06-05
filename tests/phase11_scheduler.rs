@@ -530,6 +530,25 @@ printf '{"type":"error","message":"unknown certificate verification error"}\n'
     );
 }
 
+fn write_trace_sampler_worker(path: &Path) {
+    let rive_bin = env!("CARGO_BIN_EXE_rive");
+    let team_bin = env!("CARGO_BIN_EXE_team");
+    write_executable(
+        path,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+printf '{{"type":"session.status","sessionID":"sampler-session","status":{{"type":"thinking"}}}}\n' | "{rive_bin}" debug trace ingest --adapter opencode-plugin --agent "$RIVE_AGENT_ID" --run "$RIVE_RUN_ID" --dispatch "$RIVE_DISPATCH_ID" --stdin >/dev/null
+printf '{{"type":"message.part.updated","sessionID":"sampler-session","messageID":"msg_1","part":{{"type":"tool","tool":"read","callID":"call_read","state":{{"status":"completed","input":{{"filePath":"examples/eino-compose-runtime-replica-go/compose/graph.go"}},"output":"read graph.go ok"}}}}}}\n' | "{rive_bin}" debug trace ingest --adapter opencode-plugin --agent "$RIVE_AGENT_ID" --run "$RIVE_RUN_ID" --dispatch "$RIVE_DISPATCH_ID" --stdin >/dev/null
+printf '{{"type":"session.diff","sessionID":"sampler-session","changes":["compose/checkpoint.go"]}}\n' | "{rive_bin}" debug trace ingest --adapter opencode-plugin --agent "$RIVE_AGENT_ID" --run "$RIVE_RUN_ID" --dispatch "$RIVE_DISPATCH_ID" --stdin >/dev/null
+printf 'sampler artifact\n' > "$RIVE_WORKSPACE/trace-sampler-result.txt"
+SNAPSHOT_ID=$("{rive_bin}" snapshot capture --path "$RIVE_WORKSPACE/trace-sampler-result.txt" --label trace-sampler --agent "$RIVE_AGENT_ID" --dispatch "$RIVE_DISPATCH_ID" | sed -n 's/.*"snapshot_id": "\([^"]*\)".*/\1/p' | head -n 1)
+printf 'trace sampler done\n' | "{team_bin}" report --dispatch "$RIVE_DISPATCH_ID" --status done --snapshot "$SNAPSHOT_ID" --artifact-ref "file:trace-sampler-result.txt" --command-id "trace-sampler-report-$RIVE_RUN_ID" --stdin >/dev/null
+"#
+        ),
+    );
+}
+
 fn write_branch_worker(path: &Path) {
     let rive_bin = env!("CARGO_BIN_EXE_rive");
     let team_bin = env!("CARGO_BIN_EXE_team");
@@ -855,6 +874,68 @@ fn scheduler_classifies_no_report_runner_stdout_errors() {
         .as_str()
         .unwrap()
         .contains(".rive/debug/runs/"));
+}
+
+#[test]
+fn scheduler_status_exposes_neutral_structured_trace_samples() {
+    let temp = init_workspace();
+    add_worker(&temp, "worker-a");
+    add_worker(&temp, "worker-b");
+    let root = create_work(&temp, "phase18-trace-root", "root");
+    let a = create_work(&temp, "phase18-trace-node", "trace sampler node");
+    add_edge(
+        &temp,
+        "decomposes-to",
+        &root,
+        &a,
+        "edge-phase18-trace-root-a",
+    );
+
+    let fake = temp.path().join("fake-opencode-trace-sampler");
+    write_trace_sampler_worker(&fake);
+    let response = run_json(&mut scheduler_command(
+        &temp,
+        &fake,
+        &root,
+        "phase18-trace-sampler",
+    ));
+    assert_eq!(response["protocol"]["scheduler"]["state"], "completed");
+
+    let status = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("scheduler")
+            .arg("status")
+            .arg("--root")
+            .arg(&root),
+    );
+    let activity = &status["protocol"]["node_runs"][0]["activity"];
+    let trace = &activity["trace"];
+    assert!(trace["sample_count"].as_u64().unwrap() >= 3);
+    assert!(trace["latest_sequence"].as_i64().unwrap() >= 3);
+    assert!(trace["latest_event_kind"].as_str().is_some());
+
+    let samples = trace["samples"].as_array().unwrap();
+    let tool_sample = samples
+        .iter()
+        .find(|sample| sample["event_kind"] == "tool_call_completed")
+        .expect("tool sample should be present");
+    assert_eq!(tool_sample["tool_name"], "read");
+    assert_eq!(tool_sample["tool_status"], "completed");
+    assert!(tool_sample["tool_input_preview"]
+        .as_str()
+        .unwrap()
+        .contains("examples/eino-compose-runtime-replica-go/compose/graph.go"));
+    assert!(tool_sample["tool_output_preview"]
+        .as_str()
+        .unwrap()
+        .contains("read graph.go ok"));
+
+    let status_json = serde_json::to_string(&status).unwrap();
+    assert!(!status_json.contains("path_hit_ratio"));
+    assert!(!status_json.contains("off_track"));
+    assert!(!status_json.contains("runaway"));
+    assert!(activity["recent_trace_events"].as_array().unwrap().len() >= 3);
 }
 
 #[test]

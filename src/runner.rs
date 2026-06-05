@@ -306,10 +306,41 @@ pub struct SchedulerNodeActivityProtocol {
     pub stderr_ref: Option<String>,
     pub stdout_tail: Option<String>,
     pub stderr_tail: Option<String>,
+    pub trace: SchedulerTraceActivityProtocol,
     pub recent_trace_events: Vec<String>,
     pub branch_path: Option<String>,
     pub branch_ref: Option<String>,
     pub changed_files: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SchedulerTraceActivityProtocol {
+    pub sample_count: usize,
+    pub latest_sequence: Option<i64>,
+    pub latest_event_kind: Option<String>,
+    pub latest_occurred_at: Option<DateTime<Utc>>,
+    pub samples: Vec<SchedulerTraceSampleProtocol>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SchedulerTraceSampleProtocol {
+    pub trace_event_id: String,
+    pub sequence: i64,
+    pub adapter: String,
+    pub event_kind: String,
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub external_session_id: Option<String>,
+    pub external_turn_id: Option<String>,
+    pub external_tool_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_status: Option<String>,
+    pub tool_input_preview: Option<String>,
+    pub tool_output_preview: Option<String>,
+    pub text_preview: Option<String>,
+    pub session_status: Option<String>,
+    pub message_role: Option<String>,
+    pub part_type: Option<String>,
+    pub summary: serde_json::Value,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1804,8 +1835,12 @@ impl<'a> SchedulerService<'a> {
             .then(|| format!("{run_ref}/prompt.txt"));
         let stdout_tail = read_tail_if_exists(&stdout_path, 12);
         let stderr_tail = read_tail_if_exists(&stderr_path, 12);
-        let recent_trace_events =
-            self.recent_trace_summaries(worker_run_id, run.dispatch_id.as_deref());
+        let trace = self.recent_trace_activity(worker_run_id, run.dispatch_id.as_deref());
+        let recent_trace_events = trace
+            .samples
+            .iter()
+            .map(trace_sample_compat_summary)
+            .collect();
         let (branch_path, branch_ref, changed_files) =
             self.branch_activity_for_dispatch(run.dispatch_id.as_deref());
         Ok(SchedulerNodeActivityProtocol {
@@ -1814,6 +1849,7 @@ impl<'a> SchedulerService<'a> {
             stderr_ref,
             stdout_tail,
             stderr_tail,
+            trace,
             recent_trace_events,
             branch_path,
             branch_ref,
@@ -1821,8 +1857,13 @@ impl<'a> SchedulerService<'a> {
         })
     }
 
-    fn recent_trace_summaries(&self, run_id: &str, dispatch_id: Option<&str>) -> Vec<String> {
-        self.trace_store
+    fn recent_trace_activity(
+        &self,
+        run_id: &str,
+        dispatch_id: Option<&str>,
+    ) -> SchedulerTraceActivityProtocol {
+        let samples = self
+            .trace_store
             .list_events(TraceListFilter {
                 dispatch_id: dispatch_id.map(ToOwned::to_owned),
                 ..TraceListFilter::default()
@@ -1833,12 +1874,17 @@ impl<'a> SchedulerService<'a> {
                 event.run_id.as_deref() == Some(run_id)
                     || dispatch_id.is_some_and(|id| event.dispatch_id.as_deref() == Some(id))
             })
-            .take(5)
-            .map(|event| {
-                let summary = serde_json::to_string(&event.summary).unwrap_or_default();
-                truncate_chars(&format!("{}: {summary}", event.event_kind), 300)
-            })
-            .collect()
+            .take(10)
+            .map(trace_sample_protocol)
+            .collect::<Vec<_>>();
+        let latest = samples.first();
+        SchedulerTraceActivityProtocol {
+            sample_count: samples.len(),
+            latest_sequence: latest.map(|sample| sample.sequence),
+            latest_event_kind: latest.map(|sample| sample.event_kind.clone()),
+            latest_occurred_at: latest.and_then(|sample| sample.occurred_at),
+            samples,
+        }
     }
 
     fn branch_activity_for_dispatch(
@@ -2038,10 +2084,59 @@ fn empty_scheduler_node_activity() -> SchedulerNodeActivityProtocol {
         stderr_ref: None,
         stdout_tail: None,
         stderr_tail: None,
+        trace: empty_scheduler_trace_activity(),
         recent_trace_events: Vec::new(),
         branch_path: None,
         branch_ref: None,
         changed_files: Vec::new(),
+    }
+}
+
+fn empty_scheduler_trace_activity() -> SchedulerTraceActivityProtocol {
+    SchedulerTraceActivityProtocol {
+        sample_count: 0,
+        latest_sequence: None,
+        latest_event_kind: None,
+        latest_occurred_at: None,
+        samples: Vec::new(),
+    }
+}
+
+fn trace_sample_protocol(
+    event: crate::debug_trace::DebugTraceEventRecord,
+) -> SchedulerTraceSampleProtocol {
+    SchedulerTraceSampleProtocol {
+        trace_event_id: event.trace_event_id,
+        sequence: event.sequence,
+        adapter: event.adapter,
+        event_kind: event.event_kind,
+        occurred_at: event.occurred_at,
+        external_session_id: event.external_session_id,
+        external_turn_id: event.external_turn_id,
+        external_tool_id: event.external_tool_id,
+        tool_name: summary_string(&event.summary, "tool_name"),
+        tool_status: summary_string(&event.summary, "tool_status"),
+        tool_input_preview: summary_string(&event.summary, "tool_input_preview"),
+        tool_output_preview: summary_string(&event.summary, "tool_output_preview"),
+        text_preview: summary_string(&event.summary, "text_preview"),
+        session_status: summary_string(&event.summary, "session_status"),
+        message_role: summary_string(&event.summary, "message_role"),
+        part_type: summary_string(&event.summary, "part_type"),
+        summary: event.summary,
+    }
+}
+
+fn trace_sample_compat_summary(sample: &SchedulerTraceSampleProtocol) -> String {
+    let summary = serde_json::to_string(&sample.summary).unwrap_or_default();
+    truncate_chars(&format!("{}: {summary}", sample.event_kind), 300)
+}
+
+fn summary_string(summary: &serde_json::Value, key: &str) -> Option<String> {
+    match summary.get(key) {
+        Some(serde_json::Value::String(value)) => Some(value.clone()),
+        Some(serde_json::Value::Number(value)) => Some(value.to_string()),
+        Some(serde_json::Value::Bool(value)) => Some(value.to_string()),
+        _ => None,
     }
 }
 
