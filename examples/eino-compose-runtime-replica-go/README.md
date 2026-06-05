@@ -1,6 +1,6 @@
 # Eino Compose Runtime Replica (Go MVP)
 
-受 Eino (CloudWeGo) 启发的第二/三/四章骨架示例与验证项目,覆盖核心编译边界与 DAG/Pregel 执行引擎,并实现三层编排抽象 (FieldMapping / Workflow / Chain / Parallel / Branch) + Runnable Stream/Callback 教学示例 + ChatModel/Retriever 组件接口与 Bridge Adapter 模式 + Checkpoint/Interrupt/Resume 教学子集。本项目为学习与研究用途的章节级骨架,非 Eino 的完整产品复刻。
+受 Eino (CloudWeGo) 启发的第二/三/四/五章骨架示例与验证项目,覆盖核心编译边界与 DAG/Pregel 执行引擎,并实现三层编排抽象 (FieldMapping / Workflow / Chain / Parallel / Branch) + Runnable Stream/Callback 教学示例 + ChatModel/Retriever 组件接口与 Bridge Adapter 模式 + Checkpoint/Interrupt/Resume 教学子集 + PromptTemplate/Tool/ToolsNode 桥接。本项目为学习与研究用途的章节级骨架,非 Eino 的完整产品复刻。
 
 ## 架构总览
 
@@ -35,6 +35,13 @@ Graph Builder  ──>  Compile  ──>  Runnable[I, O]
   ├── context 型 CheckPointStore / CheckPointID 恢复入口
   ├── GetInterruptState / GetResumeContext 定向恢复
   └── PipeStreamReader 物化与恢复示例
+
+第五章: PromptTemplate / Tool / ToolsNode 组件桥接
+  ├── MessageTemplate (ChatTemplate 接口 + {{variable}} 替换)
+  ├── BridgeTool 领域接口 (Name + Execute)
+  ├── ToolsNode (ToolCall 解析 → 工具分发 → 结果组装)
+  ├── Workflow.AsPromptTemplateNode / AsToolsNode 便捷方法
+  └── Graph/Workflow/Chain 三种编排演示
 ```
 
 ### 三层抽象对比
@@ -300,17 +307,176 @@ result, _ := r.Invoke(ctx, &RAGInput{Query: "What is Rive?"})
 ### 便捷方法对照
 
 | Bridge 方法 | 等效 Graph 调用 | 说明 |
-|---|---|---|
+|---|---|---|---|
 | `wf.AsRetrieverNode(key, retriever)` | `wf.AddLambdaNode(key, bridge.toLambda())` | 将 Retriever 桥接为 Lambda 节点 |
 | `wf.AsChatModelNode(key, model)` | `wf.AddLambdaNode(key, bridge.toLambda())` | 将 ChatModel 桥接为 Lambda 节点 |
 | `wf.AsPromptAssemblerNode(key, prompt)` | `wf.AddLambdaNode(key, bridge.toLambda())` | 创建提示词组装 Lambda 节点 |
+| `wf.AsPromptTemplateNode(key, tmpl)` | `wf.AddLambdaNode(key, NewPromptTemplateLambda(tmpl))` | 将 MessageTemplate 桥接为 Lambda 节点 (输出 []*Message) |
+| `wf.AsToolsNode(key, tools...)` | `wf.AddLambdaNode(key, NewToolsNodeLambda(tools...))` | 将 BridgeTool 集合桥接为 ToolsNode Lambda |
 
 ### 扩展清单 (本教育子集未实现)
 
-- **Tool bridge**: `Tool.Execute()` → Lambda
 - **StreamChatModel bridge**: `GenerateStream()` → `StreamableLambda`
 - **Embedding bridge**: `Embedder.Embed()` → Lambda
 - **完整的错误传递与重试语义** (callback + state 集成)
+
+> **Tool bridge 已实现**: `compose/prompt_tool_bridge.go` 提供 `NewToolsNodeLambda` / `Workflow.AsToolsNode` 等方法,支持将 `BridgeTool` 包装为 Lambda,解析 `ToolCall` 并分发执行。详见下方"第五章: PromptTemplate / Tool / ToolsNode"章节。
+
+---
+
+## 第五章功能 (PromptTemplate / Tool / ToolsNode 组件桥接)
+
+> **本章扩展 I3 Bridge Adapter 模式,增加 PromptTemplate 渲染、Tool 接口与 ToolsNode 工具执行节点,实现完整的 Tool Calling Pipeline。所有示例均确定性 (无外部模型调用),适合教学演示。**
+
+### 核心概念
+
+```
+PromptTemplate → ChatModel (返回 ToolCall) → ToolsNode → ChatModel (生成回答)
+```
+
+**Tool Calling Pipeline** 是 LLM 应用的标准模式:
+1. **PromptTemplate**: 将用户输入与系统提示词组装为 `[]*Message`
+2. **ChatModel**: 根据提示词决定调用哪个工具,返回带 `ToolCalls` 的 `Message`
+3. **ToolsNode**: 解析 `ToolCalls`,匹配已注册的 `BridgeTool`,执行工具并返回结果
+4. **ChatModel**: 基于工具结果生成最终回答
+
+### 数据模型 (schema.go)
+
+```go
+type ToolCall struct {
+    ID       string
+    Type     string
+    Function ToolCallFunction    // {Name, Arguments}
+}
+
+type ToolInfo struct {
+    Name, Desc string
+    ParamsOneOf *ParamsOneOf     // 参数 Schema
+}
+
+type ToolResult struct {
+    Text string
+}
+```
+
+`Message` 结构体 (`chatmodel.go`) 扩展了 `ToolCalls []ToolCall` 字段,用于在模型节点与工具节点之间传递工具调用意图。
+
+### PromptTemplate — ChatTemplate 接口与 MessageTemplate
+
+**解决的问题**:
+ChatModel 的输入是 `[]*Message`,但用户输入通常是原始文本或结构体。每次手动构造 `Message` 对象繁琐且容易出错。
+
+**设计方案**:
+- `ChatTemplate` 接口: `Format(ctx, vs map[string]any) ([]*Message, error)`
+- `MessageTemplate`: 支持 `{{variable}}` 占位符替换,可选的系统提示词模板
+- `ChatTemplateComponent`: 将 ChatTemplate 包装为 `composableRunnable`,用于图运行时
+
+```go
+tmpl := compose.NewMessageTemplate("{{query}}").
+    WithSystemTemplate("You are a helpful assistant.")
+
+msgs, _ := tmpl.Format(ctx, map[string]any{"query": "What is the weather?"})
+// 输出: [System("You are a helpful assistant."), Human("What is the weather?")]
+```
+
+### Tool — BridgeTool 领域接口
+
+**解决的问题**:
+工具 (如天气查询、计算器) 有自己的领域逻辑和接口,不能直接作为图运行时节点。
+
+**设计方案**:
+- `BridgeTool` 接口: `Name() string` + `Execute(ctx, args map[string]any) (string, error)`
+- `BridgeToolFunc` / `NewBridgeTool`: 将普通函数包装为 `BridgeTool`
+- 工具注册后由 `toolsNodeBridge` 按名称分发调用
+
+```go
+getWeather := compose.NewBridgeTool("get_weather",
+    func(ctx context.Context, args map[string]any) (string, error) {
+        loc, _ := args["location"].(string)
+        return fmt.Sprintf("Sunny, 22°C in %s", loc), nil
+    },
+)
+```
+
+### ToolsNode — 工具执行节点
+
+**解决的问题**:
+ChatModel 返回的 `ToolCalls` 需要被解析、分配到正确的工具、收集结果,并返回给模型。这个过程需要与图运行时集成。
+
+**设计方案**:
+- `toolsNodeBridge`: 内部维护 `tools map[string]BridgeTool`
+- 输入 `*Message` → 解析 `ToolCalls` → 匹配工具 → 执行 → 组装结果 `*Message`
+- `NewToolsNodeLambda(tools...)`: 导出构造函数,将工具集包装为 Lambda
+- `Workflow.AsToolsNode(key, tools...)`: Workflow 便捷方法
+
+```go
+tools := compose.NewToolsNodeLambda(getWeather, calcTool)
+// 输入: *Message{ToolCalls: [{Function: {Name: "get_weather", Arguments: '{"location":"Paris"}'}}]}
+// 输出: *Message{Content: "Tool results:\n- get_weather({location:Paris}): Sunny, 22°C in Paris\n"}
+```
+
+### 三种编排演示
+
+以下是用 Workflow、Chain、Graph 三种抽象编排 Tool Calling Pipeline 的示例:
+
+#### Workflow 版本 (声明式,最简洁)
+
+```go
+wf := compose.NewWorkflow[map[string]any, *compose.Message]()
+wf.AsPromptTemplateNode("prompt", tmpl).AddInput(compose.START)
+wf.AddLambdaNode("model1", model1Fn).AddInput("prompt")
+wf.AsToolsNode("tools", getWeather).AddInput("model1")
+wf.AddLambdaNode("model2", model2Fn).AddInput("tools")
+wf.End().AddInput("model2")
+r, _ := wf.Compile(ctx)
+result, _ := r.Invoke(ctx, map[string]any{"query": "What is the weather in Paris?"})
+// result.Content: "Final answer based on tool results:\nTool results:\n- get_weather(...): Sunny, 22°C in Paris\n"
+```
+
+#### Chain 版本 (Builder 风格,自动连接)
+
+```go
+chain := compose.NewChain[[]*compose.Message, *compose.Message]()
+chain.
+    AppendLambda(model1Fn).
+    AppendLambda(compose.NewToolsNodeLambda(calcTool)).
+    AppendLambda(model2Fn)
+r, _ := chain.Compile(ctx)
+result, _ := r.Invoke(ctx, []*compose.Message{compose.HumanMessage("What is 2+2?")})
+// result.Content: "Answer: The tool computed → Computed result for '2+2' = 42"
+```
+
+#### Graph 版本 (最大灵活性,手动拓扑)
+
+```go
+g := compose.NewGraph[[]*compose.Message, *compose.Message]()
+g.AddLambdaNode("model1", model1Fn)
+g.AddLambdaNode("tools", compose.NewToolsNodeLambda(weatherTool))
+g.AddLambdaNode("model2", model2Fn)
+g.AddEdge(compose.START, "model1")
+g.AddEdge("model1", "tools")
+g.AddEdge("tools", "model2")
+g.AddEdge("model2", compose.END)
+r, _ := g.Compile(ctx, compose.WithNodeTriggerMode(compose.AllPredecessor))
+result, _ := r.Invoke(ctx, []*compose.Message{compose.HumanMessage("Weather in Tokyo?")})
+// result.Content: "Summary: Tool results:\n- get_weather(...): Cloudy, 18°C in Tokyo\n"
+```
+
+### 便捷方法对照
+
+| Bridge 方法 | 等效 Graph 调用 | 说明 |
+|---|---|---|
+| `wf.AsPromptTemplateNode(key, tmpl)` | `wf.AddLambdaNode(key, NewPromptTemplateLambda(tmpl))` | 将 MessageTemplate 桥接为 Lambda (map → []*Message) |
+| `wf.AsToolsNode(key, tools...)` | `wf.AddLambdaNode(key, NewToolsNodeLambda(tools...))` | 将 BridgeTool 集合桥接为 ToolsNode Lambda |
+
+### 边界
+
+本教育子集实现的 Tool Calling Pipeline 不包含:
+- Eino 完整 `InvokableTool` / `ToolCallingChatModel` 分层接口
+- Streaming tool call (模型边生成边返回 ToolCall)
+- Tool rerun skip handler (中断恢复后跳过已执行工具)
+- 工具级 Callback 集成
+- Provider 特定的工具绑定选项
 
 ---
 
@@ -444,21 +610,29 @@ go run ./cmd/example/
 
 ```bash
 cd examples/eino-compose-runtime-replica-go
-go test ./...
+go test ./... -count=1
 ```
 
-## 格式化
+## 格式化 + 静态分析
 
 ```bash
 cd examples/eino-compose-runtime-replica-go
 gofmt -w .
+go vet ./...
+```
+
+## 空白字符检查
+
+```bash
+# 在仓库根目录执行
+git diff --check
 ```
 
 ## 包结构
 
 ```
 examples/eino-compose-runtime-replica-go/
-├── cmd/example/main.go          # 综合示例 (17 个场景,覆盖 Chapter 1/2/3/4)
+├── cmd/example/main.go          # 综合示例 (20 个场景,覆盖 Chapter 1/2/3/4/5)
 ├── compose/
 │   ├── types.go                 # NodeTriggerMode, ComponentType, 哨兵错误, START/END
 │   ├── runnable.go              # Runnable[I,O], Lambda, composableRunnable
@@ -480,6 +654,9 @@ examples/eino-compose-runtime-replica-go/
 │   ├── event_log.go             # EventLog: 10 种事件类型, 线程安全
 │   ├── stream.go                # PipeStreamReader/PipeStreamWriter, Copy, Merge, Concat
 │   ├── callbacks.go             # RunInfo, Handler, CallbackWrapper, stream callback copies
+│   ├── schema.go                # ToolCall / ToolCallFunction / ToolInfo / ToolResult 数据模型
+│   ├── prompt.go                # ChatTemplate 接口, MessageTemplate ({{variable}} 替换), ChatTemplateComponent
+│   ├── prompt_tool_bridge.go    # I3 Tool Bridge: BridgeTool 接口 + promptTemplateBridge + toolsNodeBridge + Workflow 便捷方法
 │   ├── bridge.go                # Bridge Adapter: BridgeRetriever/BridgeChatModel + Workflow 便捷方法
 │   ├── retriever.go             # Retriever 接口, Document/Query 类型, FakeRetriever, NewRetrieverLambda
 │   ├── chatmodel.go             # ChatModel 接口, Message/RoleType, FakeChatModel, ChatModelComponent
@@ -489,7 +666,9 @@ examples/eino-compose-runtime-replica-go/
 │   ├── ch2-verification.md             # 第二章完整验证记录
 │   ├── ch3-runtime-contract.md         # 第三章 Runnable/Stream/Callback 契约
 │   ├── ch4-r1-chatmodel-retriever-contract.md  # 第四章组件契约研究
-│   └── ch4-r2-replica-bridge-audit.md  # 第四章桥接审计
+│   ├── ch4-r2-replica-bridge-audit.md  # 第四章桥接审计
+│   ├── ch5-implementation-contract.md  # 第五章实现契约: Model/Tool/Prompt 组件接口与图桥接
+│   └── ch5-r1-component-gap-audit.md   # 第五章组件差距审计
 ├── README.md                    # 本文档
 ├── CHANGELOG.md                 # 变更日志
 ├── FINAL_SUMMARY.md             # 最终验证摘要
@@ -507,19 +686,19 @@ examples/eino-compose-runtime-replica-go/
 
 ## 明确未实现的边界
 
-**本复刻版是教育子集 (educational subset)。ChatModel/Retriever 组件接口已实现 (Chapter 4),Bridge Adapter 模式已演示 (I3)。完整图流式执行、stream field mapping、Workflow 分支运行时路由仍为已知缺口。**
+**本复刻版是教育子集 (educational subset)。ChatModel/Retriever 组件接口已实现 (Chapter 4),Bridge Adapter 模式已演示 (I3),PromptTemplate/Tool/ToolsNode 桥接已实现 (Chapter 5)。完整图流式执行、stream field mapping、Workflow 分支运行时路由仍为已知缺口。**
 
 本复刻版聚焦于 Eino Compose Runtime 的核心图编译与执行引擎,以下为明确未实现的部分:
 
 ### 运行时不支持
-- **组件桥接 (ChatModel/Tool/Retriever)**: ChatModel/Retriever 接口已实现 (retriever.go/chatmodel.go)。Bridge Adapter 模式 (bridge.go) 已展示 Workflow 声明式桥接。Tool bridge 未实现。
+- **组件桥接 (ChatModel/Tool/Retriever/Prompt)**: ChatModel/Retriever 接口已实现 (retriever.go/chatmodel.go)。Tool bridge 已实现 (prompt_tool_bridge.go)。Prompt bridge 已实现 (prompt.go)。Bridge Adapter 模式已展示 Workflow 声明式桥接。
 - **图级 Stream 执行管线**: Runnable 四模式已经实现,但 graph runner 主路径仍以 Invoke 为主
 - **streamFieldMap 流式映射**: 依赖图级 stream channel,当前未接入
 - **Stream ChainBranch**: 流式分支暂未接入 Chain Builder
 - **validateFieldMapping 编译时调用缺失 (GAP-I1-1)**: `validateFieldMapping()` 已完整实现但 `graph.compile()` 未调用
 - **GraphBranch 运行时路由缺失 (GAP-I1-2)**: Workflow 分支不可用;Chain 通过内联绕过
 - **State 传递 (graph.state)**: 字段已定义但未使用
-- **Checkpoint / Recovery**: 可恢复执行的中断-恢复机制不在范围内
+- **持久化/分布式 Checkpoint Store**: Checkpoint / Interrupt / Resume 已有内存教学实现,但未接持久化后端或分布式恢复
 - **Fan-in 智能合并**: 当前 DAG Fan-in 默认输出 map[string]any 或单值直传
 
 ### 周边工具未实现

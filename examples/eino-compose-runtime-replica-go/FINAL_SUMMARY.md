@@ -1,12 +1,15 @@
-# Eino Compose Runtime Replica — 最终验证摘要 (第二/三/四章 + I3 Bridge Adapter + Checkpoint,教学子集,非完整产品复刻)
+# Eino Compose Runtime Replica — 最终验证摘要 (第二/三/四/五章 + I3 Bridge Adapter + Checkpoint,教学子集,非完整产品复刻)
 
 ## 验证状态
 
-- **gofmt**: 通过 (所有 Go 文件均已格式化)
-- **go build ./...**: 通过 (所有包编译零错误零警告)
-- **go vet ./...**: 通过 (静态分析无问题)
-- **go test ./...**: 通过 (compose 包 130+ 测试全部 PASS,cmd/example 无测试文件)
-- **go run ./cmd/example**: 通过 (18 个示例全部正常运行)
+| 命令 | 结果 |
+|------|------|
+| `gofmt -w .` | ✅ 所有 Go 文件已格式化,无变更 |
+| `go build ./...` | ✅ 零编译错误零警告 |
+| `go test ./... -count=1` | ✅ compose 包全部 PASS |
+| `go vet ./...` | ✅ 静态分析无问题 |
+| `go run ./cmd/example` | ✅ 20 个示例全部正常运行 |
+| `git diff --check` | ✅ 无空白字符问题 |
 
 ---
 
@@ -215,6 +218,55 @@
 
 ---
 
+### 六、第五章: PromptTemplate / Tool / ToolsNode 组件桥接
+
+> **本章扩展 I3 Bridge Adapter 模式,实现 PromptTemplate 渲染、Tool 领域接口与 ToolsNode 工具执行节点,支持 Workflow/Chain/Graph 三种编排方式,构建完整的确定性 Tool Calling Pipeline。**
+
+#### 34. ToolCall Schema 数据模型 (schema.go)
+- `ToolCall{ID, Type, Function}` / `ToolCallFunction{Name, Arguments}`: 表示模型发出的工具调用请求
+- `ToolInfo{Name, Desc, ParamsOneOf}`: 工具元信息 (用于注册和校验)
+- `ParamsOneOf{Params map[string]*ParameterInfo}`: 工具参数 Schema
+- `ToolResult{Text}`: 工具执行结果封装
+- `Message.ToolCalls` 字段扩展: 在 `chatmodel.go` 的 `Message` 结构体中新增 `ToolCalls []ToolCall`
+
+#### 35. ChatTemplate 接口与 MessageTemplate (prompt.go)
+- `ChatTemplate` 接口: `Format(ctx, vs map[string]any) ([]*Message, error)` — 统一提示词渲染合约
+- `MessageTemplate`: `NewMessageTemplate(tpl)` + `.WithSystemTemplate(tpl)`,支持 `{{variable}}` 占位符替换 (使用 `regexp.MustCompile`)
+- `FakeChatTemplate`: 测试用 mock
+- `ChatTemplateComponent`: 将 ChatTemplate 包装为 `composableRunnable`,组件类型 `ComponentOfPrompt = "Prompt"`
+
+#### 36. BridgeTool 领域接口 (prompt_tool_bridge.go)
+- `BridgeTool` 接口: `Name() string` + `Execute(ctx, args map[string]any) (string, error)`
+- `BridgeToolFunc` / `NewBridgeTool(name, fn)`: 将普通函数包装为 BridgeTool
+- 工具通过 `Name()` 唯一标识,在 ToolsNode 中按名匹配
+
+#### 37. ToolsNode 工具执行节点 (prompt_tool_bridge.go)
+- `promptTemplateBridge`: 将 `MessageTemplate` 包装为 Lambda (输入 `map[string]any` → 输出 `[]*Message`)
+- `toolsNodeBridge`: 输入 `*Message` → 解析 `ToolCalls` → 匹配工具 → 执行 → 返回结果 `*Message`
+- `NewPromptTemplateLambda(tmpl)`: 导出构造函数
+- `NewToolsNodeLambda(tools...)`: 导出构造函数,从变长参数构建 tools map
+- `NewToolsNodeLambdaFromMap(toolMap)`: 从预构建 map 创建
+- `Workflow.AsPromptTemplateNode(key, tmpl)`: Workflow 便捷方法
+- `Workflow.AsToolsNode(key, tools...)`: Workflow 便捷方法
+
+#### 38. 三编排演示 (cmd/example/main.go)
+- **Example 19: Tool Calling Pipeline (Workflow)** — `START → prompt → model1 → tools → model2 → END`,使用 `AsPromptTemplateNode` / `AsToolsNode` 便捷方法
+- **Example 20: Tool Calling Pipeline (Chain / Graph)** — Chain 版本 `AppendLambda` 自动连接;Graph 版本 `AddEdge` 手动拓扑,展示最大灵活性
+- 全程确定性: 使用 `FakeChatModel` 返回固定 `ToolCall`,使用 `BridgeTool` 返回固定结果
+
+#### 39. 测试覆盖 (prompt_test.go / prompt_tool_bridge_test.go)
+- `prompt_test.go`: 6 个测试 — plain/system/missing vars/missing map/FakeChatTemplate/ChatTemplateComponent
+- `prompt_tool_bridge_test.go`: 15 个测试 — BridgeToolFunc 包装、PromptTemplate Bridge Lambda、ToolsNode 单工具/多工具/未找到/错误/无效参数、Workflow/Chain/Graph 端到端 pipeline
+
+#### 40. 明确不包含
+- Eino 完整 `InvokableTool` / `ToolCallingChatModel` 分层接口
+- Streaming tool call (模型边生成边返回 ToolCall)
+- Tool rerun skip handler (中断恢复后跳过已执行工具)
+- 工具级 Callback 集成
+- Provider 特定的工具绑定选项
+
+---
+
 ## 关键文件导览
 
 | 文件 | 职责 |
@@ -251,31 +303,39 @@
 | `stream.go` | PipeStreamReader/PipeStreamWriter、Copy、Merge、Concat |
 | `stream_test.go` | 20 测试: Pipe/Copy/Merge/Concat 并发安全 |
 | `callbacks.go` | RunInfo、Handler、HandlerBuilder、CallbackWrapper、流输入/输出副本 |
+| `schema.go` | ToolCall / ToolCallFunction / ToolInfo / ToolResult 数据模型 |
+| `prompt.go` | ChatTemplate 接口、MessageTemplate ({{variable}} 替换)、ChatTemplateComponent |
+| `prompt_test.go` | 6 测试: MessageTemplate / FakeChatTemplate / ChatTemplateComponent |
+| `prompt_tool_bridge.go` | BridgeTool 接口、promptTemplateBridge / toolsNodeBridge、NewToolsNodeLambda、Workflow 便捷方法 |
+| `prompt_tool_bridge_test.go` | 15 测试: BridgeToolFunc / PromptTemplate / ToolsNode / 三编排端到端 pipeline |
 | `callbacks_test.go` | 25 测试: 5 阶段时序、上下文隔离、TimingChecker、CbStreamReader |
 | `graph_test.go` | 80+ 测试: DAG/Pregel/边界/EventLog/Branch/Callback 集成 |
-| `cmd/example/main.go` | 综合示例程序 (17 个场景,覆盖 Graph/DAG/Pregel/FieldMapping/Workflow/Chain/Parallel/Branch/Stream/Collect/Transform/Callback/Bridge/RAG) |
-| `research/` | 6 个研究文档: ch2 实现契约与验证、ch3 运行时契约、ch4 R1 组件契约、ch4 R2 桥接审计 |
+| `cmd/example/main.go` | 综合示例程序 (20 个场景,覆盖 Graph/DAG/Pregel/FieldMapping/Workflow/Chain/Parallel/Branch/Stream/Collect/Transform/Callback/Bridge/RAG/ToolCallingPipeline) |
+| `research/` | 8 个研究文档: ch2 实现契约与验证、ch3 运行时契约、ch4 R1 组件契约、ch4 R2 桥接审计、ch5 实现契约、ch5 组件差距审计 |
 
 ---
 
 ## 如何运行
 
-### 运行测试
 ```bash
+# 工作目录
 cd examples/eino-compose-runtime-replica-go
-go test ./...
-```
 
-### 格式化代码
-```bash
-cd examples/eino-compose-runtime-replica-go
+# 格式化
 gofmt -w .
-```
 
-### 运行示例
-```bash
-cd examples/eino-compose-runtime-replica-go
+# 编译 + 静态分析
+go build ./...
+go vet ./...
+
+# 运行测试 (禁用缓存)
+go test ./... -count=1
+
+# 运行综合示例 (20 个场景)
 go run ./cmd/example/
+
+# 检查空白字符 (仓库根目录)
+git diff --check
 ```
 
 ---
@@ -287,14 +347,14 @@ go run ./cmd/example/
 本复刻版聚焦于 Eino Compose Runtime 的核心图编译与执行引擎。以下为明确未实现的部分:
 
 ### 运行时不支持
-- **组件桥接 (ChatModel/Tool/Retriever)**: Bridge Adapter 模式 (bridge.go) 已展示 Workflow 声明式桥接。ChatModel/Retriever 独立接口 (retriever.go/chatmodel.go) 已实现。Tool bridge / Embedding bridge 未实现。
+- **组件桥接 (ChatModel/Tool/Retriever)**: Bridge Adapter 模式 (bridge.go) 已展示 Workflow 声明式桥接。ChatModel/Retriever 独立接口 (retriever.go/chatmodel.go) 已实现。Tool bridge 已实现 (prompt_tool_bridge.go)。Embedding bridge 未实现。
 - **图级 Stream 执行管线**: Runnable 四模式已经实现,但 graph runner 主路径仍以 Invoke 为主
 - **streamFieldMap 流式映射**: 依赖图级 stream channel,当前未接入 (见 `field_mapping.go:448` stub)
 - **Stream ChainBranch**: 流式分支暂未接入 Chain Builder
 - **validateFieldMapping 编译时调用**: `validateFieldMapping()` 已完整实现但 `graph.compile()` 未调用 — 类型错误推迟到运行时 (GAP-I1-1)
 - **GraphBranch 运行时路由**: Workflow 分支不可用 (GAP-I1-2)。Chain 通过内联分支评估绕过。
 - **State 传递 (graph.state)**: 字段已定义但未使用
-- **Checkpoint / Recovery**: 可恢复执行机制不在范围内
+- **持久化/分布式 Checkpoint Store**: Checkpoint / Interrupt / Resume 已有内存教学实现,但未接持久化后端或分布式恢复
 - **Fan-in 智能合并 (Merge 配置)**: 当前默认 map[string]any 合并
 
 ### 周边工具未实现
@@ -365,3 +425,4 @@ Go Eino Compose Runtime Replica 成功实现了 Eino 的核心设计理念:
 12. **Bridge Adapter (I3)**: 领域接口与图运行时之间的无侵入适配层,让 Retriever/ChatModel 参与图编排
 13. **Chapter 4 Component Interfaces**: 独立的 ChatModel/Retriever 接口 + Fake 实现 + Lambda 桥接 + 四模式降级测试
 14. **桥接审计 (R1/R2)**: 六层抽象 90%+ 完成度,3 个关键缺口已在 `research/ch4-r2-replica-bridge-audit.md` 记录
+15. **Chapter 5 PromptTemplate / Tool / ToolsNode**: ChatTemplate 接口 + MessageTemplate 渲染 + BridgeTool 领域接口 + ToolsNode 工具执行 + Workflow/Chain/Graph 三编排,全程确定性无外部依赖

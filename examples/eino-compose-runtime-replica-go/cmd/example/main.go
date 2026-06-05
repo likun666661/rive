@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -10,7 +11,7 @@ import (
 )
 
 func main() {
-	fmt.Println("=== Eino Compose Runtime Replica — Chapter 1 / 2 / 3 / 4 综合示例 ===")
+	fmt.Println("=== Eino Compose Runtime Replica — Chapter 1 / 2 / 3 / 4 / 5 综合示例 ===")
 	fmt.Println()
 
 	fmt.Println("========== 第一章示例 (Graph/DAG/Pregel/Info/EventLog) ==========")
@@ -44,6 +45,12 @@ func main() {
 	fmt.Println()
 	example16_RAGPipeline()
 	example17_BridgePatternExplanation()
+
+	fmt.Println()
+	fmt.Println("========== I3 Prompt/Tool Bridge 示例 (PromptTemplate → ToolCall → ToolsNode → Response) ==========")
+	fmt.Println()
+	example19_ToolCallingPipeline()
+	example20_ToolCallingPipelineChain()
 
 	fmt.Println()
 	fmt.Println("========== 第四章示例 (Checkpoint / Interrupt / Resume) ==========")
@@ -614,14 +621,14 @@ func example11_SkippedFeatures() {
 	fmt.Println("┌─────────────────────────────────────────────────────────────────────┐")
 	fmt.Println("│ 项目                               │ 跳过理由                      │")
 	fmt.Println("├─────────────────────────────────────────────────────────────────────┤")
-	fmt.Println("│ 组件桥接 (ChatModel/Tool/Retriever)  │ 依赖外部组件接口体系         │")
-	fmt.Println("│ AddChatModelNode / AppendChatModel   │ 当前仅有 Lambda 抽象         │")
+	fmt.Println("│ Provider 级组件桥接选项              │ 依赖真实模型/工具 SDK        │")
+	fmt.Println("│ AddEmbeddingNode / AppendEmbedding   │ 尚未实现 Embedding 领域接口  │")
 	fmt.Println("│ 图级 Stream 执行管线                  │ runner 仍以 Invoke 为主路径  │")
 	fmt.Println("│ streamFieldMap 流式字段映射          │ 依赖图级 stream channel      │")
 	fmt.Println("│ Stream ChainBranch                   │ 流式分支未接入 Chain Builder │")
-	fmt.Println("│ 组件级 Callback 桥接                  │ 未接 ChatModel/Tool 组件体系 │")
+	fmt.Println("│ 组件级 Callback 深度集成              │ 未接 Provider 级事件模型      │")
 	fmt.Println("│ State 传递 (graph.state)             │ 字段定义但未使用             │")
-	fmt.Println("│ Checkpoint / Recovery                │ 可恢复执行机制不在范围内     │")
+	fmt.Println("│ 持久化/分布式 Checkpoint Store       │ 当前仅内存教学实现           │")
 	fmt.Println("│ values_merge 的 StreamReader merge    │ 未接图级 stream fan-in      │")
 	fmt.Println("│ 编译时类型推断 (toValidateMap)       │ 推迟到后续版本               │")
 	fmt.Println("│ Graph 可视化 / DOT 导出              │ 周边工具未实现               │")
@@ -632,7 +639,7 @@ func example11_SkippedFeatures() {
 	fmt.Println("└─────────────────────────────────────────────────────────────────────┘")
 	fmt.Println()
 	fmt.Println("  可替代方案:")
-	fmt.Println("  - 组件桥接: 通过 AddLambdaNode + InvokableLambda 包装实现等价功能")
+	fmt.Println("  - ChatModel/Retriever/Prompt/Tool: 已通过 Bridge Adapter 包装为 Lambda")
 	fmt.Println("  - 流式处理: Runnable 四模式、Pipe stream、Collect/Transform 教学路径已实现")
 	fmt.Println("  - 回调处理: CallbackWrapper 已覆盖 OnStart/OnEnd/OnError 与流输入/输出回调副本")
 	fmt.Println("  - 类型推断: 当前通过 fmtType() 返回简单类型名，复杂类型标注为 \"any\"")
@@ -970,7 +977,7 @@ func example15_CallbackTiming() {
 	fmt.Println("#   - 回调可用于计时 trace、日志、熔断、重试")
 	fmt.Println("#   - EventLog 在 graph 级别提供了类似的可观测性")
 	fmt.Println("#   - CallbackWrapper 已覆盖 Invoke/Stream/Collect/Transform 包装")
-	fmt.Println("#   - 组件桥接、图级 callback 初始化链和完整图流式执行不在范围内")
+	fmt.Println("#   - Provider 级 callback 初始化链和完整图流式执行不在范围内")
 	fmt.Println()
 }
 
@@ -1131,10 +1138,289 @@ func example17_BridgePatternExplanation() {
 	fmt.Println("     - Chain: Builder 风格 AppendLambda")
 	fmt.Println()
 	fmt.Println("# 扩展清单 (本教育子集未实现):")
-	fmt.Println("  - Tool bridge: Tool.Execute() → Lambda (参考 Eino Tool 接口)")
 	fmt.Println("  - StreamChatModel bridge: ChatModel.GenerateStream() → StreamableLambda")
 	fmt.Println("  - Embedding bridge: Embedder.Embed() → Lambda")
+	fmt.Println("  - Provider-specific tool binding options")
 	fmt.Println("  - 完整的错误传递与重试语义 (callback + state 集成)")
+	fmt.Println()
+}
+
+// =============================================================================
+// I3 Prompt/Tool Bridge 示例: PromptTemplate → ToolCall → ToolsNode → Response
+//
+// 核心概念:
+// 本示例演示 Tool Calling Pipeline — 让 LLM 应用能够调用外部工具:
+//
+//   BridgeTool          — 领域工具接口 (Name + Execute)
+//   promptTemplateBridge— MessageTemplate → Lambda 适配器
+//   toolsNodeBridge     — 解析 ToolCalls, 执行工具, 返回结果
+//
+// 工作流:
+//   PromptTemplate → FakeChatModel (返回 ToolCall) → ToolsNode → FinalModel
+//
+// 特点:
+//   - 完全确定性, 不调用任何外部模型/API
+//   - 使用 compose.FakeChatModel 模拟返回 ToolCall 的模型行为
+//   - 使用 compose.BridgeTool 模拟工具 (get_weather / calculator)
+//   - 通过 Workflow/Graph/Chain 三种编排方式演示
+// =============================================================================
+
+// mockToolCallModel returns a canned ToolCall for get_weather.
+func mockToolCallModel() *compose.FakeChatModel {
+	return compose.NewFakeChatModel(compose.WithChatGenerateFunc(
+		func(ctx context.Context, input []*compose.Message) (*compose.Message, error) {
+			return &compose.Message{
+				Role:    compose.Assistant,
+				Content: "",
+				ToolCalls: []compose.ToolCall{
+					{
+						ID:   "call_weather_001",
+						Type: "function",
+						Function: compose.ToolCallFunction{
+							Name:      "get_weather",
+							Arguments: `{"location":"Paris"}`,
+						},
+					},
+				},
+			}, nil
+		},
+	))
+}
+
+// mockFinalModel assembles a final answer from the tool result.
+func mockFinalModel() *compose.FakeChatModel {
+	return compose.NewFakeChatModel(compose.WithChatGenerateFunc(
+		func(ctx context.Context, input []*compose.Message) (*compose.Message, error) {
+			if len(input) == 0 {
+				return compose.AssistantMessage("no input"), nil
+			}
+			last := input[len(input)-1]
+			return &compose.Message{
+				Role:    compose.Assistant,
+				Content: fmt.Sprintf("Final answer based on tool results:\n%s", last.Content),
+			}, nil
+		},
+	))
+}
+
+func example19_ToolCallingPipeline() {
+	fmt.Println("--- Example 19: Tool Calling Pipeline (Workflow) ---")
+	fmt.Println()
+
+	fmt.Println("# 场景: 用户提问 → PromptTemplate → 模型返回 ToolCall → ToolsNode 执行 → 最终回答")
+	fmt.Println("#")
+	fmt.Println("#   拓扑 (Workflow):")
+	fmt.Println("#     START ──> prompt ──> model1 ──> tools ──> model2 ──> END")
+	fmt.Println("#")
+	fmt.Println()
+
+	// 1. Define the prompt template
+	tmpl := compose.NewMessageTemplate("{{query}}").
+		WithSystemTemplate("You are a helpful assistant. Answer concisely.")
+
+	// 2. Create tools
+	getWeather := compose.NewBridgeTool("get_weather",
+		func(ctx context.Context, args map[string]any) (string, error) {
+			loc, _ := args["location"].(string)
+			return fmt.Sprintf("Sunny, 22°C in %s with light breeze", loc), nil
+		},
+	)
+
+	// 3. Build the workflow
+	wf := compose.NewWorkflow[map[string]any, *compose.Message]()
+
+	wf.AsPromptTemplateNode("prompt", tmpl).
+		AddInput(compose.START)
+
+	wf.AddLambdaNode("model1", compose.InvokableLambda(
+		func(ctx context.Context, msgs []*compose.Message) (*compose.Message, error) {
+			return mockToolCallModel().Generate(ctx, msgs)
+		},
+	)).AddInput("prompt")
+
+	wf.AsToolsNode("tools", getWeather).
+		AddInput("model1")
+
+	wf.AddLambdaNode("model2", compose.InvokableLambda(
+		func(ctx context.Context, msg *compose.Message) (*compose.Message, error) {
+			return mockFinalModel().Generate(ctx, []*compose.Message{msg})
+		},
+	)).AddInput("tools")
+
+	wf.End().AddInput("model2")
+
+	r, err := wf.Compile(context.Background())
+	if err != nil {
+		fmt.Printf("  Compile error: %v\n\n", err)
+		return
+	}
+
+	result, err := r.Invoke(context.Background(), map[string]any{
+		"query": "What is the weather in Paris?",
+	})
+	if err != nil {
+		fmt.Printf("  Invoke error: %v\n\n", err)
+		return
+	}
+
+	fmt.Printf("  Input:  %q\n", "What is the weather in Paris?")
+	fmt.Printf("  Output: %s\n", result.Content)
+	fmt.Println()
+	fmt.Println("# 关键点:")
+	fmt.Println("#   - PromptTemplate: MessageTemplate → Lambda, 输出 []*Message")
+	fmt.Println("#   - model1: FakeChatModel 返回包含 ToolCall 的 Message (ToolCalls 字段)")
+	fmt.Println("#   - tools: ToolsNode 解析 ToolCalls, 匹配 BridgeTool, 执行并组装结果")
+	fmt.Println("#   - model2: 第二个 FakeChatModel 基于工具结果生成最终回答")
+	fmt.Println("#   - 全程确定性, 无外部调用")
+	fmt.Println()
+}
+
+func example20_ToolCallingPipelineChain() {
+	fmt.Println("--- Example 20: Tool Calling Pipeline (Chain / Graph) ---")
+	fmt.Println()
+
+	fmt.Println("# Chain 版本: 线性管道, 自动连接 START/END")
+	fmt.Println()
+
+	// Create the tool
+	calcTool := compose.NewBridgeTool("calculator",
+		func(ctx context.Context, args map[string]any) (string, error) {
+			expr, _ := args["expression"].(string)
+			return fmt.Sprintf("Computed result for '%s' = 42", expr), nil
+		},
+	)
+
+	// model1: returns a ToolCall for calculator
+	model1 := compose.InvokableLambda(
+		func(ctx context.Context, msgs []*compose.Message) (*compose.Message, error) {
+			return compose.NewFakeChatModel(compose.WithChatGenerateFunc(
+				func(ctx context.Context, input []*compose.Message) (*compose.Message, error) {
+					return &compose.Message{
+						Role:    compose.Assistant,
+						Content: "",
+						ToolCalls: []compose.ToolCall{
+							{
+								ID:   "call_calc_001",
+								Type: "function",
+								Function: compose.ToolCallFunction{
+									Name:      "calculator",
+									Arguments: `{"expression":"2+2"}`,
+								},
+							},
+						},
+					}, nil
+				},
+			)).Generate(ctx, msgs)
+		},
+	)
+
+	// tools: execute the calculator tool using exported NewToolsNodeLambda
+	tools := compose.NewToolsNodeLambda(calcTool)
+
+	// model2: assemble final response
+	model2 := compose.InvokableLambda(
+		func(ctx context.Context, msg *compose.Message) (*compose.Message, error) {
+			return compose.AssistantMessage(
+				fmt.Sprintf("Answer: The tool computed → %s", msg.Content),
+			), nil
+		},
+	)
+
+	chain := compose.NewChain[[]*compose.Message, *compose.Message]()
+	chain.AppendLambda(model1).AppendLambda(tools).AppendLambda(model2)
+
+	r, err := chain.Compile(context.Background())
+	if err != nil {
+		fmt.Printf("  Compile error: %v\n\n", err)
+		return
+	}
+
+	input := []*compose.Message{compose.HumanMessage("What is 2+2?")}
+	result, err := r.Invoke(context.Background(), input)
+	if err != nil {
+		fmt.Printf("  Invoke error: %v\n\n", err)
+		return
+	}
+
+	fmt.Printf("  Input:  %q\n", "What is 2+2?")
+	fmt.Printf("  Output: %s\n", result.Content)
+	fmt.Println()
+
+	fmt.Println("# Graph 版本: 手动拓扑, 最大灵活性")
+	fmt.Println()
+
+	// Demonstrate the same pipeline using raw Graph
+	g := compose.NewGraph[[]*compose.Message, *compose.Message]()
+
+	model1Fn := compose.InvokableLambda(
+		func(ctx context.Context, msgs []*compose.Message) (*compose.Message, error) {
+			jsonArgs, _ := json.Marshal(map[string]string{"location": "Tokyo"})
+			return &compose.Message{
+				Role:    compose.Assistant,
+				Content: "",
+				ToolCalls: []compose.ToolCall{
+					{
+						ID:   "call_weather_002",
+						Type: "function",
+						Function: compose.ToolCallFunction{
+							Name:      "get_weather",
+							Arguments: string(jsonArgs),
+						},
+					},
+				},
+			}, nil
+		},
+	)
+
+	weatherTool := compose.NewBridgeTool("get_weather",
+		func(ctx context.Context, args map[string]any) (string, error) {
+			loc, _ := args["location"].(string)
+			return fmt.Sprintf("Cloudy, 18°C in %s", loc), nil
+		},
+	)
+
+	toolsFn := compose.NewToolsNodeLambda(weatherTool)
+
+	model2Fn := compose.InvokableLambda(
+		func(ctx context.Context, msg *compose.Message) (*compose.Message, error) {
+			return compose.AssistantMessage(
+				fmt.Sprintf("Summary: %s", msg.Content),
+			), nil
+		},
+	)
+
+	g.AddLambdaNode("model1", model1Fn)
+	g.AddLambdaNode("tools", toolsFn)
+	g.AddLambdaNode("model2", model2Fn)
+	g.AddEdge(compose.START, "model1")
+	g.AddEdge("model1", "tools")
+	g.AddEdge("tools", "model2")
+	g.AddEdge("model2", compose.END)
+
+	gr, err := g.Compile(context.Background(),
+		compose.WithGraphName("tool_calling_graph"),
+		compose.WithNodeTriggerMode(compose.AllPredecessor),
+	)
+	if err != nil {
+		fmt.Printf("  Compile error: %v\n\n", err)
+		return
+	}
+
+	graphResult, err := gr.Invoke(context.Background(), []*compose.Message{
+		compose.HumanMessage("What is the weather in Tokyo?"),
+	})
+	if err != nil {
+		fmt.Printf("  Invoke error: %v\n\n", err)
+		return
+	}
+
+	fmt.Printf("  Input:  %q\n", "What is the weather in Tokyo?")
+	fmt.Printf("  Output: %s\n", graphResult.Content)
+	fmt.Println()
+	fmt.Println("# 关键点:")
+	fmt.Println("#   - Chain: AppendLambda 自动串联, 简洁直观")
+	fmt.Println("#   - Graph: AddEdge 手动拓扑, 支持复杂 DAG")
+	fmt.Println("#   - NewToolsNodeLambda 是导出的构造函数,BridgeTool.Execute 保持领域接口")
 	fmt.Println()
 }
 

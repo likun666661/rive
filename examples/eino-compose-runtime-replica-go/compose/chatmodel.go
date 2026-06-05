@@ -17,8 +17,11 @@ const (
 )
 
 type Message struct {
-	Role    RoleType
-	Content string
+	Role       RoleType
+	Content    string
+	ToolCalls  []ToolCall
+	ToolCallID string
+	Name       string
 }
 
 type ChatModel interface {
@@ -142,4 +145,20 @@ func (c *ChatModelComponent) GetRunnable() *composableRunnable {
 
 func (c *ChatModelComponent) GetComponentType() ComponentType {
 	return ComponentOfChatModel
+}
+
+func SystemMessage(content string) *Message {
+	return &Message{Role: System, Content: content}
+}
+
+func HumanMessage(content string) *Message {
+	return &Message{Role: Human, Content: content}
+}
+
+func AssistantMessage(content string) *Message {
+	return &Message{Role: Assistant, Content: content}
+}
+
+func ToolMessage(content string, toolCallID string) *Message {
+	return &Message{Role: Tool, Content: content, ToolCallID: toolCallID}
 }

@@ -24,6 +24,8 @@ const (
 	ComponentOfWorkflow  ComponentType = "Workflow"
 	ComponentOfChain     ComponentType = "Chain"
 	ComponentOfChatModel ComponentType = "ChatModel"
+	ComponentOfPrompt    ComponentType = "Prompt"
+	ComponentOfTool      ComponentType = "Tool"
 	ComponentOfUnknown   ComponentType = "Unknown"
 )
 

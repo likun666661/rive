@@ -1,6 +1,6 @@
-# CHANGELOG — 第二/三/四章 & I3 Bridge Adapter 示例与文档更新
+# CHANGELOG — 第二/三/四/五章 & I3 Bridge Adapter 示例与文档更新
 
-本文档记录对 `examples/eino-compose-runtime-replica-go` 的第二章 (FieldMapping / Workflow / Chain / Parallel / Branch)、第三章 (Runnable Stream / Collect / Transform / Callback)、第四章 (ChatModel + Retriever 组件接口)、I3 Bridge Adapter 与桥接审计 (R1/R2) 的示例补全与文档更新。
+本文档记录对 `examples/eino-compose-runtime-replica-go` 的第二章 (FieldMapping / Workflow / Chain / Parallel / Branch)、第三章 (Runnable Stream / Collect / Transform / Callback)、第四章 (ChatModel + Retriever 组件接口)、第五章 (PromptTemplate / Tool / ToolsNode)、I3 Bridge Adapter 与桥接审计 (R1/R2) 的示例补全与文档更新。
 
 ---
 
@@ -125,6 +125,62 @@
 
 ---
 
+## Ch5: Chapter 5 — PromptTemplate / Tool / ToolsNode 组件桥接
+
+参考 Eino 技术手册第五章 (`05-components-model-tool-prompt.md`),扩展 I3 Bridge Adapter 模式,增加 PromptTemplate 渲染、Tool 领域接口与 ToolsNode 工具执行节点,实现完整的确定性 Tool Calling Pipeline。
+
+### 变更范围
+
+| 文件 | 变更类型 | 说明 |
+|------|---------|------|
+| `compose/schema.go` | 新增 | `ToolCall` / `ToolCallFunction` / `ToolInfo` / `ParamsOneOf` / `ParameterInfo` / `ToolResult` 数据模型 |
+| `compose/prompt.go` | 新增 | `ChatTemplate` 接口 (`Format`)、`MessageTemplate` (带 `WithSystemTemplate` 和 `{{variable}}` 替换)、`ChatTemplateComponent`、`FakeChatTemplate` |
+| `compose/prompt_test.go` | 新增 | 6 个测试: MessageTemplate 简单/系统/缺失变量/缺失map/FakeChatTemplate/ChatTemplateComponent |
+| `compose/prompt_tool_bridge.go` | 新增 | `BridgeTool` 接口、`BridgeToolFunc` / `NewBridgeTool`、`promptTemplateBridge` / `toolsNodeBridge` 适配器、`NewPromptTemplateLambda` / `NewToolsNodeLambda` / `NewToolsNodeLambdaFromMap`、`Workflow.AsPromptTemplateNode` / `Workflow.AsToolsNode` 便捷方法 |
+| `compose/prompt_tool_bridge_test.go` | 新增 | 15 个测试: BridgeToolFunc / PromptTemplate / ToolsNode 单工具/多工具/未找到/错误/无效参数,Workflow/Chain/Graph 三编排端到端 |
+| `cmd/example/main.go` | 更新 | 新增 Example 19 (Workflow) 和 Example 20 (Chain/Graph) Tool Calling Pipeline,示例总数增至 20 |
+| `README.md` | 更新 | 新增第五章功能章节,架构总览增加 PromptTemplate/Tool/ToolsNode,更新便捷方法表、扩展清单、未实现边界、包结构、示例计数 |
+| `CHANGELOG.md` | 更新 | 本文件 |
+| `FINAL_SUMMARY.md` | 更新 | 新增第五章功能摘要,更新验证状态 |
+| `research/ch5-implementation-contract.md` | 新增 | 研究笔记: Chapter 05 组件契约与实现计划 |
+| `research/ch5-r1-component-gap-audit.md` | 新增 | 差距审计: 当前复刻版 vs Eino Chapter 05 组件契约 |
+
+### 新增示例说明
+
+#### Example 19: Tool Calling Pipeline (Workflow)
+- 完整 pipeline: `PromptTemplate → FakeChatModel (ToolCall) → ToolsNode → FakeChatModel (final answer)`
+- 使用 `wf.AsPromptTemplateNode` / `wf.AsToolsNode` 便捷方法
+- 拓扑: `START → prompt → model1 → tools → model2 → END`
+- 模拟 `get_weather` 工具,返回确定性结果
+
+#### Example 20: Tool Calling Pipeline (Chain / Graph)
+- **Chain 版本**: `AppendLambda(model1).AppendLambda(tools).AppendLambda(model2)`,自动连接
+- **Graph 版本**: `AddEdge` 手动拓扑,展示最大灵活性
+- 模拟 `calculator` 和 `get_weather` 工具
+
+### PromptTemplate 组件设计
+
+- **ChatTemplate 接口**: `Format(ctx, vs map[string]any) ([]*Message, error)` — 统一提示词渲染合约
+- **MessageTemplate**: 支持 `{{variable}}` 占位符替换 + 可选的系统提示词模板
+- **ChatTemplateComponent**: `GetRunnable()` 返回 `composableRunnable{i}`,支持图运行时集成
+- **FakeChatTemplate**: 测试用 mock 实现
+- **组件常量**: `ComponentOfPrompt = "Prompt"`
+
+### Tool / ToolsNode 组件设计
+
+- **BridgeTool 接口**: `Name() string` + `Execute(ctx, args map[string]any) (string, error)`
+- **BridgeToolFunc**: 将普通函数包装为 BridgeTool
+- **toolsNodeBridge**: 内部维护 `tools map[string]BridgeTool`;输入 `*Message` → 解析 `ToolCalls` → 匹配工具 → 执行 → 结果组装
+- **工具匹配**: 根据 `ToolCall.Function.Name` 在 tools map 中查找
+- **JSON 参数解析**: `json.Unmarshal` 反序列化 `ToolCall.Function.Arguments`
+- **三种构造路径**: `NewToolsNodeLambda(tools...)` / `NewToolsNodeLambdaFromMap(toolMap)` / `Workflow.AsToolsNode`
+
+### 教学边界
+
+当前实现刻意保留为教育子集: 不实现 Eino 完整 `InvokableTool` / `ToolCallingChatModel` 分层接口、streaming tool call、tool rerun skip handler、工具级 Callback 集成和 provider 特定的工具绑定选项。
+
+---
+
 ## M1: Final merge docs — 第三章教学示例与文档补全
 
 ### 变更范围
@@ -178,5 +234,5 @@ README.md 第三章新增内容:
 - 代码编译通过 (`go build ./...`)、`go vet ./...` 无问题
 - 代码格式化通过 (`gofmt -w .`)
 - 示例程序运行通过 (`go run ./cmd/example`)
-- 17 个示例覆盖 Chapter 1 (Graph/DAG/Pregel/Info/EventLog) + Chapter 2 (FieldMapping/Workflow/Chain/Parallel/Branch) + Chapter 3 (Stream/Collect/Transform/Callback) + Chapter 4 Bridge (RAG Pipeline + Bridge Pattern)
+- 20 个示例覆盖 Chapter 1 (Graph/DAG/Pregel/Info/EventLog) + Chapter 2 (FieldMapping/Workflow/Chain/Parallel/Branch) + Chapter 3 (Stream/Collect/Transform/Callback) + Chapter 4 Bridge (RAG Pipeline + Bridge Pattern) + Chapter 5 (Tool Calling Pipeline Workflow/Chain/Graph)
 - 已知缺口已在 `research/ch4-r2-replica-bridge-audit.md` 完整记录
