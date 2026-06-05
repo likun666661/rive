@@ -1,4 +1,4 @@
 interface:
   display_name: "Rive"
-  short_description: "Run reusable multi-agent workflow DAGs with Rive."
-  default_prompt: "Use Rive to turn my objective into a ledger-backed workflow or Work DAG, run OpenCode/Codex workers with scheduler/retry/worktree isolation, and report the projection-backed result."
+  short_description: "Run observable, recoverable multi-agent workflow DAGs with Rive."
+  default_prompt: "Use Rive to turn my objective into a ledger-backed workflow or Work DAG, run OpenCode/Codex workers with scheduler/status/retry/worktree isolation, inspect neutral trace activity when needed, and report the projection-backed result."

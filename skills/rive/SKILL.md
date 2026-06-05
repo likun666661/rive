@@ -1,6 +1,6 @@
 ---
 name: rive
-description: Use Rive to coordinate local multi-agent software work through ledger-backed Work DAGs, reusable workflow templates, OpenCode/Codex runners, git-worktree isolation, scheduler resume/retry, conflict inspection, failure classification, and debug trace/usage. Use when an agent should plan a DAG, run bounded worker pools, preserve artifacts and refs, recover failed nodes, or repeat a workflow instead of solving everything in one session.
+description: Use Rive to coordinate local multi-agent software work through ledger-backed Work DAGs, reusable workflow templates, OpenCode/Codex runners, git-worktree isolation, scheduler observability, resume/retry, conflict recovery, failure classification, and neutral debug trace/usage. Use when an agent should plan a DAG, run bounded worker pools, preserve artifacts and refs, inspect worker activity, recover failed/conflicted nodes, or repeat a workflow instead of solving everything in one session.
 ---
 
 # Rive
@@ -23,8 +23,11 @@ each have different authority.
   scheduler acceptance policy, or a workflow run that delegates to that policy.
 - In worktree mode, worker file changes stay isolated until `rive branch commit`
   or scheduler `auto-committed` applies the patch.
-- Debug trace and usage are diagnostic only. They must never drive work,
-  dispatch, fact, evidence, branch, scheduler, or workflow state.
+- Debug trace, usage, stdout/stderr, and status activity are diagnostic only.
+  They must never drive work, dispatch, fact, evidence, branch, scheduler, or
+  workflow state.
+- Trust the base model's exploration unless ledger state says it failed. Do not
+  invent path-hit ratios, off-track/runaway judgments, or heartbeat rules.
 - Prefer OpenCode for low-cost production worker pools. Use Codex when the task
   requires Codex coverage, Codex-specific behavior, or the user explicitly asks.
 - Do not manually edit SQLite or patch around Rive state. Use retry, resume,
@@ -32,41 +35,24 @@ each have different authority.
 
 ## Capability Map
 
-Use this map to choose the right layer.
+Use this map to choose the right layer:
 
-- Evidence and facts:
-  - `rive snapshot capture/list/show`
-  - `rive evidence list`
-  - `team fact record`
-  - `rive fact list/show`
-- Agents, dispatches, and agent-facing completion:
-  - `rive agent add/list/show`
-  - `rive dispatch create/list/show/cancel`
-  - `team status`, `team report`, `team list`
-- Debug trace and cost inspection:
-  - `rive debug trace ingest/list/show/session/export/install/uninstall`
-  - `rive debug trace usage`
-- Runners:
-  - `rive runner opencode`
-  - `rive runner codex`
-  - `rive runner orchestrator --runner opencode`
-- Work DAG:
-  - `rive work create/list/show/inspect/edge add/accept/reopen/retry`
-  - `rive work graph inspect`
-  - `team work create/edge/list/show/inspect/note`
-- Delegation:
-  - `team send --wait`
-  - `team send --work <work_id> --wait`
-- Scheduler:
-  - `rive scheduler run/status/resume`
-  - `rive scheduler resume --failed`
-- Worktree refs and conflicts:
-  - `rive branch list/show/commit/abort/reject`
-  - `rive branch conflict show/reject`
-- Reusable workflows:
-  - `rive workflow validate/import/list/show/run/status`
-  - workflow packages can be a single `workflow.yaml` or a directory with
-    `workflow.yaml` plus `prompts/*.md`
+- Evidence/facts: `rive snapshot capture/list/show`, `rive evidence list`,
+  `team fact record`, `rive fact list/show`.
+- Agents/dispatches: `rive agent add/list/show`,
+  `rive dispatch create/list/show/cancel`, `team status/report/list`.
+- Debug: `rive debug trace ingest/list/show/session/export/install/uninstall`
+  and `rive debug trace usage`.
+- Runners: `rive runner opencode`, `rive runner codex`,
+  `rive runner orchestrator --runner opencode`.
+- Work DAG: `rive work create/list/show/inspect/edge add/accept/reopen/retry`,
+  `rive work graph inspect`, `team work create/edge/list/show/inspect/note`.
+- Delegation/scheduler: `team send --work <work_id> --wait`,
+  `rive scheduler run/status/resume`, `rive scheduler resume --failed`.
+- Worktree refs/conflicts: `rive branch list/show/commit/abort/reject`,
+  `rive branch conflict show/reject/retry-from-parent`.
+- Workflows: `rive workflow validate/import/list/show/run/status` with either
+  a single `workflow.yaml` or a package directory containing `prompts/*.md`.
 
 ## When to Use Rive
 
@@ -80,12 +66,9 @@ Use Rive when the request benefits from durable multi-agent coordination:
 - tasks where worker patches must be isolated and explicitly integrated;
 - dogfood where trace, artifact refs, and retry history matter.
 
-Do not use Rive for a tiny one-agent edit that is faster and clearer without
-orchestration.
+Do not use Rive for a tiny one-agent edit that is faster without orchestration.
 
 ## Setup
-
-Work from the repository root.
 
 ```sh
 rive init .
@@ -108,6 +91,10 @@ For production file mutation, prefer git worktree isolation:
 
 Use shared workspace mode only for controlled smoke tests, read-only flows, or
 cases where the user intentionally wants all workers in the same tree.
+
+Worktrees are seeded from the current parent workspace baseline, including
+accepted but uncommitted parent changes. Workers still edit only their isolated
+`$RIVE_WORKSPACE`.
 
 ## Plan a Work DAG
 
@@ -215,6 +202,12 @@ rive scheduler status --run <scheduler_run_id>
 rive work graph inspect --root <root>
 ```
 
+For live or failed runs, inspect scheduler status before deciding. It exposes
+`protocol.node_runs[].activity` with prompt/stdout/stderr refs and tails, branch
+ref/path, changed files, recent trace summaries, and structured
+`activity.trace.samples`; failures include `failure_kind`, `retryable`,
+`suggested_action`, and detail. These are neutral observability only.
+
 ## Reusable Workflow Templates
 
 Use workflows when a successful DAG should be repeated later with one command.
@@ -314,9 +307,21 @@ printf '%s\n' "Reject conflicting worker patch" | rive branch conflict reject <c
   --stdin
 ```
 
-Use the conflict record to decide between `reject`, retrying from current
-parent, or manually inspecting the worktree path. Do not hide conflict handling
-inside a worker summary.
+`conflict show` separates business conflict files from runtime pollution and
+suggests actions. To discard the conflicted branch and rerun the same work node
+from the current parent baseline:
+
+```sh
+rive branch conflict retry-from-parent <conflict_id> \
+  --worker opencode-worker-a \
+  --command-id retry-conflict-<node>-1 \
+  --acceptance-mode auto-committed \
+  --workspace-mode worktree \
+  --timeout-seconds 900
+```
+
+Use `open-conflict`/manual inspection only when a human needs to review the
+worktree path. Do not hide conflict handling inside a worker summary.
 
 ## Retry and Resume
 
@@ -353,7 +358,9 @@ Recovery semantics:
 - stale failed/active attempts are marked `superseded`;
 - old open/blocked dispatches are cancelled;
 - failure trace and refs remain inspectable;
-- replay of the retry command does not start another child process.
+- replay of the retry command does not start another child process;
+- same command ID with different retry parameters returns
+  `idempotency_conflict` before superseding/cancelling anything.
 
 Failure records include `failure_kind`, `retryable`, `suggested_action`, and
 `detail`. Common kinds include `certificate_error`, `network_error`,
@@ -449,9 +456,10 @@ Use workflow status for higher-level failure inspection:
 rive workflow status --run <workflow_run_id>
 ```
 
-The status response includes effective state and scheduler-node debug refs such
-as prompt/stdout/stderr refs. Use those refs to diagnose failures; never use
-them to mark success.
+Status responses include effective state, scheduler-node prompt/stdout/stderr
+refs, and recent neutral trace samples such as tool calls, session status, file
+changes, command errors, and text previews. Use them to understand activity,
+never to mark success or label a run off-track by heuristic.
 
 ## Common Failure Handling
 
@@ -468,8 +476,8 @@ them to mark success.
   reviewable nodes before root accept.
 - `worktree_ref_not_committed`: commit or reject the pending integration before
   guarded accept.
-- `worktree_patch_conflict`: inspect `rive branch conflict show`, then reject,
-  retry from parent, or manually review the branch path.
+- `worktree_patch_conflict`: inspect `rive branch conflict show`, then
+  `retry-from-parent`, reject, or manually review the branch path.
 - `idempotency_conflict`: use a new command ID only when the request is
   intentionally different.
 
@@ -483,6 +491,7 @@ Report ledger-backed results:
 - important node states and pending reviewable/blocked nodes;
 - dispatch IDs for worker attempts;
 - integration IDs, conflict IDs, and committed refs;
+- activity/failure summary from scheduler status when a run needed diagnosis;
 - validation commands run by workers or final judge;
 - unresolved risks, failures, rejected integrations, or retry decisions.
 
