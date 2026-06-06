@@ -7,11 +7,6 @@ import (
 
 const ComponentOfRetriever ComponentType = "Retriever"
 
-type Document struct {
-	Content  string
-	Metadata map[string]string
-}
-
 type Query struct {
 	Text string
 	K    int

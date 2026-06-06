@@ -2,6 +2,35 @@ package compose
 
 import "errors"
 
+// RoleType constants — canonical role aliases.
+const (
+	User RoleType = "user"
+)
+
+// DataType describes parameter primitive types for JSON Schema generation.
+type DataType string
+
+const (
+	DataTypeString  DataType = "string"
+	DataTypeInteger DataType = "integer"
+	DataTypeBoolean DataType = "boolean"
+	DataTypeNumber  DataType = "number"
+	DataTypeObject  DataType = "object"
+	DataTypeArray   DataType = "array"
+)
+
+// ChatMessagePartType enumerates multi-modal content part variants.
+type ChatMessagePartType string
+
+const (
+	ChatMessagePartTypeText             ChatMessagePartType = "text"
+	ChatMessagePartTypeImageURL         ChatMessagePartType = "image_url"
+	ChatMessagePartTypeAudioURL         ChatMessagePartType = "audio_url"
+	ChatMessagePartTypeVideoURL         ChatMessagePartType = "video_url"
+	ChatMessagePartTypeFileURL          ChatMessagePartType = "file_url"
+	ChatMessagePartTypeToolSearchResult ChatMessagePartType = "tool_search_result"
+)
+
 type NodeTriggerMode string
 
 const (

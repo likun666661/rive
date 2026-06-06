@@ -223,10 +223,10 @@
 > **本章扩展 I3 Bridge Adapter 模式,实现 PromptTemplate 渲染、Tool 领域接口与 ToolsNode 工具执行节点,支持 Workflow/Chain/Graph 三种编排方式,构建完整的确定性 Tool Calling Pipeline。**
 
 #### 34. ToolCall Schema 数据模型 (schema.go)
-- `ToolCall{ID, Type, Function}` / `ToolCallFunction{Name, Arguments}`: 表示模型发出的工具调用请求
-- `ToolInfo{Name, Desc, ParamsOneOf}`: 工具元信息 (用于注册和校验)
-- `ParamsOneOf{Params map[string]*ParameterInfo}`: 工具参数 Schema
-- `ToolResult{Text}`: 工具执行结果封装
+- `ToolCall{Index, ID, Type, Function, Extra}` / `ToolCallFunction{Name, Arguments}`: 表示模型发出的工具调用请求,其中 `Index` 支持流式 delta 合并
+- `ToolInfo{Name, Desc, ParamsOneOf, Extra}`: 工具元信息 (用于注册和校验)
+- `NewParamsOneOfByParams(params)` / `NewParamsOneOfByJSONSchema(schema)`: 工具参数 Schema 的两种构造路径,通过 `ToJSONSchema()` 统一输出
+- `ToolResult{Text, Images, Audio, Video, Files}`: 工具执行结果封装
 - `Message.ToolCalls` 字段扩展: 在 `chatmodel.go` 的 `Message` 结构体中新增 `ToolCalls []ToolCall`
 
 #### 35. ChatTemplate 接口与 MessageTemplate (prompt.go)
@@ -267,6 +267,40 @@
 
 ---
 
+### 七、第六章: Canonical Schema / Stream Concat / Provider Adapters
+
+> **本章将 ChatModel、Retriever、Tool 与 Provider wire format 统一到规范 Schema 层,通过 `Message` / `AgenticMessage` 两种模型展示多 Provider 互操作,并补齐流式 chunk concat 行为。**
+
+#### 41. Canonical Schema 扩展
+- `types.go`: 新增 `User` 规范角色、`DataType`、`ChatMessagePartType`。
+- `schema.go`: `ToolCall` 增加 `Index` 和 `Extra`;`ToolInfo` 增加 `Extra`;`ParamsOneOf` 支持轻量参数树与完整 JSON Schema;`ToolResult` 支持 text/images/audio/video/files;`Document` 扩展 ID/meta/embedding/score。
+- `chatmodel.go`: `Message` 增加 `ToolName`、多模态输入/输出 part、`ResponseMeta`、`ReasoningContent`、`Extra`;`ResponseMeta` 包含 usage/logprobs 和 OpenAI/Claude/Gemini 类型化扩展槽位。
+
+#### 42. Stream concat 注册表
+- `concat.go`: `RegisterStreamChunkConcatFunc[T]` 建立类型到 concat 函数的注册表,`ConcatItems` 提供直接合并入口。
+- `ConcatMessages`: 拼接内容和 reasoning,按 `ToolCall.Index` 分组合并流式 tool call delta,冲突时报错,保留最后一个非空 `ResponseMeta`。
+- `ConcatToolResults`: 拼接文本并追加多模态工具结果。
+- `stream.go`: `Concat` 在旧式 `RegisterConcatFunc` 后接入 Chapter 6 concat 注册表,使 `*Message` stream chunk 能折叠成完整消息。
+
+#### 43. Provider Adapter Skeletons
+- `provider.go`: 定义 `ContentBlock`、`AgenticMessage`、OpenAI/Claude/Gemini provider interface 和常用内容块构造器。
+- `provider_openai.go`: OpenAI role/message/tool_calls/tool_call_id ↔ 规范 `Message`。
+- `provider_claude.go`: Claude `text` / `image` / `tool_use` / `tool_result` content blocks ↔ `AgenticMessage`。
+- `provider_gemini.go`: Gemini `parts` / `functionCall` / `functionResponse` ↔ `AgenticMessage`,并提供经典 `Message` 路径。
+- `FakeOpenAIProvider` / `FakeClaudeProvider` / `FakeGeminiProvider`: 教育桩实现,用于证明下游 ChatModel/Retriever/Tool 消费规范类型而不感知 Provider 来源。
+
+#### 44. 测试覆盖
+- `schema_test.go`: schema 字段、JSON Schema 输出、多模态 ToolResult、Document、Message metadata。
+- `concat_test.go`: concat 注册表、Message 内容/reasoning/tool call delta、ToolResult 多模态合并、`Concat` stream pipe 集成。
+- `provider_test.go`: OpenAI/Claude/Gemini 双向转换、round trip、fake provider 接口、跨 Provider 到 ChatModel/Retriever/Tool 的消费示例。
+
+#### 45. 明确不包含
+- 外部 Provider SDK 调用、鉴权、真实 HTTP 请求。
+- 完整 Eino `schema/openai` / `schema/claude` / `schema/gemini` 子包拆分。
+- 完整 AgenticMessage block 全量枚举、序列化注册和 provider-specific streaming protocol。
+
+---
+
 ## 关键文件导览
 
 | 文件 | 职责 |
@@ -303,7 +337,15 @@
 | `stream.go` | PipeStreamReader/PipeStreamWriter、Copy、Merge、Concat |
 | `stream_test.go` | 20 测试: Pipe/Copy/Merge/Concat 并发安全 |
 | `callbacks.go` | RunInfo、Handler、HandlerBuilder、CallbackWrapper、流输入/输出副本 |
-| `schema.go` | ToolCall / ToolCallFunction / ToolInfo / ToolResult 数据模型 |
+| `schema.go` | ToolCall / ToolInfo / ParamsOneOf / ToolResult / Document 规范数据模型 |
+| `schema_test.go` | Chapter 6 schema 字段、JSON Schema、多模态结果测试 |
+| `concat.go` | Chapter 6 stream chunk concat 注册表和 Message/ToolResult 合并规则 |
+| `concat_test.go` | Chapter 6 concat 注册表、tool call delta、stream pipe 集成测试 |
+| `provider.go` | ContentBlock / AgenticMessage 规范类型和 provider interface |
+| `provider_openai.go` | OpenAI message/request ↔ 规范 Message adapter |
+| `provider_claude.go` | Claude content blocks ↔ 规范 AgenticMessage adapter |
+| `provider_gemini.go` | Gemini parts/functionCall/functionResponse ↔ 规范类型 adapter |
+| `provider_test.go` | Provider adapter round trip 与跨组件消费测试 |
 | `prompt.go` | ChatTemplate 接口、MessageTemplate ({{variable}} 替换)、ChatTemplateComponent |
 | `prompt_test.go` | 6 测试: MessageTemplate / FakeChatTemplate / ChatTemplateComponent |
 | `prompt_tool_bridge.go` | BridgeTool 接口、promptTemplateBridge / toolsNodeBridge、NewToolsNodeLambda、Workflow 便捷方法 |
@@ -311,7 +353,7 @@
 | `callbacks_test.go` | 25 测试: 5 阶段时序、上下文隔离、TimingChecker、CbStreamReader |
 | `graph_test.go` | 80+ 测试: DAG/Pregel/边界/EventLog/Branch/Callback 集成 |
 | `cmd/example/main.go` | 综合示例程序 (20 个场景,覆盖 Graph/DAG/Pregel/FieldMapping/Workflow/Chain/Parallel/Branch/Stream/Collect/Transform/Callback/Bridge/RAG/ToolCallingPipeline) |
-| `research/` | 8 个研究文档: ch2 实现契约与验证、ch3 运行时契约、ch4 R1 组件契约、ch4 R2 桥接审计、ch5 实现契约、ch5 组件差距审计 |
+| `research/` | 研究文档: ch2/ch3/ch4/ch5/ch6 实现契约、差距审计、验证记录和 Provider Schema 契约 |
 
 ---
 

@@ -520,3 +520,385 @@ func TestChatModelStreamTokenByToken(t *testing.T) {
 		t.Fatalf("expected 'Hello World!', got %q", assembled)
 	}
 }
+
+func TestUserMessage(t *testing.T) {
+	m := UserMessage("hello")
+	if m.Role != User {
+		t.Fatalf("expected User role, got %q", m.Role)
+	}
+	if m.Content != "hello" {
+		t.Fatalf("expected 'hello', got %q", m.Content)
+	}
+}
+
+func TestRoleType_UserAlias(t *testing.T) {
+	if User != "user" {
+		t.Fatalf("expected User='user', got %q", User)
+	}
+	if Human != "human" {
+		t.Fatalf("expected Human='human', got %q", Human)
+	}
+	if User == Human {
+		t.Fatal("User and Human must be distinct role constants")
+	}
+}
+
+func TestMessage_NewFields_ZeroValueSafe(t *testing.T) {
+	msg := &Message{}
+	if msg.Role != "" {
+		t.Fatalf("expected zero Role, got %q", msg.Role)
+	}
+	if msg.Content != "" {
+		t.Fatalf("expected zero Content, got %q", msg.Content)
+	}
+	if msg.ReasoningContent != "" {
+		t.Fatalf("expected zero ReasoningContent, got %q", msg.ReasoningContent)
+	}
+	if msg.ResponseMeta != nil {
+		t.Fatal("expected nil ResponseMeta")
+	}
+	if msg.ToolName != "" {
+		t.Fatalf("expected zero ToolName, got %q", msg.ToolName)
+	}
+	if msg.Extra != nil {
+		t.Fatal("expected nil Extra")
+	}
+	if msg.UserInputMultiContent != nil {
+		t.Fatal("expected nil UserInputMultiContent")
+	}
+	if msg.AssistantGenMultiContent != nil {
+		t.Fatal("expected nil AssistantGenMultiContent")
+	}
+}
+
+func TestMessage_ReasoningContent(t *testing.T) {
+	msg := &Message{Role: Assistant, Content: "The answer is 42", ReasoningContent: "I think the answer is 42 because..."}
+	if msg.ReasoningContent != "I think the answer is 42 because..." {
+		t.Fatalf("expected reasoning content, got %q", msg.ReasoningContent)
+	}
+}
+
+func TestMessage_ResponseMeta_Usage(t *testing.T) {
+	msg := &Message{
+		Role:    Assistant,
+		Content: "response",
+		ResponseMeta: &ResponseMeta{
+			ID:           "resp-1",
+			Model:        "gpt-4",
+			FinishReason: "stop",
+			Usage: &TokenUsage{
+				PromptTokens:     10,
+				CompletionTokens: 20,
+				TotalTokens:      30,
+				ReasoningTokens:  5,
+			},
+		},
+	}
+	if msg.ResponseMeta.ID != "resp-1" {
+		t.Fatalf("expected resp-1, got %q", msg.ResponseMeta.ID)
+	}
+	if msg.ResponseMeta.Model != "gpt-4" {
+		t.Fatalf("expected gpt-4, got %q", msg.ResponseMeta.Model)
+	}
+	if msg.ResponseMeta.FinishReason != "stop" {
+		t.Fatalf("expected stop, got %q", msg.ResponseMeta.FinishReason)
+	}
+	if msg.ResponseMeta.Usage.PromptTokens != 10 {
+		t.Fatalf("expected 10 prompt tokens, got %d", msg.ResponseMeta.Usage.PromptTokens)
+	}
+	if msg.ResponseMeta.Usage.CompletionTokens != 20 {
+		t.Fatalf("expected 20 completion tokens, got %d", msg.ResponseMeta.Usage.CompletionTokens)
+	}
+	if msg.ResponseMeta.Usage.TotalTokens != 30 {
+		t.Fatalf("expected 30 total tokens, got %d", msg.ResponseMeta.Usage.TotalTokens)
+	}
+	if msg.ResponseMeta.Usage.ReasoningTokens != 5 {
+		t.Fatalf("expected 5 reasoning tokens, got %d", msg.ResponseMeta.Usage.ReasoningTokens)
+	}
+}
+
+func TestMessage_MultiContent_Input(t *testing.T) {
+	text := "What's in this image?"
+	msg := &Message{
+		Role: User,
+		UserInputMultiContent: []MessageInputPart{
+			{
+				Type: ChatMessagePartTypeText,
+				Text: &text,
+			},
+			{
+				Type: ChatMessagePartTypeImageURL,
+				Image: &MessageInputImage{
+					URL:    "https://example.com/photo.png",
+					Detail: "high",
+				},
+			},
+		},
+	}
+	if len(msg.UserInputMultiContent) != 2 {
+		t.Fatalf("expected 2 input parts, got %d", len(msg.UserInputMultiContent))
+	}
+	if msg.UserInputMultiContent[0].Type != ChatMessagePartTypeText {
+		t.Fatalf("expected text part type, got %q", msg.UserInputMultiContent[0].Type)
+	}
+	if *msg.UserInputMultiContent[0].Text != "What's in this image?" {
+		t.Fatalf("expected text content, got %q", *msg.UserInputMultiContent[0].Text)
+	}
+	if msg.UserInputMultiContent[1].Type != ChatMessagePartTypeImageURL {
+		t.Fatalf("expected image part type, got %q", msg.UserInputMultiContent[1].Type)
+	}
+	if msg.UserInputMultiContent[1].Image.URL != "https://example.com/photo.png" {
+		t.Fatalf("expected image URL, got %q", msg.UserInputMultiContent[1].Image.URL)
+	}
+}
+
+func TestMessage_MultiContent_Output(t *testing.T) {
+	text := "Here is the generated image:"
+	reasoning := "Let me think about this..."
+	msg := &Message{
+		Role:    Assistant,
+		Content: text,
+		AssistantGenMultiContent: []MessageOutputPart{
+			{
+				Type: ChatMessagePartTypeText,
+				Text: &text,
+			},
+			{
+				Type:      ChatMessagePartTypeText,
+				Reasoning: &reasoning,
+			},
+		},
+	}
+	if len(msg.AssistantGenMultiContent) != 2 {
+		t.Fatalf("expected 2 output parts, got %d", len(msg.AssistantGenMultiContent))
+	}
+	if msg.AssistantGenMultiContent[0].Type != ChatMessagePartTypeText {
+		t.Fatalf("expected text part type, got %q", msg.AssistantGenMultiContent[0].Type)
+	}
+	if msg.AssistantGenMultiContent[1].Reasoning == nil || *msg.AssistantGenMultiContent[1].Reasoning != reasoning {
+		t.Fatalf("expected reasoning content in output part")
+	}
+}
+
+func TestMessage_ToolName(t *testing.T) {
+	msg := &Message{
+		Role:     Tool,
+		ToolName: "get_weather",
+		Content:  "Sunny, 72F",
+	}
+	if msg.ToolName != "get_weather" {
+		t.Fatalf("expected get_weather, got %q", msg.ToolName)
+	}
+}
+
+func TestMessage_Extra(t *testing.T) {
+	msg := &Message{
+		Role:    Assistant,
+		Content: "response",
+		Extra:   map[string]any{"custom_key": "custom_value", "count": 42},
+	}
+	if msg.Extra["custom_key"] != "custom_value" {
+		t.Fatalf("expected custom_value, got %v", msg.Extra["custom_key"])
+	}
+	if msg.Extra["count"] != 42 {
+		t.Fatalf("expected 42, got %v", msg.Extra["count"])
+	}
+}
+
+func TestResponseMeta_OpenAIExtension(t *testing.T) {
+	meta := &ResponseMeta{
+		ID:           "resp-openai-1",
+		Model:        "gpt-4o",
+		FinishReason: "stop",
+		OpenAIExtension: &OpenAIRespMetaExtension{
+			ID:          "resp-openai-ext-1",
+			Status:      "completed",
+			ServiceTier: "default",
+		},
+	}
+	if meta.OpenAIExtension == nil {
+		t.Fatal("expected OpenAIExtension")
+	}
+	if meta.OpenAIExtension.ID != "resp-openai-ext-1" {
+		t.Fatalf("expected ext id, got %q", meta.OpenAIExtension.ID)
+	}
+	if meta.OpenAIExtension.Status != "completed" {
+		t.Fatalf("expected completed, got %q", meta.OpenAIExtension.Status)
+	}
+}
+
+func TestResponseMeta_GeminiExtension(t *testing.T) {
+	meta := &ResponseMeta{
+		ID:           "resp-gemini-1",
+		Model:        "gemini-2.0-flash",
+		FinishReason: "STOP",
+		GeminiExtension: &GeminiRespMetaExtension{
+			ID:           "gemini-ext-1",
+			FinishReason: "STOP",
+			GroundingMeta: &GeminiGroundingMetadata{
+				WebSearchQueries: []string{"golang tutorial"},
+			},
+		},
+	}
+	if meta.GeminiExtension == nil {
+		t.Fatal("expected GeminiExtension")
+	}
+	if meta.GeminiExtension.ID != "gemini-ext-1" {
+		t.Fatalf("expected gemini-ext-1, got %q", meta.GeminiExtension.ID)
+	}
+	if meta.GeminiExtension.GroundingMeta == nil {
+		t.Fatal("expected GroundingMeta")
+	}
+	if len(meta.GeminiExtension.GroundingMeta.WebSearchQueries) != 1 {
+		t.Fatalf("expected 1 web search query, got %d", len(meta.GeminiExtension.GroundingMeta.WebSearchQueries))
+	}
+}
+
+func TestResponseMeta_ClaudeExtension(t *testing.T) {
+	meta := &ResponseMeta{
+		ID:           "resp-claude-1",
+		Model:        "claude-3-5-sonnet",
+		FinishReason: "end_turn",
+		ClaudeExtension: &ClaudeRespMetaExtension{
+			ID:         "claude-ext-1",
+			StopReason: "end_turn",
+			StopDetails: &ClaudeStopDetails{
+				Category:    "stop_sequence",
+				Explanation: "Reached stop sequence",
+			},
+		},
+	}
+	if meta.ClaudeExtension == nil {
+		t.Fatal("expected ClaudeExtension")
+	}
+	if meta.ClaudeExtension.StopReason != "end_turn" {
+		t.Fatalf("expected end_turn, got %q", meta.ClaudeExtension.StopReason)
+	}
+	if meta.ClaudeExtension.StopDetails == nil {
+		t.Fatal("expected StopDetails")
+	}
+	if meta.ClaudeExtension.StopDetails.Category != "stop_sequence" {
+		t.Fatalf("expected stop_sequence, got %q", meta.ClaudeExtension.StopDetails.Category)
+	}
+}
+
+func TestTokenUsage_ReasoningTokens(t *testing.T) {
+	usage := &TokenUsage{
+		PromptTokens:     50,
+		CompletionTokens: 100,
+		TotalTokens:      150,
+		ReasoningTokens:  30,
+	}
+	if usage.ReasoningTokens != 30 {
+		t.Fatalf("expected 30 reasoning tokens, got %d", usage.ReasoningTokens)
+	}
+	if usage.TotalTokens != usage.PromptTokens+usage.CompletionTokens {
+		t.Fatalf("total tokens should be 150, got %d", usage.TotalTokens)
+	}
+}
+
+func TestChatMessagePartTypeConstants(t *testing.T) {
+	if ChatMessagePartTypeText != "text" {
+		t.Fatalf("expected ChatMessagePartTypeText='text', got %q", ChatMessagePartTypeText)
+	}
+	if ChatMessagePartTypeImageURL != "image_url" {
+		t.Fatalf("expected ChatMessagePartTypeImageURL='image_url', got %q", ChatMessagePartTypeImageURL)
+	}
+	if ChatMessagePartTypeAudioURL != "audio_url" {
+		t.Fatalf("expected ChatMessagePartTypeAudioURL='audio_url', got %q", ChatMessagePartTypeAudioURL)
+	}
+	if ChatMessagePartTypeVideoURL != "video_url" {
+		t.Fatalf("expected ChatMessagePartTypeVideoURL='video_url', got %q", ChatMessagePartTypeVideoURL)
+	}
+	if ChatMessagePartTypeFileURL != "file_url" {
+		t.Fatalf("expected ChatMessagePartTypeFileURL='file_url', got %q", ChatMessagePartTypeFileURL)
+	}
+	if ChatMessagePartTypeToolSearchResult != "tool_search_result" {
+		t.Fatalf("expected ChatMessagePartTypeToolSearchResult='tool_search_result', got %q", ChatMessagePartTypeToolSearchResult)
+	}
+}
+
+func TestLogProbs(t *testing.T) {
+	lp := &LogProbs{
+		Content: []*LogProbInfo{
+			{Token: "Hello", LogProb: -0.5, Bytes: []int32{72, 101, 108, 108, 111}},
+			{Token: " World", LogProb: -0.3, Bytes: []int32{32, 87, 111, 114, 108, 100}},
+		},
+	}
+	if len(lp.Content) != 2 {
+		t.Fatalf("expected 2 log prob infos, got %d", len(lp.Content))
+	}
+	if lp.Content[0].Token != "Hello" {
+		t.Fatalf("expected 'Hello', got %q", lp.Content[0].Token)
+	}
+	if lp.Content[1].LogProb != -0.3 {
+		t.Fatalf("expected -0.3, got %f", lp.Content[1].LogProb)
+	}
+}
+
+func TestToolSearchResult(t *testing.T) {
+	tsr := &ToolSearchResult{
+		ToolName: "search_web",
+		Score:    0.89,
+	}
+	if tsr.ToolName != "search_web" {
+		t.Fatalf("expected search_web, got %q", tsr.ToolName)
+	}
+	if tsr.Score != 0.89 {
+		t.Fatalf("expected 0.89, got %f", tsr.Score)
+	}
+}
+
+func TestMessageOutputImage(t *testing.T) {
+	img := &MessageOutputImage{
+		URL:    "https://example.com/gen.png",
+		Data:   []byte{0x89, 0x50, 0x4E, 0x47},
+		Format: "png",
+	}
+	if img.URL != "https://example.com/gen.png" {
+		t.Fatalf("expected URL, got %q", img.URL)
+	}
+	if img.Format != "png" {
+		t.Fatalf("expected png, got %q", img.Format)
+	}
+	if len(img.Data) != 4 {
+		t.Fatalf("expected 4 bytes of data, got %d", len(img.Data))
+	}
+}
+
+func TestGeminiGroundingMetadata(t *testing.T) {
+	gm := &GeminiGroundingMetadata{
+		GroundingChunks: []*GeminiGroundingChunk{
+			{Web: &GeminiWebSource{Title: "Go Docs", URI: "https://go.dev", Domain: "go.dev"}},
+		},
+		GroundingSupports: []*GeminiGroundingSupport{
+			{Segment: "Go is a programming language", ConfidenceScores: []float64{0.95}},
+		},
+		SearchEntryPoint: &GeminiSearchEntryPoint{
+			RenderedContent: "Search results for Go",
+		},
+		WebSearchQueries: []string{"what is golang"},
+	}
+	if len(gm.GroundingChunks) != 1 {
+		t.Fatalf("expected 1 grounding chunk, got %d", len(gm.GroundingChunks))
+	}
+	if gm.GroundingChunks[0].Web.Title != "Go Docs" {
+		t.Fatalf("expected 'Go Docs', got %q", gm.GroundingChunks[0].Web.Title)
+	}
+	if len(gm.GroundingSupports) != 1 {
+		t.Fatalf("expected 1 grounding support, got %d", len(gm.GroundingSupports))
+	}
+	if gm.SearchEntryPoint == nil {
+		t.Fatal("expected SearchEntryPoint")
+	}
+}
+
+func TestSystemMessage_Role(t *testing.T) {
+	m := SystemMessage("You are helpful.")
+	if m.Role != System {
+		t.Fatalf("expected System role, got %q", m.Role)
+	}
+	if m.Content != "You are helpful." {
+		t.Fatalf("expected content, got %q", m.Content)
+	}
+}

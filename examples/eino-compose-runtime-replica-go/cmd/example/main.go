@@ -11,7 +11,7 @@ import (
 )
 
 func main() {
-	fmt.Println("=== Eino Compose Runtime Replica — Chapter 1 / 2 / 3 / 4 / 5 综合示例 ===")
+	fmt.Println("=== Eino Compose Runtime Replica — Chapter 1 / 2 / 3 / 4 / 5 / 6 综合示例 ===")
 	fmt.Println()
 
 	fmt.Println("========== 第一章示例 (Graph/DAG/Pregel/Info/EventLog) ==========")
@@ -56,6 +56,11 @@ func main() {
 	fmt.Println("========== 第四章示例 (Checkpoint / Interrupt / Resume) ==========")
 	fmt.Println()
 	example18_CheckpointInterruptResume()
+
+	fmt.Println()
+	fmt.Println("========== 第六章示例 (Schema / Provider Adapter 互操作) ==========")
+	fmt.Println()
+	example21_SchemaProviderAdapters()
 }
 
 func example1_DAGBasic() {
@@ -1482,5 +1487,106 @@ func example18_CheckpointInterruptResume() {
 		return
 	}
 	fmt.Printf("  Resume result: %s\n", result)
+	fmt.Println()
+}
+
+func example21_SchemaProviderAdapters() {
+	fmt.Println("--- Example 21: Canonical Schema / Provider Adapter ---")
+	fmt.Println()
+	fmt.Println("# 问题: OpenAI / Claude / Gemini 的消息线格式不同, Graph 节点如果直接依赖 provider payload 就无法互换。")
+	fmt.Println("# 解法: provider adapter 把 native payload 归一化成 canonical Message / AgenticMessage, 组件只消费规范类型。")
+	fmt.Println()
+
+	openAIReq := &compose.OpenAIChatRequest{
+		Model: "gpt-4",
+		Messages: []*compose.OpenAIMessage{
+			{Role: "user", Content: "weather in Paris?"},
+			{
+				Role: "assistant",
+				ToolCalls: []compose.ToolCall{
+					{
+						ID:   "call_weather",
+						Type: "function",
+						Function: compose.ToolCallFunction{
+							Name:      "get_weather",
+							Arguments: `{"city":"Paris"}`,
+						},
+					},
+				},
+			},
+		},
+	}
+	openAICanonical := compose.ToCanonicalMessages(openAIReq)
+	fmt.Printf("  OpenAI-like → canonical Message: role=%s tool=%s args=%s\n",
+		openAICanonical[1].Role,
+		openAICanonical[1].ToolCalls[0].Function.Name,
+		openAICanonical[1].ToolCalls[0].Function.Arguments,
+	)
+
+	claudeReq := &compose.ClaudeChatRequest{
+		Model: "claude-3",
+		Messages: []*compose.ClaudeMessage{
+			{
+				Role: "assistant",
+				Content: []*compose.ClaudeContentBlock{
+					{Type: "text", Text: "Checking..."},
+					{Type: "tool_use", ID: "toolu_weather", Name: "get_weather", Input: map[string]string{"city": "Paris"}},
+				},
+			},
+		},
+	}
+	claudeCanonical := compose.ToCanonicalAgenticMessages(claudeReq)
+	fmt.Printf("  Claude-like → canonical AgenticMessage: role=%s blocks=%d first_tool=%s\n",
+		claudeCanonical[0].Role,
+		len(claudeCanonical[0].ContentBlocks),
+		compose.AgenticMessageToolCalls(claudeCanonical[0])[0].Name,
+	)
+
+	geminiReq := &compose.GeminiChatRequest{
+		Contents: []*compose.GeminiContent{
+			{
+				Role: "model",
+				Parts: []*compose.GeminiPart{
+					{Text: "Checking..."},
+					{FunctionCall: &compose.GeminiFunctionCall{Name: "get_weather", Args: map[string]any{"city": "Paris"}}},
+				},
+			},
+		},
+	}
+	geminiCanonical := compose.ToCanonicalAgenticMessagesFromGemini(geminiReq)
+	fmt.Printf("  Gemini-like → canonical AgenticMessage: role=%s blocks=%d first_text=%q\n",
+		geminiCanonical[0].Role,
+		len(geminiCanonical[0].ContentBlocks),
+		compose.AgenticMessageFirstText(geminiCanonical[0]),
+	)
+
+	index := 0
+	merged, err := compose.ConcatItems([]*compose.Message{
+		{
+			Role: compose.Assistant,
+			ToolCalls: []compose.ToolCall{
+				{Index: &index, ID: "call_weather", Type: "function", Function: compose.ToolCallFunction{Name: "get_weather", Arguments: `{"city":`}},
+			},
+		},
+		{
+			ToolCalls: []compose.ToolCall{
+				{Index: &index, ID: "call_weather", Type: "function", Function: compose.ToolCallFunction{Name: "get_weather", Arguments: `"Paris"}`}},
+			},
+		},
+	})
+	if err != nil {
+		fmt.Printf("  Concat error: %v\n\n", err)
+		return
+	}
+	fmt.Printf("  Stream concat: tool=%s merged_args=%s\n",
+		merged.ToolCalls[0].Function.Name,
+		merged.ToolCalls[0].Function.Arguments,
+	)
+	fmt.Println()
+	fmt.Println("# 关键点:")
+	fmt.Println("#   - Provider adapter 是边界层, Graph/Workflow/Chain 不识别 OpenAI/Claude/Gemini native payload。")
+	fmt.Println("#   - Message 兼容经典 chat/tool_call 语义; AgenticMessage 用 ContentBlock 表示更丰富的 agentic payload。")
+	fmt.Println("#   - RegisterStreamChunkConcatFunc/ConcatItems 把流式合并交给类型注册表, compose runtime 不写 provider 分支。")
+	fmt.Println("#   - 本示例只做教育版 native payload skeleton, 不接真实 provider SDK。")
 	fmt.Println()
 }

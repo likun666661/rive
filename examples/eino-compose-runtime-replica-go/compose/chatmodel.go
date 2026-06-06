@@ -16,12 +16,179 @@ const (
 	Tool      RoleType = "tool"
 )
 
+// Message is the canonical chat message type.
+//
+// Role-driven model: Assistant carries ToolCalls, Tool carries ToolCallID.
+// Multi-modal content goes in UserInputMultiContent / AssistantGenMultiContent.
+// Provider-specific metadata lives in ResponseMeta with typed extension slots.
 type Message struct {
-	Role       RoleType
-	Content    string
-	ToolCalls  []ToolCall
-	ToolCallID string
-	Name       string
+	Role                     RoleType
+	Content                  string
+	ToolCalls                []ToolCall
+	ToolCallID               string
+	Name                     string
+	ToolName                 string
+	UserInputMultiContent    []MessageInputPart
+	AssistantGenMultiContent []MessageOutputPart
+	ResponseMeta             *ResponseMeta
+	ReasoningContent         string
+	Extra                    map[string]any
+}
+
+// ResponseMeta carries completion metadata and typed provider extension slots.
+type ResponseMeta struct {
+	ID              string
+	Model           string
+	FinishReason    string
+	Usage           *TokenUsage
+	LogProbs        *LogProbs
+	OpenAIExtension *OpenAIRespMetaExtension
+	GeminiExtension *GeminiRespMetaExtension
+	ClaudeExtension *ClaudeRespMetaExtension
+	Extension       any
+}
+
+// TokenUsage records token consumption for a single completion.
+type TokenUsage struct {
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+	ReasoningTokens  int
+}
+
+// LogProbs gathers per-token log probabilities.
+type LogProbs struct {
+	Content []*LogProbInfo
+}
+
+type LogProbInfo struct {
+	Token       string
+	LogProb     float64
+	Bytes       []int32
+	TopLogProbs map[string]float64
+}
+
+// MessageInputPart is a tagged union for user/external multi-modal input parts.
+type MessageInputPart struct {
+	Type             ChatMessagePartType
+	Text             *string
+	Image            *MessageInputImage
+	Audio            *MessageInputAudio
+	Video            *MessageInputVideo
+	File             *MessageInputFile
+	ToolSearchResult *ToolSearchResult
+}
+
+type MessageInputImage struct {
+	URL    string
+	Detail string
+}
+
+type MessageInputAudio struct {
+	URL string
+}
+
+type MessageInputVideo struct {
+	URL string
+}
+
+type MessageInputFile struct {
+	URL string
+}
+
+// MessageOutputPart is a tagged union for model multi-modal output parts.
+type MessageOutputPart struct {
+	Type      ChatMessagePartType
+	Text      *string
+	Image     *MessageOutputImage
+	Audio     *MessageOutputAudio
+	Video     *MessageOutputVideo
+	Reasoning *string
+}
+
+type MessageOutputImage struct {
+	URL    string
+	Data   []byte
+	Format string
+}
+
+type MessageOutputAudio struct {
+	URL    string
+	Data   []byte
+	Format string
+}
+
+type MessageOutputVideo struct {
+	URL    string
+	Data   []byte
+	Format string
+}
+
+// ToolSearchResult represents a tool-match from a search request.
+type ToolSearchResult struct {
+	ToolName string
+	Score    float64
+}
+
+// Provider extension stubs for ResponseMeta.
+
+type OpenAIRespMetaExtension struct {
+	ID                   string
+	Status               string
+	PreviousResponseID   string
+	IncompleteDetails    *OpenAIIncompleteDetails
+	ServiceTier          string
+	CreatedAt            int64
+	PromptCacheRetention string
+}
+
+type OpenAIIncompleteDetails struct {
+	Reason string
+}
+
+type ClaudeRespMetaExtension struct {
+	ID          string
+	StopReason  string
+	StopDetails *ClaudeStopDetails
+}
+
+type ClaudeStopDetails struct {
+	Category    string
+	Explanation string
+}
+
+type GeminiRespMetaExtension struct {
+	ID            string
+	FinishReason  string
+	GroundingMeta *GeminiGroundingMetadata
+}
+
+type GeminiGroundingMetadata struct {
+	GroundingChunks   []*GeminiGroundingChunk
+	GroundingSupports []*GeminiGroundingSupport
+	SearchEntryPoint  *GeminiSearchEntryPoint
+	WebSearchQueries  []string
+}
+
+type GeminiGroundingChunk struct {
+	Web *GeminiWebSource
+}
+
+type GeminiWebSource struct {
+	Title  string
+	URI    string
+	Domain string
+}
+
+type GeminiGroundingSupport struct {
+	Segment               string
+	ConfidenceScores      []float64
+	GroundingChunkIndices []int32
+}
+
+type GeminiSearchEntryPoint struct {
+	RenderedContent string
+	SDKBlob         string
 }
 
 type ChatModel interface {
@@ -161,4 +328,9 @@ func AssistantMessage(content string) *Message {
 
 func ToolMessage(content string, toolCallID string) *Message {
 	return &Message{Role: Tool, Content: content, ToolCallID: toolCallID}
+}
+
+// UserMessage creates a Message with the canonical User role.
+func UserMessage(content string) *Message {
+	return &Message{Role: User, Content: content}
 }

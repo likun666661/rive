@@ -1,6 +1,37 @@
-# CHANGELOG — 第二/三/四/五章 & I3 Bridge Adapter 示例与文档更新
+# CHANGELOG — 第二/三/四/五/六章 & I3 Bridge Adapter 示例与文档更新
 
-本文档记录对 `examples/eino-compose-runtime-replica-go` 的第二章 (FieldMapping / Workflow / Chain / Parallel / Branch)、第三章 (Runnable Stream / Collect / Transform / Callback)、第四章 (ChatModel + Retriever 组件接口)、第五章 (PromptTemplate / Tool / ToolsNode)、I3 Bridge Adapter 与桥接审计 (R1/R2) 的示例补全与文档更新。
+本文档记录对 `examples/eino-compose-runtime-replica-go` 的第二章 (FieldMapping / Workflow / Chain / Parallel / Branch)、第三章 (Runnable Stream / Collect / Transform / Callback)、第四章 (ChatModel + Retriever 组件接口)、第五章 (PromptTemplate / Tool / ToolsNode)、第六章 (Canonical Schema / Stream Concat / Provider Adapters)、I3 Bridge Adapter 与桥接审计 (R1/R2) 的示例补全与文档更新。
+
+---
+
+## Ch6: Canonical Schema / Stream Concat / Provider Adapter 教学子集
+
+参考 Eino 技术手册第六章,将前文的 ChatModel、Retriever、Tool 和 Provider 消息格式收敛到规范 Schema 层,补齐流式 chunk concat 注册表和 OpenAI / Claude / Gemini provider adapter 骨架。
+
+### 变更范围
+
+| 文件 | 变更类型 | 说明 |
+|------|---------|------|
+| `compose/types.go` | 更新 | 新增 `User` 规范角色、`DataType`、`ChatMessagePartType` |
+| `compose/schema.go` | 更新 | 扩展 `ToolCall.Index/Extra`、`ToolInfo.Extra`、`ParamsOneOf` 双模式 JSON Schema 输出、`ToolResult` 多模态字段,并将 `Document` 作为规范类型 |
+| `compose/chatmodel.go` | 更新 | `Message` 扩展 `ToolName`、多模态 content part、`ResponseMeta`、`ReasoningContent`、`Extra`;新增 provider extension metadata 类型 |
+| `compose/concat.go` | 新增 | `RegisterStreamChunkConcatFunc` / `ConcatItems` 注册式合并,实现 `ConcatMessages`、`ConcatMessageArray`、`ConcatToolResults` |
+| `compose/stream.go` | 更新 | `Concat` 支持 Chapter 6 concat 注册表,用于流式 Message chunk 折叠 |
+| `compose/provider.go` | 新增 | `ContentBlock` / `AgenticMessage` 教育子集和 provider interface 定义 |
+| `compose/provider_openai.go` | 新增 | OpenAI chat message 与规范 `Message` 双向转换 |
+| `compose/provider_claude.go` | 新增 | Claude content blocks 与规范 `AgenticMessage` 双向转换 |
+| `compose/provider_gemini.go` | 新增 | Gemini parts/functionCall/functionResponse 与 `AgenticMessage`、`Message` 双路径转换 |
+| `compose/schema_test.go` / `compose/concat_test.go` / `compose/provider_test.go` | 新增 | 覆盖 schema API、stream concat 行为、provider adapter round trip 和跨组件消费模式 |
+| `research/ch6-*.md` | 新增 | 第六章差距审计、provider schema 契约、实现契约和验证记录 |
+| `README.md` / `FINAL_SUMMARY.md` | 更新 | 记录第六章具体模式、边界和运行验证 |
+
+### 设计要点
+
+- **经典消息模型**: `Message` 保持 role-driven chat 语义,assistant 携带 `ToolCalls`,tool 消息通过 `ToolCallID` 回指。
+- **AgenticMessage 模型**: `ContentBlock` 表示 Claude/Gemini 风格的 text/image/tool_use/tool_result 内容块,工具调用与结果不依赖单独的 `tool` 角色。
+- **Provider 扩展槽位**: `ResponseMeta` 使用 `OpenAIExtension`、`ClaudeExtension`、`GeminiExtension` 类型化指针保存 provider 特定元数据。
+- **Stream concat**: `ToolCall.Index` 用于合并同一工具调用的流式 delta,参数字符串按到达顺序拼接,索引冲突返回错误。
+- **教育边界**: Adapter 是本地 fake/skeleton,不调用外部 Provider SDK;重点展示原生线格式与规范类型之间的转换模式。
 
 ---
 

@@ -174,9 +174,21 @@ func Concat[T any](readers ...PipeStreamReader[T]) PipeStreamReader[T] {
 		if fn, ok := concatFns.Load(t); ok {
 			result := reflect.ValueOf(fn).Call([]reflect.Value{reflect.ValueOf(allItems)})
 			sw.Send(result[0].Interface().(T))
-		} else {
-			sw.Send(allItems[len(allItems)-1])
+			return
 		}
+		if fn, ok := concatFuncRegistry.Load(t); ok {
+			results := reflect.ValueOf(fn).Call([]reflect.Value{reflect.ValueOf(allItems)})
+			result := results[0].Interface().(T)
+			var err error
+			if !results[1].IsNil() {
+				err = results[1].Interface().(error)
+			}
+			if err == nil {
+				sw.Send(result)
+			}
+			return
+		}
+		sw.Send(allItems[len(allItems)-1])
 	}()
 	return sr
 }

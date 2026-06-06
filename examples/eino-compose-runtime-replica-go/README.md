@@ -42,6 +42,14 @@ Graph Builder  ──>  Compile  ──>  Runnable[I, O]
   ├── ToolsNode (ToolCall 解析 → 工具分发 → 结果组装)
   ├── Workflow.AsPromptTemplateNode / AsToolsNode 便捷方法
   └── Graph/Workflow/Chain 三种编排演示
+
+I3 Provider Adapters
+  ├── ContentBlock / AgenticMessage 规范 (Claude/Gemini 内容块模型)
+  ├── ProviderOpenAI:  OpenAI 原生消息 ↔ 规范 Message
+  ├── ProviderClaude: Claude content blocks ↔ 规范 AgenticMessage
+  ├── ProviderGemini: Gemini parts/functionCall/functionResponse ↔ 规范类型
+  ├── FakeOpenAIProvider / FakeClaudeProvider / FakeGeminiProvider 桩实现
+  └── 跨 Provider 示例: ChatModel/Retriever/Tool 消费规范模式 (不感知来源)
 ```
 
 ### 三层抽象对比
@@ -344,22 +352,29 @@ PromptTemplate → ChatModel (返回 ToolCall) → ToolsNode → ChatModel (生�
 
 ```go
 type ToolCall struct {
+    Index    *int       // streaming delta 分组索引
     ID       string
     Type     string
     Function ToolCallFunction    // {Name, Arguments}
+    Extra    map[string]any
 }
 
 type ToolInfo struct {
     Name, Desc string
     ParamsOneOf *ParamsOneOf     // 参数 Schema
+    Extra map[string]any
 }
 
 type ToolResult struct {
     Text string
+    Images []*ImageContent
+    Audio  []*AudioContent
+    Video  []*VideoContent
+    Files  []*FileContent
 }
 ```
 
-`Message` 结构体 (`chatmodel.go`) 扩展了 `ToolCalls []ToolCall` 字段,用于在模型节点与工具节点之间传递工具调用意图。
+`Message` 结构体 (`chatmodel.go`) 扩展了 `ToolCalls []ToolCall`、`ToolCallID`、`ToolName`、`ResponseMeta`、`ReasoningContent` 和多模态 content part 字段,用于在模型节点、工具节点与 Provider Adapter 之间传递规范消息。
 
 ### PromptTemplate — ChatTemplate 接口与 MessageTemplate
 
@@ -477,6 +492,33 @@ result, _ := r.Invoke(ctx, []*compose.Message{compose.HumanMessage("Weather in T
 - Tool rerun skip handler (中断恢复后跳过已执行工具)
 - 工具级 Callback 集成
 - Provider 特定的工具绑定选项
+
+---
+
+## 第六章功能 (Canonical Schema / Stream Concat / Provider Adapters)
+
+> **本章把 ChatModel、Retriever、Tool 和多 Provider 消息格式收敛到一个规范 Schema 层: 经典 `Message` 负责 role-driven chat/tool calling,`AgenticMessage` + `ContentBlock` 展示 Claude/Gemini 风格的内容块模型,Provider Adapter 只做原生格式与规范类型的互转。**
+
+### 规范 Schema
+
+- `RoleType` 新增 `User = "user"` 规范角色,保留 `Human = "human"` 以兼容前文示例。
+- `Document` 迁移到 `schema.go`,扩展 `ID`、`Meta`、`Embedding`、`Score`,同时保留 `Metadata` 兼容 Retriever 示例。
+- `ParamsOneOf` 支持轻量 `ParameterInfo` 树和完整 JSON Schema 两种模式,通过 `ToJSONSchema()` 统一输出。
+- `ResponseMeta` 提供 `TokenUsage`、`LogProbs` 和 `OpenAIExtension` / `ClaudeExtension` / `GeminiExtension` 类型化槽位。
+
+### Stream Concat
+
+- `RegisterStreamChunkConcatFunc[T]` 注册 `reflect.Type → concat func`。
+- `ConcatMessages` 按流式语义拼接 `Content`、`ReasoningContent`,按 `ToolCall.Index` 合并工具调用参数 delta,并保留最后一个非空 `ResponseMeta`。
+- `ConcatToolResults` 拼接文本并追加 images/audio/video/files 多模态结果。
+- `compose/concat_test.go` 覆盖注册表、Message/tool call delta、ToolResult 以及 `Concat` stream pipe 集成。
+
+### Provider Adapter Skeletons
+
+- `provider_openai.go`: `OpenAIMessage` / `OpenAIChatRequest` ↔ 规范 `Message`,覆盖 role、tool_calls、tool_call_id。
+- `provider_claude.go`: Claude content blocks ↔ `AgenticMessage`,将 `text`、`image`、`tool_use`、`tool_result` 映射到 `ContentBlock`。
+- `provider_gemini.go`: Gemini `parts` / `functionCall` / `functionResponse` ↔ `AgenticMessage` 和 `Message` 两条路径。
+- `FakeOpenAIProvider`、`FakeClaudeProvider`、`FakeGeminiProvider` 是教育桩实现,用于展示组件只消费规范类型,不感知 Provider 来源。
 
 ---
 
@@ -653,13 +695,18 @@ examples/eino-compose-runtime-replica-go/
 │   ├── introspect.go            # GraphInfo, GraphNodeInfo 编译时拓扑导出
 │   ├── event_log.go             # EventLog: 10 种事件类型, 线程安全
 │   ├── stream.go                # PipeStreamReader/PipeStreamWriter, Copy, Merge, Concat
+│   ├── concat.go                # Chapter 6 stream chunk concat registry + Message/ToolResult concat rules
 │   ├── callbacks.go             # RunInfo, Handler, CallbackWrapper, stream callback copies
-│   ├── schema.go                # ToolCall / ToolCallFunction / ToolInfo / ToolResult 数据模型
+│   ├── schema.go                # ToolCall / ToolInfo / ParamsOneOf / ToolResult / Document 规范数据模型
 │   ├── prompt.go                # ChatTemplate 接口, MessageTemplate ({{variable}} 替换), ChatTemplateComponent
 │   ├── prompt_tool_bridge.go    # I3 Tool Bridge: BridgeTool 接口 + promptTemplateBridge + toolsNodeBridge + Workflow 便捷方法
 │   ├── bridge.go                # Bridge Adapter: BridgeRetriever/BridgeChatModel + Workflow 便捷方法
 │   ├── retriever.go             # Retriever 接口, Document/Query 类型, FakeRetriever, NewRetrieverLambda
 │   ├── chatmodel.go             # ChatModel 接口, Message/RoleType, FakeChatModel, ChatModelComponent
+│   ├── provider.go              # I3 Provider Adapter: ContentBlock/AgenticMessage 规范类型 + 辅助函数
+│   ├── provider_openai.go       # OpenAI Adapter: OpenAIMessage/OpenAIChatRequest ↔ 规范 Message
+│   ├── provider_claude.go       # Claude Adapter: ClaudeContentBlock/ClaudeChatRequest ↔ 规范 AgenticMessage
+│   ├── provider_gemini.go       # Gemini Adapter: GeminiPart/GeminiChatRequest ↔ 规范类型
 │   └── utils.go                 # 辅助函数
 ├── research/
 │   ├── ch2-implementation-contract.md  # 第二章实现契约
@@ -668,7 +715,11 @@ examples/eino-compose-runtime-replica-go/
 │   ├── ch4-r1-chatmodel-retriever-contract.md  # 第四章组件契约研究
 │   ├── ch4-r2-replica-bridge-audit.md  # 第四章桥接审计
 │   ├── ch5-implementation-contract.md  # 第五章实现契约: Model/Tool/Prompt 组件接口与图桥接
-│   └── ch5-r1-component-gap-audit.md   # 第五章组件差距审计
+│   ├── ch5-r1-component-gap-audit.md   # 第五章组件差距审计
+│   ├── ch6-implementation-contract.md  # 第六章实现契约: Schema / concat / Provider Adapter
+│   ├── ch6-r1-current-schema-gap-audit.md  # 第六章 Schema 差距审计
+│   ├── ch6-r2-provider-schema-contract.md  # 第六章 Provider Schema 契约研究
+│   └── ch6-verification.md             # 第六章验证记录
 ├── README.md                    # 本文档
 ├── CHANGELOG.md                 # 变更日志
 ├── FINAL_SUMMARY.md             # 最终验证摘要
