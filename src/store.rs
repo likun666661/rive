@@ -308,11 +308,26 @@ pub struct SchedulerNodeRunRecord {
     pub scheduler_run_id: String,
     pub work_node_id: String,
     pub dispatch_id: Option<String>,
+    pub runner: String,
     pub worker_agent_id: String,
     pub worker_run_id: Option<String>,
+    pub workspace_mode: String,
+    pub acceptance_mode: String,
     pub state: String,
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkNodeExecutionPolicyRecord {
+    pub work_node_id: String,
+    pub runner: Option<String>,
+    pub worker_agent_id: Option<String>,
+    pub workspace_mode: Option<String>,
+    pub acceptance_mode: Option<String>,
+    pub policy_json: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -456,7 +471,10 @@ pub struct InsertSchedulerNodeRunInput {
     pub node_run_id: String,
     pub scheduler_run_id: String,
     pub work_node_id: String,
+    pub runner: String,
     pub worker_agent_id: String,
+    pub workspace_mode: String,
+    pub acceptance_mode: String,
     pub started_at: DateTime<Utc>,
 }
 
@@ -477,6 +495,18 @@ pub struct InsertSchedulerNodeFailureInput {
     pub suggested_action: String,
     pub detail: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertWorkNodeExecutionPolicyInput {
+    pub work_node_id: String,
+    pub runner: Option<String>,
+    pub worker_agent_id: Option<String>,
+    pub workspace_mode: Option<String>,
+    pub acceptance_mode: Option<String>,
+    pub policy_json: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -890,8 +920,11 @@ impl EventStore {
               scheduler_run_id TEXT NOT NULL,
               work_node_id TEXT NOT NULL,
               dispatch_id TEXT,
+              runner TEXT NOT NULL DEFAULT 'opencode',
               worker_agent_id TEXT NOT NULL,
               worker_run_id TEXT,
+              workspace_mode TEXT NOT NULL DEFAULT 'shared',
+              acceptance_mode TEXT NOT NULL DEFAULT 'manual',
               state TEXT NOT NULL,
               started_at TEXT NOT NULL,
               completed_at TEXT,
@@ -904,6 +937,18 @@ impl EventStore {
               ON scheduler_node_runs(work_node_id, state);
             CREATE INDEX IF NOT EXISTS idx_scheduler_node_runs_scheduler
               ON scheduler_node_runs(scheduler_run_id);
+            CREATE TABLE IF NOT EXISTS work_node_execution_policies (
+              work_node_id TEXT PRIMARY KEY,
+              runner TEXT,
+              worker_agent_id TEXT,
+              workspace_mode TEXT,
+              acceptance_mode TEXT,
+              policy_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY(work_node_id) REFERENCES work_nodes(work_node_id),
+              FOREIGN KEY(worker_agent_id) REFERENCES agents(agent_id)
+            );
             CREATE TABLE IF NOT EXISTS scheduler_node_failures (
               node_run_id TEXT PRIMARY KEY,
               failure_kind TEXT NOT NULL,
@@ -1036,6 +1081,36 @@ impl EventStore {
               FOREIGN KEY(work_node_id) REFERENCES work_nodes(work_node_id)
             );
             "#,
+        )?;
+        self.ensure_column(
+            "scheduler_node_runs",
+            "runner",
+            "TEXT NOT NULL DEFAULT 'opencode'",
+        )?;
+        self.ensure_column(
+            "scheduler_node_runs",
+            "workspace_mode",
+            "TEXT NOT NULL DEFAULT 'shared'",
+        )?;
+        self.ensure_column(
+            "scheduler_node_runs",
+            "acceptance_mode",
+            "TEXT NOT NULL DEFAULT 'manual'",
+        )?;
+        Ok(())
+    }
+
+    fn ensure_column(&self, table: &str, column: &str, definition: &str) -> Result<()> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for row in rows {
+            if row? == column {
+                return Ok(());
+            }
+        }
+        self.conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
         )?;
         Ok(())
     }
@@ -2463,15 +2538,18 @@ impl EventStore {
         self.conn.execute(
             r#"
             INSERT INTO scheduler_node_runs (
-              node_run_id, scheduler_run_id, work_node_id, dispatch_id, worker_agent_id,
-              worker_run_id, state, started_at, completed_at
-            ) VALUES (?1, ?2, ?3, NULL, ?4, NULL, 'claimed', ?5, NULL)
+              node_run_id, scheduler_run_id, work_node_id, dispatch_id, runner, worker_agent_id,
+              worker_run_id, workspace_mode, acceptance_mode, state, started_at, completed_at
+            ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, NULL, ?6, ?7, 'claimed', ?8, NULL)
             "#,
             params![
                 input.node_run_id,
                 input.scheduler_run_id,
                 input.work_node_id,
+                input.runner,
                 input.worker_agent_id,
+                input.workspace_mode,
+                input.acceptance_mode,
                 input.started_at.to_rfc3339(),
             ],
         )?;
@@ -2507,8 +2585,9 @@ impl EventStore {
     ) -> Result<Option<SchedulerNodeRunRecord>> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT node_run_id, scheduler_run_id, work_node_id, dispatch_id, worker_agent_id,
-                   worker_run_id, state, started_at, completed_at
+            SELECT node_run_id, scheduler_run_id, work_node_id, dispatch_id, runner,
+                   worker_agent_id, worker_run_id, workspace_mode, acceptance_mode, state,
+                   started_at, completed_at
             FROM scheduler_node_runs
             WHERE node_run_id = ?1
             "#,
@@ -2527,8 +2606,9 @@ impl EventStore {
     ) -> Result<Vec<SchedulerNodeRunRecord>> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT node_run_id, scheduler_run_id, work_node_id, dispatch_id, worker_agent_id,
-                   worker_run_id, state, started_at, completed_at
+            SELECT node_run_id, scheduler_run_id, work_node_id, dispatch_id, runner,
+                   worker_agent_id, worker_run_id, workspace_mode, acceptance_mode, state,
+                   started_at, completed_at
             FROM scheduler_node_runs
             WHERE scheduler_run_id = ?1
             ORDER BY started_at ASC
@@ -2548,8 +2628,9 @@ impl EventStore {
     ) -> Result<Vec<SchedulerNodeRunRecord>> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT node_run_id, scheduler_run_id, work_node_id, dispatch_id, worker_agent_id,
-                   worker_run_id, state, started_at, completed_at
+            SELECT node_run_id, scheduler_run_id, work_node_id, dispatch_id, runner,
+                   worker_agent_id, worker_run_id, workspace_mode, acceptance_mode, state,
+                   started_at, completed_at
             FROM scheduler_node_runs
             WHERE work_node_id = ?1 AND state IN ('claimed', 'running')
             ORDER BY started_at ASC
@@ -2569,8 +2650,9 @@ impl EventStore {
     ) -> Result<Vec<SchedulerNodeRunRecord>> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT node_run_id, scheduler_run_id, work_node_id, dispatch_id, worker_agent_id,
-                   worker_run_id, state, started_at, completed_at
+            SELECT node_run_id, scheduler_run_id, work_node_id, dispatch_id, runner,
+                   worker_agent_id, worker_run_id, workspace_mode, acceptance_mode, state,
+                   started_at, completed_at
             FROM scheduler_node_runs
             WHERE work_node_id = ?1
             ORDER BY started_at ASC
@@ -2590,8 +2672,9 @@ impl EventStore {
     ) -> Result<Option<SchedulerNodeRunRecord>> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT node_run_id, scheduler_run_id, work_node_id, dispatch_id, worker_agent_id,
-                   worker_run_id, state, started_at, completed_at
+            SELECT node_run_id, scheduler_run_id, work_node_id, dispatch_id, runner,
+                   worker_agent_id, worker_run_id, workspace_mode, acceptance_mode, state,
+                   started_at, completed_at
             FROM scheduler_node_runs
             WHERE work_node_id = ?1
             ORDER BY started_at DESC
@@ -2651,6 +2734,59 @@ impl EventStore {
         let mut rows = stmt.query(params![node_run_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row_to_scheduler_node_failure(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn upsert_work_node_execution_policy(
+        &self,
+        input: &UpsertWorkNodeExecutionPolicyInput,
+    ) -> Result<WorkNodeExecutionPolicyRecord> {
+        self.conn.execute(
+            r#"
+            INSERT INTO work_node_execution_policies (
+              work_node_id, runner, worker_agent_id, workspace_mode, acceptance_mode,
+              policy_json, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(work_node_id) DO UPDATE SET
+              runner = excluded.runner,
+              worker_agent_id = excluded.worker_agent_id,
+              workspace_mode = excluded.workspace_mode,
+              acceptance_mode = excluded.acceptance_mode,
+              policy_json = excluded.policy_json,
+              updated_at = excluded.updated_at
+            "#,
+            params![
+                input.work_node_id,
+                input.runner,
+                input.worker_agent_id,
+                input.workspace_mode,
+                input.acceptance_mode,
+                serde_json::to_string(&input.policy_json)?,
+                input.created_at.to_rfc3339(),
+                input.updated_at.to_rfc3339(),
+            ],
+        )?;
+        self.get_work_node_execution_policy(&input.work_node_id)?
+            .ok_or_else(|| anyhow::anyhow!("work node policy not found: {}", input.work_node_id))
+    }
+
+    pub fn get_work_node_execution_policy(
+        &self,
+        work_node_id: &str,
+    ) -> Result<Option<WorkNodeExecutionPolicyRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT work_node_id, runner, worker_agent_id, workspace_mode, acceptance_mode,
+                   policy_json, created_at, updated_at
+            FROM work_node_execution_policies
+            WHERE work_node_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![work_node_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_work_node_execution_policy(row)?))
         } else {
             Ok(None)
         }
@@ -3592,16 +3728,19 @@ fn row_to_scheduler_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SchedulerRu
 }
 
 fn row_to_scheduler_node_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SchedulerNodeRunRecord> {
-    let started_at: String = row.get(7)?;
-    let completed_at: Option<String> = row.get(8)?;
+    let started_at: String = row.get(10)?;
+    let completed_at: Option<String> = row.get(11)?;
     Ok(SchedulerNodeRunRecord {
         node_run_id: row.get(0)?,
         scheduler_run_id: row.get(1)?,
         work_node_id: row.get(2)?,
         dispatch_id: row.get(3)?,
-        worker_agent_id: row.get(4)?,
-        worker_run_id: row.get(5)?,
-        state: row.get(6)?,
+        runner: row.get(4)?,
+        worker_agent_id: row.get(5)?,
+        worker_run_id: row.get(6)?,
+        workspace_mode: row.get(7)?,
+        acceptance_mode: row.get(8)?,
+        state: row.get(9)?,
         started_at: parse_time_for_sql(&started_at)?,
         completed_at: completed_at
             .as_deref()
@@ -3622,6 +3761,26 @@ fn row_to_scheduler_node_failure(
         suggested_action: row.get(3)?,
         detail: row.get(4)?,
         created_at: parse_time_for_sql(&created_at)?,
+    })
+}
+
+fn row_to_work_node_execution_policy(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WorkNodeExecutionPolicyRecord> {
+    let policy_json: String = row.get(5)?;
+    let created_at: String = row.get(6)?;
+    let updated_at: String = row.get(7)?;
+    Ok(WorkNodeExecutionPolicyRecord {
+        work_node_id: row.get(0)?,
+        runner: row.get(1)?,
+        worker_agent_id: row.get(2)?,
+        workspace_mode: row.get(3)?,
+        acceptance_mode: row.get(4)?,
+        policy_json: serde_json::from_str(&policy_json).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(err))
+        })?,
+        created_at: parse_time_for_sql(&created_at)?,
+        updated_at: parse_time_for_sql(&updated_at)?,
     })
 }
 

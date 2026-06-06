@@ -156,7 +156,6 @@ params:
 nodes:
   scan:
     kind: task
-    runner: opencode
     title: Scan {{env}}
     prompt:
       file: prompts/scan.md
@@ -165,7 +164,6 @@ nodes:
       required_sections: [signals]
   judge:
     kind: review
-    runner: opencode
     title: Judge for {{slack_channel}}
     consumes: [scan]
     prompt:
@@ -190,6 +188,57 @@ edges:
     )
     .unwrap();
     fs::write(package.join("prompts/scan.md"), "Scan {{env}} signals.\n").unwrap();
+    package
+}
+
+fn write_mixed_runner_workflow(temp: &TempDir) -> std::path::PathBuf {
+    let package = temp.path().join("mixed-runner-workflow");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(
+        package.join("workflow.yaml"),
+        r#"api_version: rive.workflow/v0
+id: mixed.runner.workflow
+version: 1
+title: Mixed runner workflow
+params:
+  slack_channel:
+    type: string
+    required: true
+nodes:
+  scan:
+    kind: task
+    runner: opencode
+    worker: worker-a
+    acceptance_mode: auto-reported
+    title: Scan evidence
+    prompt:
+      inline: "Scan evidence for {{slack_channel}}."
+    output_contract:
+      format: markdown
+  judge:
+    kind: review
+    runner: codex
+    worker: codex-worker
+    acceptance_mode: auto-reported
+    title: Judge evidence
+    consumes: [scan]
+    prompt:
+      inline: "Judge scan output."
+    output_contract:
+      format: markdown
+edges:
+  - type: decomposes_to
+    from: root
+    to: scan
+  - type: decomposes_to
+    from: root
+    to: judge
+  - type: depends_on
+    from: judge
+    to: scan
+"#,
+    )
+    .unwrap();
     package
 }
 
@@ -814,6 +863,132 @@ fn workflow_run_can_execute_codex_scheduler_with_fake_binary() {
         fs::read_to_string(temp.path().join("workflow-codex-scheduler-invocations.txt")).unwrap(),
         "2\n"
     );
+}
+
+#[test]
+fn workflow_scheduler_respects_node_level_runner_and_worker_policy() {
+    let temp = init_workspace();
+    add_worker(&temp, "worker-a");
+    add_worker(&temp, "codex-worker");
+    let package = write_mixed_runner_workflow(&temp);
+    import_workflow(&temp, &package, "wf-import-mixed-runner");
+    let fake_opencode = temp.path().join("fake-opencode-mixed-workflow");
+    let fake_codex = temp.path().join("fake-codex-mixed-workflow");
+    write_fake_opencode_reporter(&fake_opencode);
+    write_fake_codex_reporter(&fake_codex);
+
+    let run = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("workflow")
+            .arg("run")
+            .arg("mixed.runner.workflow")
+            .arg("--param")
+            .arg("slack_channel=#alerts")
+            .arg("--command-id")
+            .arg("wf-run-mixed-runner")
+            .arg("--runner")
+            .arg("opencode")
+            .arg("--worker")
+            .arg("worker-a")
+            .arg("--max-parallel")
+            .arg("2")
+            .arg("--acceptance-mode")
+            .arg("auto-reported")
+            .arg("--opencode-bin")
+            .arg(&fake_opencode)
+            .arg("--codex-bin")
+            .arg(&fake_codex)
+            .arg("--trust-project")
+            .arg("--timeout-seconds")
+            .arg("10"),
+    );
+
+    assert_eq!(run["protocol"]["state"], "completed");
+    assert_eq!(run["protocol"]["root_projection"]["state"], "done");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("workflow-scheduler-invocations.txt")).unwrap(),
+        "1\n"
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join("workflow-codex-scheduler-invocations.txt")).unwrap(),
+        "1\n"
+    );
+    assert_eq!(
+        db_count_where(&temp, "scheduler_node_runs", "runner = 'opencode'"),
+        1
+    );
+    assert_eq!(
+        db_count_where(&temp, "scheduler_node_runs", "runner = 'codex'"),
+        1
+    );
+    assert_eq!(
+        db_count_where(
+            &temp,
+            "scheduler_node_runs",
+            "acceptance_mode = 'auto-reported' AND state = 'accepted'"
+        ),
+        2
+    );
+    let scheduler_run_id = run["protocol"]["scheduler"]["scheduler_run_id"]
+        .as_str()
+        .unwrap();
+    let status = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("scheduler")
+            .arg("status")
+            .arg("--run")
+            .arg(scheduler_run_id),
+    );
+    let node_runs = status["protocol"]["node_runs"].as_array().unwrap();
+    assert_eq!(node_runs.len(), 2);
+    assert!(node_runs.iter().any(|run| run["runner"] == "opencode"));
+    assert!(node_runs.iter().any(|run| run["runner"] == "codex"));
+    assert_eq!(
+        db_count_where(
+            &temp,
+            "scheduler_node_runs",
+            "runner = 'opencode' AND worker_agent_id = (SELECT agent_id FROM agents WHERE name = 'worker-a')"
+        ),
+        1
+    );
+    assert_eq!(
+        db_count_where(
+            &temp,
+            "scheduler_node_runs",
+            "runner = 'codex' AND worker_agent_id = (SELECT agent_id FROM agents WHERE name = 'codex-worker')"
+        ),
+        1
+    );
+
+    let conflict = run_json_expect_error(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("workflow")
+            .arg("run")
+            .arg("mixed.runner.workflow")
+            .arg("--param")
+            .arg("slack_channel=#alerts")
+            .arg("--command-id")
+            .arg("wf-run-mixed-runner")
+            .arg("--runner")
+            .arg("opencode")
+            .arg("--worker")
+            .arg("codex-worker")
+            .arg("--max-parallel")
+            .arg("2")
+            .arg("--acceptance-mode")
+            .arg("auto-reported")
+            .arg("--opencode-bin")
+            .arg(&fake_opencode)
+            .arg("--codex-bin")
+            .arg(&fake_codex)
+            .arg("--trust-project")
+            .arg("--timeout-seconds")
+            .arg("10"),
+    );
+    assert_eq!(conflict["protocol"]["code"], "idempotency_conflict");
 }
 
 #[test]

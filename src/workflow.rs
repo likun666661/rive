@@ -11,10 +11,11 @@ use uuid::Uuid;
 
 use crate::snapshot::SnapshotStore;
 use crate::store::{
-    EventStore, InsertWorkflowImportCommandInput, InsertWorkflowRunInput,
+    AgentRole, EventStore, InsertWorkflowImportCommandInput, InsertWorkflowRunInput,
     InsertWorkflowRunNodeInput, SchedulerNodeRunRecord, SchedulerRunRecord,
-    UpdateWorkflowRunSchedulerInput, UpsertWorkflowTemplateInput, WorkflowRunNodeRecord,
-    WorkflowRunRecord, WorkflowTemplateRecord, WorkflowTemplateVersionRecord,
+    UpdateWorkflowRunSchedulerInput, UpsertWorkNodeExecutionPolicyInput,
+    UpsertWorkflowTemplateInput, WorkflowRunNodeRecord, WorkflowRunRecord, WorkflowTemplateRecord,
+    WorkflowTemplateVersionRecord,
 };
 use crate::work::{
     AddWorkEdgeInput, BindWorkRootCommand, CreateWorkNodeInput, WorkEdgeType, WorkNodeKind,
@@ -53,6 +54,12 @@ pub struct NodeSpec {
     pub kind: String,
     #[serde(default)]
     pub runner: Option<String>,
+    #[serde(default)]
+    pub worker: Option<String>,
+    #[serde(default)]
+    pub workspace_mode: Option<String>,
+    #[serde(default)]
+    pub acceptance_mode: Option<String>,
     pub title: String,
     pub prompt: PromptSpec,
     #[serde(default)]
@@ -173,8 +180,11 @@ pub struct WorkflowRunDebugNodeProtocol {
     pub node_run_id: String,
     pub work_node_id: String,
     pub dispatch_id: Option<String>,
+    pub runner: String,
     pub worker_agent_id: String,
     pub worker_run_id: Option<String>,
+    pub workspace_mode: String,
+    pub acceptance_mode: String,
     pub state: String,
     pub stdout_ref: Option<String>,
     pub stderr_ref: Option<String>,
@@ -358,6 +368,22 @@ impl<'a, B: SnapshotStore> WorkflowService<'a, B> {
         Ok(workflow_template_show_protocol(&record))
     }
 
+    fn preflight_scheduler_node_policies(&self, spec: &WorkflowSpec) -> Result<()> {
+        for node in spec.nodes.values() {
+            let Some(worker) = node.worker.as_deref() else {
+                continue;
+            };
+            let agent = self
+                .store
+                .get_agent(worker)?
+                .ok_or_else(|| anyhow!("agent not found: {worker}"))?;
+            if agent.role != AgentRole::Worker {
+                return Err(anyhow!("runner worker must be worker: {worker}"));
+            }
+        }
+        Ok(())
+    }
+
     pub fn run(&self, input: WorkflowRunInput) -> Result<WorkflowRunProtocol> {
         if input.command_id.trim().is_empty() {
             return Err(anyhow!("missing command id"));
@@ -371,6 +397,9 @@ impl<'a, B: SnapshotStore> WorkflowService<'a, B> {
         let params = resolve_params(&spec, &input.params)?;
         let params_hash = hash_json(&params)?;
         let request_hash = request_hash_for_run(&version, &params_hash, &input.scheduler_request)?;
+        if input.scheduler_request.is_some() {
+            self.preflight_scheduler_node_policies(&spec)?;
+        }
         if let Some(existing) = self
             .store
             .get_workflow_run_by_command_id(&input.command_id)?
@@ -425,6 +454,26 @@ impl<'a, B: SnapshotStore> WorkflowService<'a, B> {
                 created_by_agent_id: None,
                 created_by_run_id: Some(run_id.clone()),
             })?;
+            if node_has_execution_policy(node) {
+                let worker_agent_id = node
+                    .worker
+                    .as_deref()
+                    .and_then(|worker| self.store.get_agent(worker).ok().flatten())
+                    .map(|agent| agent.agent_id);
+                let now = Utc::now();
+                self.store.upsert_work_node_execution_policy(
+                    &UpsertWorkNodeExecutionPolicyInput {
+                        work_node_id: work_node.work_node_id.clone(),
+                        runner: node.runner.clone(),
+                        worker_agent_id,
+                        workspace_mode: node.workspace_mode.clone(),
+                        acceptance_mode: node.acceptance_mode.clone(),
+                        policy_json: node_execution_policy_json(node),
+                        created_at: now,
+                        updated_at: now,
+                    },
+                )?;
+            }
             node_map.insert(node_id.clone(), work_node.work_node_id.clone());
         }
 
@@ -623,13 +672,10 @@ fn workflow_run_debug_protocol(
 
 fn workflow_debug_node_protocol(
     workspace: &Workspace,
-    scheduler_runner: Option<&str>,
+    _scheduler_runner: Option<&str>,
     run: &SchedulerNodeRunRecord,
 ) -> WorkflowRunDebugNodeProtocol {
-    let stdout_file = match scheduler_runner {
-        Some("opencode") | Some("codex") => "stdout.jsonl",
-        _ => "stdout.jsonl",
-    };
+    let stdout_file = "stdout.jsonl";
     let debug_ref = |file_name: &str| {
         run.worker_run_id
             .as_ref()
@@ -639,8 +685,11 @@ fn workflow_debug_node_protocol(
         node_run_id: run.node_run_id.clone(),
         work_node_id: run.work_node_id.clone(),
         dispatch_id: run.dispatch_id.clone(),
+        runner: run.runner.clone(),
         worker_agent_id: run.worker_agent_id.clone(),
         worker_run_id: run.worker_run_id.clone(),
+        workspace_mode: run.workspace_mode.clone(),
+        acceptance_mode: run.acceptance_mode.clone(),
         state: run.state.clone(),
         stdout_ref: debug_ref(stdout_file),
         stderr_ref: debug_ref("stderr.log"),
@@ -794,6 +843,7 @@ fn validate_spec(spec: &WorkflowSpec) -> Result<()> {
                 "workflow output contract missing for node: {node_id}"
             ));
         }
+        validate_node_execution_policy(node_id, node)?;
         validate_gated_capabilities(spec, node_id, &node.capability_policy)?;
     }
     for edge in &spec.edges {
@@ -813,6 +863,37 @@ fn validate_id(label: &str, value: &str) -> Result<()> {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
     {
         return Err(anyhow!("invalid {label}: {value}"));
+    }
+    Ok(())
+}
+
+fn validate_node_execution_policy(node_id: &str, node: &NodeSpec) -> Result<()> {
+    if let Some(runner) = &node.runner {
+        if !matches!(runner.as_str(), "opencode" | "codex") {
+            return Err(anyhow!(
+                "workflow node runner not supported: {node_id}.{runner}"
+            ));
+        }
+    }
+    if let Some(worker) = &node.worker {
+        validate_id("workflow node worker", worker)?;
+    }
+    if let Some(workspace_mode) = &node.workspace_mode {
+        if !matches!(workspace_mode.as_str(), "shared" | "worktree") {
+            return Err(anyhow!(
+                "workflow node workspace mode not supported: {node_id}.{workspace_mode}"
+            ));
+        }
+    }
+    if let Some(acceptance_mode) = &node.acceptance_mode {
+        if !matches!(
+            acceptance_mode.as_str(),
+            "manual" | "auto-reported" | "auto-committed"
+        ) {
+            return Err(anyhow!(
+                "workflow node acceptance mode not supported: {node_id}.{acceptance_mode}"
+            ));
+        }
     }
     Ok(())
 }
@@ -1015,8 +1096,8 @@ fn render_node_body(node_id: &str, node: &NodeSpec, params: &Value) -> Result<St
     let prompt = node.prompt.inline.as_deref().unwrap_or_default();
     let rendered_prompt = render_text(prompt, params, &local_params)?;
     Ok(format!(
-        "Workflow node template: {node_id}\nRunner: {}\nConsumes: {}\n\nPrompt:\n{}\n\nOutput contract:\n{}\n\nCapability policy:\n{}\n",
-        node.runner.as_deref().unwrap_or("opencode"),
+        "Workflow node template: {node_id}\nExecution policy: {}\nConsumes: {}\n\nPrompt:\n{}\n\nOutput contract:\n{}\n\nCapability policy:\n{}\n",
+        serde_json::to_string(&node_execution_policy_json(node))?,
         serde_json::to_string(&node.consumes)?,
         rendered_prompt,
         serde_json::to_string_pretty(&node.output_contract)?,
@@ -1026,6 +1107,36 @@ fn render_node_body(node_id: &str, node: &NodeSpec, params: &Value) -> Result<St
 
 fn prompt_local_params(node: &NodeSpec) -> BTreeMap<String, Value> {
     node.prompt.params.clone()
+}
+
+fn node_has_execution_policy(node: &NodeSpec) -> bool {
+    node.runner.is_some()
+        || node.worker.is_some()
+        || node.workspace_mode.is_some()
+        || node.acceptance_mode.is_some()
+}
+
+fn node_execution_policy_json(node: &NodeSpec) -> Value {
+    let mut policy = serde_json::Map::new();
+    if let Some(runner) = &node.runner {
+        policy.insert("runner".to_string(), Value::String(runner.clone()));
+    }
+    if let Some(worker) = &node.worker {
+        policy.insert("worker".to_string(), Value::String(worker.clone()));
+    }
+    if let Some(workspace_mode) = &node.workspace_mode {
+        policy.insert(
+            "workspace_mode".to_string(),
+            Value::String(workspace_mode.clone()),
+        );
+    }
+    if let Some(acceptance_mode) = &node.acceptance_mode {
+        policy.insert(
+            "acceptance_mode".to_string(),
+            Value::String(acceptance_mode.clone()),
+        );
+    }
+    Value::Object(policy)
 }
 
 fn render_text(
