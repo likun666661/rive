@@ -242,6 +242,36 @@ edges:
     package
 }
 
+fn write_bad_node_worker_workflow(temp: &TempDir, worker: &str) -> std::path::PathBuf {
+    let path = temp.path().join(format!("bad-node-worker-{worker}.yaml"));
+    fs::write(
+        &path,
+        format!(
+            r#"api_version: rive.workflow/v0
+id: bad.node.worker.{worker}
+version: 1
+title: Bad node worker
+nodes:
+  only:
+    kind: task
+    runner: opencode
+    worker: {worker}
+    title: Only
+    prompt:
+      inline: "Do it."
+    output_contract:
+      format: markdown
+edges:
+  - type: decomposes_to
+    from: root
+    to: only
+"#
+        ),
+    )
+    .unwrap();
+    path
+}
+
 fn write_versioned_workflow(temp: &TempDir, version: i64, title: &str) -> std::path::PathBuf {
     let path = temp.path().join(format!("versioned-{version}.yaml"));
     fs::write(
@@ -1048,6 +1078,119 @@ fn workflow_scheduler_args_are_checked_before_instantiation() {
     assert_eq!(db_count(&temp, "workflow_runs"), 0);
     assert_eq!(db_count(&temp, "work_nodes"), 0);
     assert_eq!(db_count(&temp, "scheduler_runs"), 0);
+}
+
+#[test]
+fn scheduler_preflights_node_policy_workers_before_side_effects() {
+    let temp = init_workspace();
+    add_worker(&temp, "worker-a");
+    let missing_package = write_bad_node_worker_workflow(&temp, "no-such-worker");
+    import_workflow(&temp, &missing_package, "wf-import-bad-node-worker");
+    let run = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("workflow")
+            .arg("run")
+            .arg("bad.node.worker.no-such-worker")
+            .arg("--command-id")
+            .arg("wf-run-bad-node-worker")
+            .arg("--no-scheduler"),
+    );
+    let root = run["protocol"]["root_work_node_id"].as_str().unwrap();
+    let fake = temp.path().join("fake-opencode-bad-node-policy");
+    write_fake_opencode_reporter(&fake);
+
+    let error = run_json_expect_error(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("scheduler")
+            .arg("run")
+            .arg("--root")
+            .arg(root)
+            .arg("--runner")
+            .arg("opencode")
+            .arg("--worker")
+            .arg("worker-a")
+            .arg("--command-id")
+            .arg("sched-bad-node-worker")
+            .arg("--acceptance-mode")
+            .arg("auto-reported")
+            .arg("--opencode-bin")
+            .arg(&fake)
+            .arg("--timeout-seconds")
+            .arg("10"),
+    );
+    assert_eq!(error["protocol"]["code"], "agent_not_found");
+    assert_eq!(db_count(&temp, "scheduler_runs"), 0);
+    assert_eq!(db_count(&temp, "scheduler_node_runs"), 0);
+    assert_eq!(db_count(&temp, "dispatches"), 0);
+
+    let resume_error = run_json_expect_error(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("scheduler")
+            .arg("resume")
+            .arg("--root")
+            .arg(root)
+            .arg("--worker")
+            .arg("worker-a")
+            .arg("--command-id")
+            .arg("sched-resume-bad-node-worker")
+            .arg("--acceptance-mode")
+            .arg("auto-reported")
+            .arg("--opencode-bin")
+            .arg(&fake)
+            .arg("--timeout-seconds")
+            .arg("10"),
+    );
+    assert_eq!(resume_error["protocol"]["code"], "agent_not_found");
+    assert_eq!(db_count(&temp, "scheduler_runs"), 0);
+    assert_eq!(db_count(&temp, "scheduler_node_runs"), 0);
+    assert_eq!(db_count(&temp, "dispatches"), 0);
+
+    add_agent(&temp, "not-worker", "orchestrator");
+    let non_worker_package = write_bad_node_worker_workflow(&temp, "not-worker");
+    import_workflow(&temp, &non_worker_package, "wf-import-non-worker-policy");
+    let non_worker_run = run_json(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("workflow")
+            .arg("run")
+            .arg("bad.node.worker.not-worker")
+            .arg("--command-id")
+            .arg("wf-run-non-worker-policy")
+            .arg("--no-scheduler"),
+    );
+    let non_worker_root = non_worker_run["protocol"]["root_work_node_id"]
+        .as_str()
+        .unwrap();
+    let non_worker_error = run_json_expect_error(
+        rive_cmd()
+            .current_dir(temp.path())
+            .arg("scheduler")
+            .arg("run")
+            .arg("--root")
+            .arg(non_worker_root)
+            .arg("--runner")
+            .arg("opencode")
+            .arg("--worker")
+            .arg("worker-a")
+            .arg("--command-id")
+            .arg("sched-non-worker-policy")
+            .arg("--acceptance-mode")
+            .arg("auto-reported")
+            .arg("--opencode-bin")
+            .arg(&fake)
+            .arg("--timeout-seconds")
+            .arg("10"),
+    );
+    assert_eq!(
+        non_worker_error["protocol"]["code"],
+        "runner_worker_role_invalid"
+    );
+    assert_eq!(db_count(&temp, "scheduler_runs"), 0);
+    assert_eq!(db_count(&temp, "scheduler_node_runs"), 0);
+    assert_eq!(db_count(&temp, "dispatches"), 0);
 }
 
 #[test]

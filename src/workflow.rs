@@ -397,9 +397,6 @@ impl<'a, B: SnapshotStore> WorkflowService<'a, B> {
         let params = resolve_params(&spec, &input.params)?;
         let params_hash = hash_json(&params)?;
         let request_hash = request_hash_for_run(&version, &params_hash, &input.scheduler_request)?;
-        if input.scheduler_request.is_some() {
-            self.preflight_scheduler_node_policies(&spec)?;
-        }
         if let Some(existing) = self
             .store
             .get_workflow_run_by_command_id(&input.command_id)?
@@ -413,6 +410,9 @@ impl<'a, B: SnapshotStore> WorkflowService<'a, B> {
                 return self.run_protocol(existing, "replayed");
             }
             return Err(anyhow!("idempotency conflict"));
+        }
+        if input.scheduler_request.is_some() {
+            self.preflight_scheduler_node_policies(&spec)?;
         }
 
         let work_service = WorkService::new(self.workspace, self.store, self.blob_store);

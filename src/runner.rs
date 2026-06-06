@@ -758,6 +758,17 @@ impl<'a> SchedulerService<'a> {
             binary: scheduler_binary_for_runner(&runner, &input),
             trust_project: input.trust_project,
         });
+        if self
+            .event_store
+            .get_scheduler_run_by_command_id(&input.command_id)?
+            .is_none()
+        {
+            self.preflight_reachable_node_policies(
+                &input.root_work_node_id,
+                workspace_mode,
+                acceptance_mode,
+            )?;
+        }
         let inserted =
             self.event_store
                 .insert_scheduler_run_idempotent(&InsertSchedulerRunInput {
@@ -937,6 +948,13 @@ impl<'a> SchedulerService<'a> {
             binary: scheduler_binary_for_runner_resume(&runner_kind, &input),
             trust_project: input.trust_project,
         });
+        if self
+            .event_store
+            .get_scheduler_run_by_command_id(&input.command_id)?
+            .is_none()
+        {
+            self.preflight_reachable_node_policies(&root_work_node_id, workspace_mode, acceptance)?;
+        }
         let inserted =
             self.event_store
                 .insert_scheduler_run_idempotent(&InsertSchedulerRunInput {
@@ -1741,6 +1759,61 @@ impl<'a> SchedulerService<'a> {
         Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
     }
 
+    fn preflight_reachable_node_policies(
+        &self,
+        root_work_node_id: &str,
+        default_workspace_mode: WorkspaceMode,
+        default_acceptance_mode: AcceptanceMode,
+    ) -> Result<()> {
+        let work_service = WorkService::new(self.workspace, self.event_store, self.blob_store);
+        let graph = work_service.inspect_graph(root_work_node_id)?;
+        for node_id in graph.reachable_nodes {
+            let Some(policy) = self.event_store.get_work_node_execution_policy(&node_id)? else {
+                continue;
+            };
+            if let Some(runner) = policy.runner.as_deref() {
+                RunnerKind::parse(runner)?;
+            }
+            if let Some(worker_agent_id) = policy.worker_agent_id.as_deref() {
+                let worker = self
+                    .event_store
+                    .get_agent(worker_agent_id)?
+                    .ok_or_else(|| anyhow!("agent not found: {worker_agent_id}"))?;
+                if worker.role != AgentRole::Worker {
+                    return Err(anyhow!("runner worker must be worker"));
+                }
+            } else if let Some(worker_selector) = policy
+                .policy_json
+                .get("worker")
+                .and_then(serde_json::Value::as_str)
+            {
+                let worker = self
+                    .event_store
+                    .get_agent(worker_selector)?
+                    .ok_or_else(|| anyhow!("agent not found: {worker_selector}"))?;
+                if worker.role != AgentRole::Worker {
+                    return Err(anyhow!("runner worker must be worker"));
+                }
+            }
+            let workspace_mode = policy
+                .workspace_mode
+                .as_deref()
+                .map(WorkspaceMode::parse)
+                .transpose()?
+                .unwrap_or(default_workspace_mode);
+            if workspace_mode == WorkspaceMode::Worktree {
+                backend_from_env().ensure_available(self.workspace)?;
+            }
+            let _ = policy
+                .acceptance_mode
+                .as_deref()
+                .map(AcceptanceMode::parse)
+                .transpose()?
+                .unwrap_or(default_acceptance_mode);
+        }
+        Ok(())
+    }
+
     fn resolve_node_execution(
         &self,
         node: WorkNodeRecord,
@@ -1767,7 +1840,7 @@ impl<'a> SchedulerService<'a> {
                 .get_agent(&worker_agent_id)?
                 .ok_or_else(|| anyhow!("agent not found: {worker_agent_id}"))?;
             if worker.role != AgentRole::Worker {
-                return Err(anyhow!("scheduler worker must be worker"));
+                return Err(anyhow!("runner worker must be worker"));
             }
             worker
         } else if let Some(worker_selector) = policy
@@ -1780,7 +1853,7 @@ impl<'a> SchedulerService<'a> {
                 .get_agent(worker_selector)?
                 .ok_or_else(|| anyhow!("agent not found: {worker_selector}"))?;
             if worker.role != AgentRole::Worker {
-                return Err(anyhow!("scheduler worker must be worker"));
+                return Err(anyhow!("runner worker must be worker"));
             }
             worker
         } else {
