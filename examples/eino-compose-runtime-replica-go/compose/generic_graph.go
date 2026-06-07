@@ -38,9 +38,43 @@ func (gg *Graph[I, O]) SetNodeCallbacks(key string, handlers ...*Handler) error 
 	return gg.g.SetNodeHandler(key, handlers...)
 }
 
+func (gg *Graph[I, O]) SetNodeInputPreHandler(key string, fn func(ctx context.Context, input any) (any, error)) error {
+	gg.g.setNodeInputPreHandler(key, fn)
+	return nil
+}
+
+func (gg *Graph[I, O]) AddChatModelNode(key string, cmc *ChatModelComponent, opts ...NodeOption) error {
+	if err := gg.g.addChatModelNode(key, cmc); err != nil {
+		return err
+	}
+	ns := &nodeOptionState{}
+	for _, opt := range opts {
+		opt(ns)
+	}
+	for _, h := range ns.inputPreHandlers {
+		gg.g.setNodeInputPreHandler(key, h)
+	}
+	return nil
+}
+
+func (gg *Graph[I, O]) AddToolsNode(key string, tn *ToolsNode, opts ...NodeOption) error {
+	if err := gg.g.addLambdaNode(key, tn.GetRunnable()); err != nil {
+		return err
+	}
+	ns := &nodeOptionState{}
+	for _, opt := range opts {
+		opt(ns)
+	}
+	for _, h := range ns.inputPreHandlers {
+		gg.g.setNodeInputPreHandler(key, h)
+	}
+	return nil
+}
+
 func (gg *Graph[I, O]) Compile(ctx context.Context, opts ...CompileOption) (Runnable[I, O], error) {
 	o := newNodeCompileOptions(opts...)
 	gg.g.graphName = o.graphName
+	gg.g.genLocalState = o.genLocalState
 
 	if o.nodeTriggerMode == AllPredecessor || o.nodeTriggerMode == AnyPredecessor {
 		gi := newGraphInfo(o.graphName, o.nodeTriggerMode, o.maxSteps)

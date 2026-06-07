@@ -1,12 +1,21 @@
 package compose
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 type graphCompileOptions struct {
 	graphName       string
 	nodeTriggerMode NodeTriggerMode
 	maxSteps        int
 	eagerDisabled   bool
+	genLocalState   *genLocalStateEntry
+}
+
+type genLocalStateEntry struct {
+	factory func(ctx context.Context) any
+	key     genLocalStateKey
 }
 
 type CompileOption func(*graphCompileOptions)

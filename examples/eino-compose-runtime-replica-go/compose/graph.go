@@ -24,9 +24,11 @@ type graph struct {
 	startNodes          []string
 	endNodes            []string
 
-	fieldMappingRecords map[string]map[string][]*FieldMapping
-	handlerPreNodes     map[string][]handlerPair
-	triggerMode         NodeTriggerMode
+	fieldMappingRecords  map[string]map[string][]*FieldMapping
+	handlerPreNodes      map[string][]handlerPair
+	nodeInputPreHandlers map[string][]func(ctx context.Context, input any) (any, error)
+	triggerMode          NodeTriggerMode
+	genLocalState        *genLocalStateEntry
 }
 
 func newGraph(inputType, outputType string) *graph {
@@ -122,6 +124,37 @@ func (g *graph) SetNodeHandler(key string, handlers ...*Handler) error {
 		return fmt.Errorf("%w: %s", ErrNodeNotFound, key)
 	}
 	node.handlers = append(node.handlers, handlers...)
+	return nil
+}
+
+func (g *graph) setNodeInputPreHandler(key string, fn func(ctx context.Context, input any) (any, error)) {
+	if g.nodeInputPreHandlers == nil {
+		g.nodeInputPreHandlers = make(map[string][]func(ctx context.Context, input any) (any, error))
+	}
+	g.nodeInputPreHandlers[key] = append(g.nodeInputPreHandlers[key], fn)
+}
+
+func (g *graph) addChatModelNode(key string, cmc *ChatModelComponent) error {
+	if err := g.checkCompiled(); err != nil {
+		return err
+	}
+	g.nodes[key] = &graphNode{
+		name: key,
+		cr:   cmc.GetRunnable(),
+		info: &GraphNodeInfo{Name: key, Component: cmc.GetComponentType()},
+	}
+	return nil
+}
+
+func (g *graph) addLambdaNode(key string, cr *composableRunnable) error {
+	if err := g.checkCompiled(); err != nil {
+		return err
+	}
+	g.nodes[key] = &graphNode{
+		name: key,
+		cr:   cr,
+		info: &GraphNodeInfo{Name: key, Component: ComponentOfLambda},
+	}
 	return nil
 }
 
@@ -266,6 +299,12 @@ func (g *graph) compile(ctx context.Context) (*runner, error) {
 		}
 	}
 
+	for nodeKey, handlers := range g.nodeInputPreHandlers {
+		if cc, ok := g.chanSubscribeTo[nodeKey]; ok {
+			cc.inputPreHandlers = append(cc.inputPreHandlers, handlers...)
+		}
+	}
+
 	for startTarget := range g.chanSubscribeTo[START].writeTo {
 		g.startNodes = append(g.startNodes, startTarget)
 	}
@@ -333,6 +372,8 @@ func (g *graph) compile(ctx context.Context) (*runner, error) {
 		maxSteps:            maxSt,
 		graphName:           g.graphName,
 		graphInfo:           g.graphInfo,
+		genLocalState:       g.genLocalState,
+		branches:            g.branches,
 	}
 
 	g.compiled = true

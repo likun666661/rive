@@ -1,6 +1,6 @@
 # Eino Compose Runtime Replica (Go MVP)
 
-受 Eino (CloudWeGo) 启发的第二/三/四/五章骨架示例与验证项目,覆盖核心编译边界与 DAG/Pregel 执行引擎,并实现三层编排抽象 (FieldMapping / Workflow / Chain / Parallel / Branch) + Runnable Stream/Callback 教学示例 + ChatModel/Retriever 组件接口与 Bridge Adapter 模式 + Checkpoint/Interrupt/Resume 教学子集 + PromptTemplate/Tool/ToolsNode 桥接。本项目为学习与研究用途的章节级骨架,非 Eino 的完整产品复刻。
+受 Eino (CloudWeGo) 启发的第二/三/四/五章骨架示例与验证项目,覆盖核心编译边界与 DAG/Pregel 执行引擎,并实现三层编排抽象 (FieldMapping / Workflow / Chain / Parallel / Branch) + Runnable Stream/Callback 教学示例 + ChatModel/Retriever 组件接口与 Bridge Adapter 模式 + Checkpoint/Interrupt/Resume 教学子集 + PromptTemplate/Tool/ToolsNode 桥接 + Canonical Schema / Stream Concat / Provider Adapters + Chapter 7 Agent Flow (ReAct + Host Multi-Agent)。本项目为学习与研究用途的章节级骨架,非 Eino 的完整产品复刻。
 
 ## 架构总览
 
@@ -50,6 +50,20 @@ I3 Provider Adapters
   ├── ProviderGemini: Gemini parts/functionCall/functionResponse ↔ 规范类型
   ├── FakeOpenAIProvider / FakeClaudeProvider / FakeGeminiProvider 桩实现
   └── 跨 Provider 示例: ChatModel/Retriever/Tool 消费规范模式 (不感知来源)
+
+第七章: Agent Flow — ReAct 循环与 Host Multi-Agent 路由
+  ├── ReAct Agent (agent/react.go): Graph Builder 编码 LLM 的推理-行动循环
+  │   ├── START → ChatModel → (ToolCall? Tools → ChatModel : END)
+  │   ├── Local State (modelPreHandle / toolsNodePreHandle) 保存消息历史
+  │   ├── MessageRewriter (持久化改写) + MessageModifier (临时改写) 双语义
+  │   ├── ToolReturnDirectly / SetReturnDirectly 短路路径
+  │   └── StreamToolCallChecker 可插拔提供商适配
+  ├── Host Multi-Agent (compose/multiagent.go): 多专家路由与聚合
+  │   ├── Host 路由 ChatModel 通过 ToolCall 选择 Specialist
+  │   ├── Specialist ChatModel / Invokable / Streamable 三种形式
+  │   ├── 单意图直接返回 + 多意图默认/自定义 Summarizer 聚合
+  │   └── Specialist 入参替换 (接收原始消息历史而非 ToolCall 参数)
+  └── State 基础设施 (compose/state.go): WithGenLocalState / ProcessState / GetState
 ```
 
 ### 三层抽象对比
@@ -522,76 +536,117 @@ result, _ := r.Invoke(ctx, []*compose.Message{compose.HumanMessage("Weather in T
 
 ---
 
-## 第三章功能 (Runnable Stream / Collect / Transform / Callback 教学示例)
+## 第七章功能 (Chapter 7: Agent Flow — ReAct / Host Multi-Agent)
 
-> **注意**: 本章实现了 Runnable 四模式、基础 Pipe stream、Collect/Transform 降级和 CallbackWrapper 教学路径。**组件桥接、图级流式执行、stream field mapping 和流式分支不在当前范围内。**
+> **本章将可复用的 LLM 应用 pattern (ReAct 推理-行动循环、多专家路由) 编码为 compose.Graph 构建器,不引入独立的 "agent runtime"。所有 Agent 基础设施 (Graph Branch / Pregel / State / Callback) 直接复用底层 compose 模块。**
 
-### composableRunnable 四字段设计
+### 核心问题
 
-**核心设计**:
-`composableRunnable` 维护四组执行函数,支持 `invoke`、`stream`、`collect`、`transform` 四种执行路径:
+传统的"预设步数循环"无法解决 LLM agent 的核心挑战:
+1. **终止条件不是步数**: Agent 循环的终止条件是"模型觉得不需要再调工具了",这由模型的输出内容驱动
+2. **工具结果可能直接是最终答案**: 某些工具输出足以回答用户,不需要模型再"总结"一轮
+3. **迭代轮次不可预测**: 相同 prompt 在不同模型/采样下可能需要不同轮数
+
+### ReAct Agent — 推理-行动循环
+
+**Graph 拓扑** (agent/react.go):
+
+```
+START → ChatModel
+ChatModel ──(has tool call)──→ Tools → ChatModel (loop)
+ChatModel ──(no tool call)───→ END
+Tools ──(return directly)──→ direct_return lambda → END
+```
+
+**关键设计**:
+
+- **Graph Builder 模式**: ReAct agent 不是一个特殊 runtime,它就是一张通过 `NewAgent(config)` 构建的 compose.Graph。所有 graph 的基础设施 (Branch / Pregel / Callback) 自动继承,循环通过 `AnyPredecessor` + Pregel 实现。
+- **Local State**: 通过 `compose.WithGenLocalState` 管理 `reactState{Messages, ReturnDirectlyToolCallID}`,消息追加在 pre-handler 中完成,不同 agent 实例的 state 完全隔离。
+- **MessageRewriter vs MessageModifier**:
+  - `MessageRewriter`: 直接修改 `state.Messages`——持久化,用于上下文压缩(删除旧消息)
+  - `MessageModifier`: 修改 `state.Messages` 的副本——仅影响当前轮,用于注入 system prompt
+  - 执行顺序: Rewriter 先执行 → Modifier 后执行
+- **Tool Return Directly**:
+  - 配置级: `AgentConfig.ToolReturnDirectly` map 声明哪些工具的返回值直接作为最终回答
+  - 运行时: 工具实现中调用 `agent.SetReturnDirectly(ctx)` 标注短路
+  - 运行时优先于配置级
+- **StreamToolCallChecker**: 提供 stream 扫描函数示例,默认实现 OpenAI 风格的首个 chunk 启发式,另有 `ScanAllStreamToolCallChecker` 演示 Claude/Gemini 这类 text-before-tool-call provider 的完整扫描思路。当前 `Generate` 路径仍以非流式 `Message.ToolCalls` 作为分支依据。
 
 ```go
-type composableRunnable struct {
-    i func(ctx context.Context, input any) (output any, err error)  // invoke
-    s func(ctx context.Context, input any) (output any, err error)  // stream
-    c func(ctx context.Context, input any) (output any, err error)  // collect
-    t func(ctx context.Context, input any) (output any, err error)  // transform
+config := &agent.AgentConfig{
+    ChatModel: myModel,
+    ToolsConfig: compose.ToolsNodeConfig{Tools: tools},
+    MaxStep:    20,
+    MessageModifier: func(ctx context.Context, msgs []*compose.Message) []*compose.Message {
+        return append([]*compose.Message{compose.SystemMessage("be helpful")}, msgs...)
+    },
+    ToolReturnDirectly: map[string]bool{"search": true},
 }
+
+a, _ := agent.NewAgent(ctx, config)
+result, _ := a.Generate(ctx, []*compose.Message{{Role: compose.User, Content: "search for 42"}})
 ```
 
-**四模式降级机制**: 当目标模式没有原生函数时,`composableRunnable` 会按 Eino 的语义做 fallback。比如 `stream()` 优先用原生 stream,然后依次尝试 transform、invoke、collect。
+### Host Multi-Agent — 多专家路由与聚合
+
+**Graph 拓扑** (compose/multiagent.go):
+
+```
+START → Host (ChatModel)
+Host ──(no tool call)──→ END
+Host ──(has tool calls)──→ SpecialistExecutor
+SpecialistExecutor ──(single intent)──→ END (直接返回专家回答)
+SpecialistExecutor ──(multi intent)──→ Summarize → END (聚合多个专家回答)
+```
+
+**关键设计**:
+
+- **Specialist 作为 Tool**: Host ChatModel 通过 ToolCall 选择 specialist;复刻版把 Host 路由、specialist 执行和聚合封装在一个 `multi_agent_core` graph node 内,保留逻辑拓扑而不复制生产版所有内部 branch 节点。
+- **Specialist 入参替换**: Specialist 接收的是**完整的用户消息历史** (`state.Msgs`),而非 Host 发出的 ToolCall 参数。这让 specialist 有完整的用户上下文。
+- **Specialist 的三种形式**: ChatModel (附带 SystemPrompt)、Invokable 函数、Streamable 函数——通过 `invokeSpecialist` 统一调度。
+- **Summarizer**: 多意图时,可选自定义 ChatModel 做总结,否则使用默认拼接 (`[name]: content`)。
 
 ```go
-func (cr *composableRunnable) stream(ctx context.Context, input any) (any, error) {
-    if cr.s != nil { return cr.s(ctx, input) }
-    if cr.t != nil { return cr.t(ctx, streamFromItems(input)) }
-    if cr.i != nil { return streamFromItems(cr.i(ctx, input)) }
-    if cr.c != nil { return streamFromItems(cr.c(ctx, streamFromItems(input))) }
-    return nil, fmt.Errorf("runnable: Stream not supported")
+config := &compose.MultiAgentConfig{
+    Host: newCannedChatModel("", []ToolCall{...}),
+    Specialists: []*compose.Specialist{
+        {Name: "math_expert", IntendedUse: "solves math", ChatModel: mathModel},
+        {Name: "code_expert", IntendedUse: "writes code", ChatModel: codeModel},
+    },
+    Summarizer: &compose.Summarizer{ChatModel: summaryModel, SystemPrompt: "Synthesize concisely."},
 }
+
+agent, _ := compose.NewMultiAgent(ctx, config)
+result, _ := agent.Invoke(ctx, []*compose.Message{{Role: compose.User, Content: "solve and code"}})
 ```
 
-### StreamReader — 流式数据接收器
+### State 基础设施 (compose/state.go)
 
-**基础 Pipe stream** 模拟 Eino 的流式数据接收抽象:
-- `NewPipe[T](cap)`: 创建 reader/writer
-- `PipeStreamReader[T].Recv() (T, bool)`: 接收下一个分块
-- `PipeStreamWriter[T].Send(T)`: 发送分块
-- `Copy`: 教学版流扇出
-- `Merge` / `Concat`: 教学版流扇入和折叠
+本章依赖的底层 state 机制:
 
-### Collect — 流式收集模式
+- `WithGenLocalState[T](factory)`: 注入 per-run state 工厂,graph 启动时调用
+- `ProcessState[T](ctx, fn)`: 在工具/pre-handler 中读/写 state
+- `GetState[T](ctx)`: 只读检索 state
+- `WithNodePreHandler(fn)`: 注册节点输入预处理器,在 action 执行前转换输入
+- `SetToolCallID / GetToolCallID`: context 级工具调用 ID 传递
 
-将流式分块按序收集为完整结果:
-```
-StreamReader → Recv(token_1) → Recv(token_2) → ... → Collect(完整结果)
-```
+### 测试覆盖
 
-Eino 完整版支持多种合并策略 (append/concat/mergeMap),本教育子集演示基础概念。
+- `agent/react_test.go`: 23 个测试 — NoTools / SingleToolCall / MultiRound / MaxStep / ReturnDirectly / MessageModifier / MessageRewriter / StreamToolCallChecker / EmptyInput / NilConfig / StateIsolation / StreamMode / LargeMultiRound / MultipleToolsInOneCall
+- `compose/multiagent_test.go`: 25 个测试 — SingleSpecialist / MultiIntent / DirectAnswer / ChatModel / Invokable / Streamable / PreHandler / Summarizer / CustomSummarizer / Validation / StateIsolation / Stream / LargeMultiIntent / AgentAsSpecialist
+- `compose/state_test.go`: 11 个测试 — GenLocalState / ProcessState / GetState / NodePreHandler / ToolCallID / state isolation
 
-### Transform — 流式变换模式
+### 边界
 
-对流中每个分块应用变换函数,构建处理管道:
-```
-StreamReader → Transform(fn) → Collect
-```
-
-支持三种变换模式:
-- **逐 chunk 变换**: `StreamReader[T] → Transform(fn) → StreamReader[U]`
-- **带状态变换**: 函数中维护计数器/滑动窗口/状态机
-- **批量变换**: 收集 N 个 chunk 后一次性处理
-
-### CallbackWrapper — 回调生命周期
-
-演示 Eino 的回调生命周期 (OnStart → Execute → OnEnd/OnError),并提供轻量 CallbackWrapper:
-- `OnStart`: 记录开始时间和输入
-- `OnEnd`: 记录结束时间、输出、耗时
-- `OnError`: 记录错误和耗时
-- `OnStartWithStreamInput`: 为流输入回调提供副本
-- `OnEndWithStreamOutput`: 为流输出回调提供副本
-
-EventLog 在 graph 级别提供等效的可观测性。
+- 不实现生产级 `ToolCallingModel` 接口 (模型级 tool binding)
+- 不实现 Claude/Gemini 专用的完整 `StreamToolCallChecker` (仅提供注入点)
+- 不实现 `HandOff` callback (Host → Specialist 专用事件)
+- 不实现 Agent 级 Interrupt/Resume (checkpoint 在 graph 层已实现,未与 agent loop 深度集成)
+- 不实现 `ExportGraph` / 动态图修改
+- 不实现 Agent Option 双通道多态 (`composeOptions` + `implSpecificOptFn`)
+- 不实现 `WithMessageFuture` 的 agent 级 callback future;callback 基础设施在 compose 层已有,本章只展示 agent loop 核心
+- 不实现 Streaming ToolsNode (工具仅 Invoke 模式)
+- 不实现增强型 ToolResult (多模态结果仅 string)
 
 ---
 
@@ -674,8 +729,11 @@ git diff --check
 
 ```
 examples/eino-compose-runtime-replica-go/
-├── cmd/example/main.go          # 综合示例 (20 个场景,覆盖 Chapter 1/2/3/4/5)
-├── compose/
+├── cmd/example/main.go          # 综合示例 (23 个示例,覆盖 Chapter 1/2/3/4/5/6/7)
+├── agent/
+│   ├── react.go                 # ReAct Agent Graph Builder (NewAgent, pre-handler, branch)
+│   ├── react_test.go            # 23 个测试 (ReAct 循环、ReturnDirectly、MessageRewriter/Modifier、StreamToolCallChecker)
+│   └── types.go                 # AgentConfig, reactState
 │   ├── types.go                 # NodeTriggerMode, ComponentType, 哨兵错误, START/END
 │   ├── runnable.go              # Runnable[I,O], Lambda, composableRunnable
 │   ├── graph.go                 # 内部 graph: AddNode, AddEdge, addEdgeWithMappings, compile, Kahn 环检测
@@ -707,7 +765,11 @@ examples/eino-compose-runtime-replica-go/
 │   ├── provider_openai.go       # OpenAI Adapter: OpenAIMessage/OpenAIChatRequest ↔ 规范 Message
 │   ├── provider_claude.go       # Claude Adapter: ClaudeContentBlock/ClaudeChatRequest ↔ 规范 AgenticMessage
 │   ├── provider_gemini.go       # Gemini Adapter: GeminiPart/GeminiChatRequest ↔ 规范类型
-│   └── utils.go                 # 辅助函数
+│   ├── multiagent.go             # Host Multi-Agent Graph Builder (NewMultiAgent, Specialist, Summarizer)
+│   ├── multiagent_test.go        # 25 个测试 (SingleIntent / MultiIntent / Summarizer / Specialist modes / Stream)
+│   ├── state.go                  # Graph Local State 基础设施 (WithGenLocalState / ProcessState / GetState / WithNodePreHandler)
+│   ├── state_test.go             # 11 个 State 基础设施测试
+│   └── utils.go                  # 辅助函数
 ├── research/
 │   ├── ch2-implementation-contract.md  # 第二章实现契约
 │   ├── ch2-verification.md             # 第二章完整验证记录
@@ -737,7 +799,7 @@ examples/eino-compose-runtime-replica-go/
 
 ## 明确未实现的边界
 
-**本复刻版是教育子集 (educational subset)。ChatModel/Retriever 组件接口已实现 (Chapter 4),Bridge Adapter 模式已演示 (I3),PromptTemplate/Tool/ToolsNode 桥接已实现 (Chapter 5)。完整图流式执行、stream field mapping、Workflow 分支运行时路由仍为已知缺口。**
+**本复刻版是教育子集 (educational subset)。ChatModel/Retriever 组件接口已实现 (Chapter 4),Bridge Adapter 模式已演示 (I3),PromptTemplate/Tool/ToolsNode 桥接已实现 (Chapter 5),Canonical Schema / Stream Concat / Provider Adapter 已实现 (Chapter 6),ReAct Agent + Host Multi-Agent 已实现 (Chapter 7)。完整图流式执行、stream field mapping、Workflow 分支运行时路由仍为已知缺口。**
 
 本复刻版聚焦于 Eino Compose Runtime 的核心图编译与执行引擎,以下为明确未实现的部分:
 

@@ -15,14 +15,15 @@ type channel interface {
 }
 
 type chanCall struct {
-	nodeKey       string
-	action        *composableRunnable
-	writeTo       map[string]bool
-	controls      map[string]bool
-	fieldMappings map[string][]*FieldMapping
-	preHandlers   []handlerPair
-	callbacks     []*Handler
-	nodeInfo      *GraphNodeInfo
+	nodeKey          string
+	action           *composableRunnable
+	writeTo          map[string]bool
+	controls         map[string]bool
+	fieldMappings    map[string][]*FieldMapping
+	preHandlers      []handlerPair
+	inputPreHandlers []func(ctx context.Context, input any) (any, error)
+	callbacks        []*Handler
+	nodeInfo         *GraphNodeInfo
 }
 
 type channelManager struct {
@@ -147,6 +148,19 @@ func (tm *taskManager) submit(ctx context.Context, tasks []*task) {
 				return
 			}
 
+			input := tt.input
+			for _, h := range tt.call.inputPreHandlers {
+				var err error
+				input, err = h(tt.ctx, input)
+				if err != nil {
+					tt.err = err
+					if tm.eventLog != nil {
+						tm.eventLog.LogNodeError(tt.nodeKey, tm.step, tt.err)
+					}
+					return
+				}
+			}
+
 			actionFn := tt.call.action.invoke
 			if len(tt.call.callbacks) > 0 && tt.call.nodeInfo != nil {
 				ri := &RunInfo{
@@ -158,7 +172,7 @@ func (tm *taskManager) submit(ctx context.Context, tasks []*task) {
 				actionFn = cw.Invoke(actionFn)
 			}
 
-			output, err := actionFn(tt.ctx, tt.input)
+			output, err := actionFn(tt.ctx, input)
 			tt.output = output
 			tt.err = err
 

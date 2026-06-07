@@ -1,6 +1,58 @@
-# CHANGELOG — 第二/三/四/五/六章 & I3 Bridge Adapter 示例与文档更新
+# CHANGELOG — 第二/三/四/五/六/七章 & I3 Bridge Adapter 示例与文档更新
 
-本文档记录对 `examples/eino-compose-runtime-replica-go` 的第二章 (FieldMapping / Workflow / Chain / Parallel / Branch)、第三章 (Runnable Stream / Collect / Transform / Callback)、第四章 (ChatModel + Retriever 组件接口)、第五章 (PromptTemplate / Tool / ToolsNode)、第六章 (Canonical Schema / Stream Concat / Provider Adapters)、I3 Bridge Adapter 与桥接审计 (R1/R2) 的示例补全与文档更新。
+本文档记录对 `examples/eino-compose-runtime-replica-go` 的第二章 (FieldMapping / Workflow / Chain / Parallel / Branch)、第三章 (Runnable Stream / Collect / Transform / Callback)、第四章 (ChatModel + Retriever 组件接口)、第五章 (PromptTemplate / Tool / ToolsNode)、第六章 (Canonical Schema / Stream Concat / Provider Adapters)、第七章 (Agent Flow: ReAct / Host Multi-Agent)、I3 Bridge Adapter 与桥接审计 (R1/R2) 的示例补全与文档更新。
+
+---
+
+## Ch7: Chapter 7 — Agent Flow: ReAct / Host Multi-Agent
+
+将可复用的 LLM 应用 pattern (ReAct 推理-行动循环、多专家路由) 编码为 compose.Graph 构建器,不引入独立的 "agent runtime"。主要包括 `agent.NewAgent` (ReAct) 和 `compose.NewMultiAgent` (Host) 两个 graph builder。
+
+### 变更范围
+
+| 文件 | 变更类型 | 说明 |
+|------|---------|------|
+| `compose/state.go` | 新增 | `WithGenLocalState` / `ProcessState` / `GetState` / `WithNodePreHandler` / `SetToolCallID` / `GetToolCallID` / `ToolsNode` / `ToolsNodeConfig` / `InvokableTool` |
+| `compose/state_test.go` | 新增 | 11 个 State 基础设施测试 |
+| `compose/multiagent.go` | 新增 | Host Multi-Agent Graph Builder: `NewMultiAgent` / `Specialist` / `Summarizer` / `MultiAgentConfig` |
+| `compose/multiagent_test.go` | 新增 | 25 个测试: SingleIntent / MultiIntent / ChatModel / Invokable / Streamable / Summarizer / Validation / StateIsolation / Stream / LargeMultiIntent / AgentAsSpecialist |
+| `agent/types.go` | 新增 | `AgentConfig` / `MessageRewriter` / `MessageModifier` / `StreamToolCallChecker` / `reactState` |
+| `agent/react.go` | 新增 | ReAct Agent Graph Builder: `NewAgent` / `modelPreHandle` / `toolsNodePreHandle` / `modelPostBranchCondition` / `buildReturnDirectly` / `DefaultStreamToolCallChecker` / `ScanAllStreamToolCallChecker` / `SetReturnDirectly` |
+| `agent/react_test.go` | 新增 | 23 个测试: NoTools / SingleToolCall / MultiRound / MaxStep / ReturnDirectly / MessageModifier / MessageRewriter / StreamToolCallChecker / StateIsolation / StreamMode / LargeMultiRound / MultipleToolsInOneCall |
+| `cmd/example/main.go` | 更新 | 新增 Example 22 (ReAct Agent Loop) 和 Example 23 (Host Multi-Agent Routing),示例总数增至 23 (+ Chapter 7) |
+| `README.md` | 更新 | 新增第七章功能章节,含 ReAct graph 拓扑、Host Multi-Agent 拓扑、State 基础设施、测试覆盖、边界说明 |
+| `CHANGELOG.md` | 更新 | 本文件 |
+| `FINAL_SUMMARY.md` | 更新 | 新增第七章功能摘要,更新验证状态 |
+| `research/ch7-agent-flow-contract.md` | 已有 | 研究笔记: Chapter 07 核心契约与复刻版设计 |
+| `research/ch7-implementation-contract.md` | 已有 | 实施契约: 文件分配、API 名称、测试规范 |
+| `research/ch7-verification.md` | 新增 | T1 验证记录: 测试结果、文档完整性、示例运行 |
+
+### ReAct Agent 设计要点
+
+1. **Graph Builder 而非独立 Runtime**: 通过 `NewAgent(config)` 构建 `START → ChatModel → (ToolCall? Tools → ChatModel : END)` 循环图,循环通过 `AnyPredecessor` + Pregel 实现。
+2. **Local State**: `reactState{Messages, ReturnDirectlyToolCallID}` 通过 `WithGenLocalState` 管理,消息追加在 pre-handler 中完成,不同 agent 实例 state 完全隔离。
+3. **MessageRewriter vs MessageModifier**: Rewriter 修改 state (持久化,用于压缩);Modifier 修改 copy (临时,用于注入 system prompt)。Rewriter 先于 Modifier 执行。
+4. **Tool Return Directly**: 配置级 (`ToolReturnDirectly` map) 和运行时 (`SetReturnDirectly`) 两种方式,运行时优先。
+5. **StreamToolCallChecker**: 默认 OpenAI 风格的 "first chunk" 启发式,另提供 `ScanAllStreamToolCallChecker` 展示 Claude/Gemini 这类 text-before-tool-call provider 的完整扫描思路。当前 `Generate` 路径仍通过非流式 `Message.ToolCalls` 分支。
+
+### Host Multi-Agent 设计要点
+
+1. **Specialist 作为 Tool**: Host ChatModel 通过 ToolCall 选择 specialist;复刻版把 Host 路由、specialist 执行和聚合封装在一个 `multi_agent_core` graph node 内,保留逻辑拓扑。
+2. **Specialist 入参替换**: Specialist 收到完整用户消息历史而非 ToolCall 参数,确保有完整上下文。
+3. **三种 Specialist 形式**: ChatModel / Invokable / Streamable,通过 `invokeSpecialist` 统一调度。
+4. **单/多意图分支**: 单意图直接返回,多意图通过默认拼接或自定义 Summarizer ChatModel 聚合。
+5. **Summarizer**: 可选自定义 ChatModel (带 SystemPrompt) 做总结。
+
+### 测试覆盖 (本章新增)
+
+- `agent/react_test.go`: 23 个测试覆盖 CRITICAL + HIGH 场景
+- `compose/multiagent_test.go`: 25 个测试覆盖 SingleIntent / MultiIntent / Specialist 三种模式 / Summarizer / Stream / Validation / AgentAsSpecialist
+- `compose/state_test.go`: 11 个 State 基础设施测试
+- 所有已有测试 (compose 包 130+ 测试) 保持通过
+
+### 教学边界
+
+当前实现刻意保留为教育子集: 不实现生产级 `ToolCallingModel` 接口、Claude/Gemini 完整 provider-specific StreamToolCallChecker、`HandOff` callback、Agent 级 Interrupt/Resume、`ExportGraph` 动态修改、Agent Option 双通道多态、`WithMessageFuture` agent 级 callback future、Streaming ToolsNode 和增强型多模态 ToolResult。
 
 ---
 
@@ -261,9 +313,9 @@ README.md 第三章新增内容:
 
 ### 状态
 
-- 所有测试通过 (`go test ./...`) — compose 包 130+ 测试 PASS
+- 所有测试通过 (`go test ./...`) — compose 包 150+ 测试 PASS,agent 包 21 测试 PASS
 - 代码编译通过 (`go build ./...`)、`go vet ./...` 无问题
 - 代码格式化通过 (`gofmt -w .`)
 - 示例程序运行通过 (`go run ./cmd/example`)
-- 20 个示例覆盖 Chapter 1 (Graph/DAG/Pregel/Info/EventLog) + Chapter 2 (FieldMapping/Workflow/Chain/Parallel/Branch) + Chapter 3 (Stream/Collect/Transform/Callback) + Chapter 4 Bridge (RAG Pipeline + Bridge Pattern) + Chapter 5 (Tool Calling Pipeline Workflow/Chain/Graph)
-- 已知缺口已在 `research/ch4-r2-replica-bridge-audit.md` 完整记录
+- 23 个示例覆盖 Chapter 1 (Graph/DAG/Pregel/Info/EventLog) + Chapter 2 (FieldMapping/Workflow/Chain/Parallel/Branch) + Chapter 3 (Stream/Collect/Transform/Callback) + Chapter 4 Bridge (RAG Pipeline + Bridge Pattern) + Chapter 5 (Tool Calling Pipeline Workflow/Chain/Graph) + Chapter 4B (Checkpoint/Interrupt/Resume) + Chapter 6 (Schema/Provider Adapter) + Chapter 7 (ReAct Agent / Host Multi-Agent)
+- 已知缺口已在 `research/ch4-r2-replica-bridge-audit.md` 和 `research/ch7-agent-flow-contract.md` 完整记录

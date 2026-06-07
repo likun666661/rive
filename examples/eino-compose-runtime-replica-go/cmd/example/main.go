@@ -7,11 +7,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rive/eino-compose-runtime-replica-go/agent"
 	compose "github.com/rive/eino-compose-runtime-replica-go/compose"
 )
 
 func main() {
-	fmt.Println("=== Eino Compose Runtime Replica — Chapter 1 / 2 / 3 / 4 / 5 / 6 综合示例 ===")
+	fmt.Println("=== Eino Compose Runtime Replica — Chapter 1 / 2 / 3 / 4 / 5 / 6 / 7 综合示例 ===")
 	fmt.Println()
 
 	fmt.Println("========== 第一章示例 (Graph/DAG/Pregel/Info/EventLog) ==========")
@@ -61,6 +62,12 @@ func main() {
 	fmt.Println("========== 第六章示例 (Schema / Provider Adapter 互操作) ==========")
 	fmt.Println()
 	example21_SchemaProviderAdapters()
+
+	fmt.Println()
+	fmt.Println("========== 第七章示例 (ReAct Agent / Host Multi-Agent) ==========")
+	fmt.Println()
+	example22_ReActAgent()
+	example23_HostMultiAgent()
 }
 
 func example1_DAGBasic() {
@@ -1589,4 +1596,300 @@ func example21_SchemaProviderAdapters() {
 	fmt.Println("#   - RegisterStreamChunkConcatFunc/ConcatItems 把流式合并交给类型注册表, compose runtime 不写 provider 分支。")
 	fmt.Println("#   - 本示例只做教育版 native payload skeleton, 不接真实 provider SDK。")
 	fmt.Println()
+}
+
+func example22_ReActAgent() {
+	fmt.Println("--- Example 22: ReAct Agent Loop ---")
+	fmt.Println()
+
+	fmt.Println("# 22.1 无工具场景: 模型直接回答, 不进入 Tool → Model 循环")
+	fmt.Println()
+
+	noToolsModel := compose.NewFakeChatModel(
+		compose.WithChatGenerateFunc(func(ctx context.Context, msgs []*compose.Message) (*compose.Message, error) {
+			return &compose.Message{Role: compose.Assistant, Content: "你好, 我是 ReAct Agent!"}, nil
+		}),
+	)
+
+	a, err := agent.NewAgent(context.Background(), &agent.AgentConfig{
+		ChatModel: noToolsModel,
+		MaxStep:   10,
+	})
+	if err != nil {
+		fmt.Printf("  NewAgent error: %v\n\n", err)
+		return
+	}
+
+	result, _ := a.Generate(context.Background(), []*compose.Message{
+		{Role: compose.User, Content: "你好"},
+	})
+	fmt.Printf("  Input:  %q\n", "你好")
+	fmt.Printf("  Output: %q\n", result.Content)
+	fmt.Println()
+
+	fmt.Println("# 22.2 单工具调用场景: 模型调用工具 → 工具返回 → 模型给最终回答")
+	fmt.Println()
+
+	searchTool := &exampleCannedTool{name: "search", desc: "搜索工具", result: "搜索结果: 42"}
+	scriptModel := compose.NewFakeChatModel(
+		compose.WithChatGenerateFunc(func(ctx context.Context, msgs []*compose.Message) (*compose.Message, error) {
+			if strings.Contains(lastMessageContent(msgs), "搜索结果") {
+				return &compose.Message{Role: compose.Assistant, Content: "基于工具结果, 答案是 42。"}, nil
+			}
+			return &compose.Message{
+				Role: compose.Assistant,
+				ToolCalls: []compose.ToolCall{
+					{ID: "call_001", Function: compose.ToolCallFunction{Name: "search", Arguments: `{"q":"42"}`}},
+				},
+			}, nil
+		}),
+	)
+
+	a2, err := agent.NewAgent(context.Background(), &agent.AgentConfig{
+		ChatModel:   scriptModel,
+		ToolsConfig: compose.ToolsNodeConfig{Tools: []compose.InvokableTool{searchTool}},
+		MaxStep:     20,
+		MessageModifier: func(ctx context.Context, msgs []*compose.Message) []*compose.Message {
+			return append([]*compose.Message{compose.SystemMessage("你是一个有用的助手")}, msgs...)
+		},
+	})
+	if err != nil {
+		fmt.Printf("  NewAgent error: %v\n\n", err)
+		return
+	}
+
+	result2, _ := a2.Generate(context.Background(), []*compose.Message{
+		{Role: compose.User, Content: "搜索 42"},
+	})
+	fmt.Printf("  Input:  %q\n", "搜索 42")
+	fmt.Printf("  Output: %q\n", result2.Content)
+	fmt.Println()
+
+	fmt.Println("# 22.3 Return Directly: 工具结果直接作为最终回答, 不再经过模型")
+	fmt.Println()
+
+	directModel := compose.NewFakeChatModel(
+		compose.WithChatGenerateFunc(func(ctx context.Context, msgs []*compose.Message) (*compose.Message, error) {
+			return &compose.Message{
+				Role: compose.Assistant,
+				ToolCalls: []compose.ToolCall{
+					{ID: "call_direct", Function: compose.ToolCallFunction{Name: "lookup", Arguments: `{"key":"val"}`}},
+				},
+			}, nil
+		}),
+	)
+
+	directTool := &exampleCannedTool{name: "lookup", desc: "查找工具", result: "直接返回结果: found!"}
+
+	a3, err := agent.NewAgent(context.Background(), &agent.AgentConfig{
+		ChatModel:          directModel,
+		ToolsConfig:        compose.ToolsNodeConfig{Tools: []compose.InvokableTool{directTool}},
+		MaxStep:            20,
+		ToolReturnDirectly: map[string]bool{"lookup": true},
+	})
+	if err != nil {
+		fmt.Printf("  NewAgent error: %v\n\n", err)
+		return
+	}
+
+	result3, _ := a3.Generate(context.Background(), []*compose.Message{
+		{Role: compose.User, Content: "查找"},
+	})
+	fmt.Printf("  Input:  %q\n", "查找")
+	fmt.Printf("  Output: %q\n", result3.Content)
+	fmt.Println()
+
+	fmt.Println("# 22.4 MessageRewriter 上下文压缩: 只保留最近 3 条消息")
+	fmt.Println()
+
+	rewriterModel := compose.NewFakeChatModel(
+		compose.WithChatGenerateFunc(func(ctx context.Context, msgs []*compose.Message) (*compose.Message, error) {
+			if strings.Contains(lastMessageContent(msgs), "tool_result") {
+				return &compose.Message{Role: compose.Assistant, Content: "已压缩上下文的最终回答"}, nil
+			}
+			return &compose.Message{
+				Role: compose.Assistant,
+				ToolCalls: []compose.ToolCall{
+					{ID: "call_rw", Function: compose.ToolCallFunction{Name: "echo", Arguments: `{}`}},
+				},
+			}, nil
+		}),
+	)
+
+	echoTool := &exampleCannedTool{name: "echo", desc: "echo", result: "tool_result"}
+
+	a4, err := agent.NewAgent(context.Background(), &agent.AgentConfig{
+		ChatModel:   rewriterModel,
+		ToolsConfig: compose.ToolsNodeConfig{Tools: []compose.InvokableTool{echoTool}},
+		MaxStep:     20,
+		MessageRewriter: func(ctx context.Context, msgs []*compose.Message) []*compose.Message {
+			if len(msgs) > 3 {
+				return msgs[len(msgs)-3:]
+			}
+			return msgs
+		},
+	})
+	if err != nil {
+		fmt.Printf("  NewAgent error: %v\n\n", err)
+		return
+	}
+
+	result4, _ := a4.Generate(context.Background(), []*compose.Message{
+		{Role: compose.User, Content: "test"},
+	})
+	fmt.Printf("  Input:  %q\n", "test")
+	fmt.Printf("  Output: %q\n", result4.Content)
+	fmt.Println()
+
+	fmt.Println("# 关键点:")
+	fmt.Println("#   - ReAct Agent 就是一张 compose.Graph, 循环通过 AnyPredecessor + Pregel 实现")
+	fmt.Println("#   - modelPreHandle: 追加消息 → MessageRewriter(持久化) → MessageModifier(临时)")
+	fmt.Println("#   - toolsNodePreHandle: 追加 tool call → 判断 return directly")
+	fmt.Println("#   - modelPostBranchCondition: 检查 ToolCalls → 路由到 Tools 或 END")
+	fmt.Println("#   - MaxStep 是安全上限, 正常终止靠模型输出不含 tool call")
+	fmt.Println("#   - StreamToolCallChecker 提供 OpenAI 默认启发式与 Claude/Gemini scan-all 示例")
+	fmt.Println()
+}
+
+func example23_HostMultiAgent() {
+	fmt.Println("--- Example 23: Host Multi-Agent Routing ---")
+	fmt.Println()
+
+	fmt.Println("# 23.1 单意图: Host 路由到一个 specialist, 直接返回其答案")
+	fmt.Println()
+
+	host1 := compose.NewFakeChatModel(
+		compose.WithChatGenerateFunc(func(ctx context.Context, msgs []*compose.Message) (*compose.Message, error) {
+			return &compose.Message{
+				Role: compose.Assistant,
+				ToolCalls: []compose.ToolCall{
+					{ID: "call_math", Function: compose.ToolCallFunction{Name: "math_expert", Arguments: `{"reason":"solve"}`}},
+				},
+			}, nil
+		}),
+	)
+
+	mathExpert := compose.NewFakeChatModel(
+		compose.WithChatGenerateFunc(func(ctx context.Context, msgs []*compose.Message) (*compose.Message, error) {
+			return &compose.Message{Role: compose.Assistant, Content: "数学专家回答: 6 × 7 = 42"}, nil
+		}),
+	)
+
+	ma1, err := compose.NewMultiAgent(context.Background(), &compose.MultiAgentConfig{
+		Host: host1,
+		Specialists: []*compose.Specialist{
+			{Name: "math_expert", IntendedUse: "解答数学问题", ChatModel: mathExpert},
+		},
+	})
+	if err != nil {
+		fmt.Printf("  NewMultiAgent error: %v\n\n", err)
+		return
+	}
+
+	r1, _ := ma1.Invoke(context.Background(), []*compose.Message{
+		{Role: compose.User, Content: "6 × 7 等于多少?"},
+	})
+	fmt.Printf("  Input:  %q\n", "6 × 7 等于多少?")
+	fmt.Printf("  Output: %q\n", r1.Content)
+	fmt.Println()
+
+	fmt.Println("# 23.2 多意图: Host 路由到两个 specialist, 返回默认拼接结果")
+	fmt.Println()
+
+	host2 := compose.NewFakeChatModel(
+		compose.WithChatGenerateFunc(func(ctx context.Context, msgs []*compose.Message) (*compose.Message, error) {
+			return &compose.Message{
+				Role: compose.Assistant,
+				ToolCalls: []compose.ToolCall{
+					{ID: "call_math2", Function: compose.ToolCallFunction{Name: "math_expert", Arguments: `{}`}},
+					{ID: "call_code2", Function: compose.ToolCallFunction{Name: "code_expert", Arguments: `{}`}},
+				},
+			}, nil
+		}),
+	)
+
+	mathExpert2 := compose.NewFakeChatModel(
+		compose.WithChatGenerateFunc(func(ctx context.Context, msgs []*compose.Message) (*compose.Message, error) {
+			return &compose.Message{Role: compose.Assistant, Content: "数学: 42"}, nil
+		}),
+	)
+	codeExpert2 := compose.NewFakeChatModel(
+		compose.WithChatGenerateFunc(func(ctx context.Context, msgs []*compose.Message) (*compose.Message, error) {
+			return &compose.Message{Role: compose.Assistant, Content: "代码: print(42)"}, nil
+		}),
+	)
+
+	ma2, err := compose.NewMultiAgent(context.Background(), &compose.MultiAgentConfig{
+		Host: host2,
+		Specialists: []*compose.Specialist{
+			{Name: "math_expert", IntendedUse: "数学", ChatModel: mathExpert2},
+			{Name: "code_expert", IntendedUse: "代码", ChatModel: codeExpert2},
+		},
+	})
+	if err != nil {
+		fmt.Printf("  NewMultiAgent error: %v\n\n", err)
+		return
+	}
+
+	r2, _ := ma2.Invoke(context.Background(), []*compose.Message{
+		{Role: compose.User, Content: "求解 6×7 并写出代码"},
+	})
+	fmt.Printf("  Input:  %q\n", "求解 6×7 并写出代码")
+	fmt.Printf("  Output: %q\n", r2.Content)
+	fmt.Println()
+
+	fmt.Println("# 23.3 无工具调用: Host 直接回答, 不调用任何 specialist")
+	fmt.Println()
+
+	host3 := compose.NewFakeChatModel(
+		compose.WithChatGenerateFunc(func(ctx context.Context, msgs []*compose.Message) (*compose.Message, error) {
+			return &compose.Message{Role: compose.Assistant, Content: "你好, 我可以直接回答这个问题。"}, nil
+		}),
+	)
+
+	ma3, err := compose.NewMultiAgent(context.Background(), &compose.MultiAgentConfig{
+		Host: host3,
+		Specialists: []*compose.Specialist{
+			{Name: "unused_expert", IntendedUse: "未使用", ChatModel: compose.NewFakeChatModel()},
+		},
+	})
+	if err != nil {
+		fmt.Printf("  NewMultiAgent error: %v\n\n", err)
+		return
+	}
+
+	r3, _ := ma3.Invoke(context.Background(), []*compose.Message{
+		{Role: compose.User, Content: "你好"},
+	})
+	fmt.Printf("  Input:  %q\n", "你好")
+	fmt.Printf("  Output: %q\n", r3.Content)
+	fmt.Println()
+
+	fmt.Println("# 关键点:")
+	fmt.Println("#   - Host ChatModel 通过 ToolCall 选择 specialist(s)")
+	fmt.Println("#   - Specialist 接收完整用户消息历史 (非 ToolCall 参数)")
+	fmt.Println("#   - 单意图: 直接返回 specialist 输出")
+	fmt.Println("#   - 多意图: 默认拼接 [name]: content, 可选自定义 Summarizer ChatModel")
+	fmt.Println("#   - Specialist 支持 ChatModel / Invokable / Streamable 三种形式")
+	fmt.Println("#   - Host Multi-Agent 编译为 Runnable[[]*Message, *Message], 可作为子图嵌入")
+	fmt.Println()
+}
+
+type exampleCannedTool struct {
+	name, desc, result string
+}
+
+func (t *exampleCannedTool) Info(ctx context.Context) (*compose.ToolInfo, error) {
+	return &compose.ToolInfo{Name: t.name, Desc: t.desc}, nil
+}
+
+func (t *exampleCannedTool) Invoke(ctx context.Context, args string) (string, error) {
+	return t.result, nil
+}
+
+func lastMessageContent(msgs []*compose.Message) string {
+	if len(msgs) == 0 {
+		return ""
+	}
+	return msgs[len(msgs)-1].Content
 }

@@ -21,6 +21,8 @@ type runner struct {
 	graphInfo           *GraphInfo
 	eventLog            *EventLog
 	runStepCount        int
+	genLocalState       *genLocalStateEntry
+	branches            map[string][]*GraphBranch
 }
 
 func (r *runner) run(ctx context.Context, input any) (any, error) {
@@ -32,6 +34,11 @@ func (r *runner) run(ctx context.Context, input any) (any, error) {
 	}
 	if r.graphName != "" {
 		ctx = AppendAddressSegment(ctx, AddressSegmentRunnable, r.graphName)
+	}
+
+	if r.genLocalState != nil {
+		state := r.genLocalState.factory(ctx)
+		ctx = context.WithValue(ctx, r.genLocalState.key, state)
 	}
 
 	cm := newChannelManager()
@@ -217,8 +224,37 @@ func (r *runner) resolveCompletedTasks(ctx context.Context, cm *channelManager, 
 			}
 		}
 
+		writeTo := make(map[string]bool)
+		skipped := make(map[string]bool)
+		for k, v := range cc.writeTo {
+			writeTo[k] = v
+		}
+
+		if branches, ok := r.branches[t.nodeKey]; ok && len(branches) > 0 {
+			branch := branches[len(branches)-1]
+			matchedTarget, err := branch.condition(ctx, output)
+			if err != nil {
+				return fmt.Errorf("branch %s condition: %w", t.nodeKey, err)
+			}
+			if matchedTarget != "" {
+				if !branch.branchMap[matchedTarget] {
+					return fmt.Errorf("branch %s returned unknown target %q", t.nodeKey, matchedTarget)
+				}
+				for target := range writeTo {
+					if target != matchedTarget {
+						skipped[target] = true
+					}
+				}
+				writeTo = map[string]bool{matchedTarget: true}
+			}
+		}
+
+		if len(skipped) > 0 {
+			cm.reportSkip(t.nodeKey, skipped)
+		}
+
 		if len(cc.fieldMappings) > 0 {
-			for target := range cc.writeTo {
+			for target := range writeTo {
 				var val any = output
 				if fms, ok := cc.fieldMappings[target]; ok && len(fms) > 0 {
 					var err error
@@ -230,12 +266,12 @@ func (r *runner) resolveCompletedTasks(ctx context.Context, cm *channelManager, 
 				cm.updateValues(t.nodeKey, val, map[string]bool{target: true})
 			}
 		} else {
-			cm.updateValues(t.nodeKey, output, cc.writeTo)
+			cm.updateValues(t.nodeKey, output, writeTo)
 		}
 
 		cm.updateDependencies(t.nodeKey, cc.controls)
 
-		for branchTarget := range cc.writeTo {
+		for branchTarget := range writeTo {
 			_ = branchTarget
 		}
 	}

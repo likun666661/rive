@@ -6,9 +6,9 @@
 |------|------|
 | `gofmt -w .` | ✅ 所有 Go 文件已格式化,无变更 |
 | `go build ./...` | ✅ 零编译错误零警告 |
-| `go test ./... -count=1` | ✅ compose 包全部 PASS |
+| `go test ./... -count=1` | ✅ compose 包 + agent 包全部 PASS |
 | `go vet ./...` | ✅ 静态分析无问题 |
-| `go run ./cmd/example` | ✅ 20 个示例全部正常运行 |
+| `go run ./cmd/example` | ✅ 23 个示例全部正常运行 |
 | `git diff --check` | ✅ 无空白字符问题 |
 
 ---
@@ -301,6 +301,77 @@
 
 ---
 
+### 八、第七章: Agent Flow — ReAct / Host Multi-Agent
+
+> **本章将可复用的 LLM 应用 pattern 编码为 compose.Graph 构建器,包括 ReAct 推理-行动循环 (agent/react.go) 和 Host Multi-Agent 多专家路由 (compose/multiagent.go)。不引入独立的 "agent runtime"。**
+
+#### 46. ReAct Agent Graph Builder (agent/react.go)
+- `NewAgent(config)` 构建 `START → ChatModel → (ToolCall? Tools → ChatModel : END)` 循环图
+- 通过 `AnyPredecessor` + Pregel 实现循环,`MaxStep` 作为安全上限
+- `reactState{Messages, ReturnDirectlyToolCallID}` 通过 `WithGenLocalState` 管理
+- `modelPreHandle`: 追加本轮输入 → MessageRewriter (持久化) → MessageModifier (临时) → 返回处理后的消息给 ChatModel
+- `toolsNodePreHandle`: 追加 model 的 tool call → 判断 return directly
+- `modelPostBranchCondition`: 检查 `msg.ToolCalls` → 路由到 Tools 或 END
+- `buildReturnDirectly`: Tools 后分支 → 如果标记 return directly → direct_return lambda → END
+- `DefaultStreamToolCallChecker`: OpenAI 风格的 "first chunk" 启发式
+- `ScanAllStreamToolCallChecker`: text-before-tool-call provider 的完整扫描示例
+- `SetReturnDirectly(ctx)`: 运行时标注当前工具调用直接返回
+
+#### 47. MessageRewriter vs MessageModifier (agent/react.go)
+- `MessageRewriter`: 修改 `state.Messages` 本身 (持久化),用于上下文压缩
+- `MessageModifier`: 修改 `state.Messages` 的副本 (临时),用于注入 system prompt
+- 执行顺序: Rewriter 先执行,Modifier 后执行
+- 测试验证: `TestReAct_MessageRewriter_Ordering` 验证了 Modifier 能看到 Rewriter 的更改
+
+#### 48. Tool Return Directly 双机制 (agent/react.go)
+- 配置级: `AgentConfig.ToolReturnDirectly` map 声明哪些工具直接返回
+- 运行时: 工具实现中调用 `SetReturnDirectly(ctx)` 标注
+- 双机制共存: `TestReAct_SetReturnDirectly_Priority` 验证运行时优先
+
+#### 49. Host Multi-Agent Graph Builder (compose/multiagent.go)
+- `NewMultiAgent(config)` 构建多专家路由图
+- 验证: nil config / nil host / empty specialists / duplicate specialists / empty specialist name / nil specialist in list
+- Host ChatModel 通过 ToolCall 选择 specialist(s)
+- 每个 specialist 接收完整用户消息历史 (`state.Msgs`),而非 ToolCall 参数
+- 复刻版把 Host 路由、specialist 执行和聚合封装在一个 `multi_agent_core` graph node 内,保留逻辑拓扑而不复制生产版所有内部 branch 节点
+
+#### 50. Specialist 三种形式 (compose/multiagent.go)
+- **ChatModel**: `spec.ChatModel.Generate()` + 可选的 `SystemPrompt` (通过 pre-handler 注入)
+- **Invokable**: `spec.Invokable(ctx, input)` 直接调用
+- **Streamable**: `spec.Streamable(ctx, input)` 流式 → 收集后返回最后一条消息的 Content
+- 优先级: ChatModel → Invokable → Streamable
+
+#### 51. Summarizer 两种模式 (compose/multiagent.go)
+- **默认**: 将多个 specialist 回答拼接为 `[name]: content`
+- **自定义**: 通过 `Summarizer{ChatModel, SystemPrompt}` 用 ChatModel 做总结
+- 测试验证: `TestMultiAgent_CustomSummarizerWithSystemPrompt` 验证 system prompt 注入
+
+#### 52. State 基础设施 (compose/state.go)
+- `WithGenLocalState[T]`: per-run state 工厂,graph 启动时调用
+- `ProcessState[T](ctx, fn)`: 在 pre-handler / 工具中读/写 state
+- `GetState[T](ctx)`: 只读检索 state
+- `WithNodePreHandler(fn)`: 注册节点输入预处理器
+- `SetToolCallID / GetToolCallID`: context 级工具调用 ID 传递
+- `ToolsNode` / `ToolsNodeConfig` / `InvokableTool`: 工具执行节点
+
+#### 53. 测试覆盖 (agent/react_test.go + compose/multiagent_test.go)
+- `agent/react_test.go`: 23 个测试 — NoTools / SingleToolCall / MultiRoundToolCall / MaxStepEnforced / ReturnDirectly_Config / ReturnDirectly_Runtime / MessageModifier_Persistent / MessageRewriter_Compression / MessageRewriter_Ordering / StreamToolCallChecker_Default / StreamToolCallChecker_ClaudeStyle / StreamToolCallChecker_ScanAllNoToolCall / EmptyInput / NilConfig / NilChatModel / NoToolsConfig / StateIsolation / SetReturnDirectly_Priority / StreamMode_Basic / LargeMultiRound / ToolCallWithMultipleTools
+- `compose/multiagent_test.go`: 25 个测试 — SingleSpecialist_SingleIntent / MultiSpecialist_MultiIntent / NoSpecialist_DirectAnswer / Specialist_ChatModel / Specialist_Invokable / Specialist_Streamable / PreHandler_InputReplacement / DefaultSummarization / CustomSummarizer / InvalidSpecialistName / EmptySpecialists / NilHostChatModel / NilConfig / DuplicateSpecialistNames / SpecialistWithSystemPrompt / StateIsolation / MultipleToolCallsSameSpecialist / SpecialistEmptyName / HostModelError / SpecialistError / CustomSummarizerWithSystemPrompt / NilSpecialistInList / Stream / LargeMultiIntent / AgentAsSpecialist
+- `compose/state_test.go`: 11 个 State 基础设施测试
+
+#### 54. 明确不包含
+- 生产级 `ToolCallingModel` 接口 (模型级 tool binding)
+- Claude/Gemini 专用完整 `StreamToolCallChecker`
+- `HandOff` callback (Host → Specialist 事件)
+- Agent 级 Interrupt/Resume
+- `ExportGraph` / 动态图修改
+- Agent Option 双通道多态
+- `WithMessageFuture` agent 级 callback future
+- Streaming ToolsNode (工具仅 Invoke 模式)
+- 增强型多模态 ToolResult
+
+---
+
 ## 关键文件导览
 
 | 文件 | 职责 |
@@ -352,8 +423,15 @@
 | `prompt_tool_bridge_test.go` | 15 测试: BridgeToolFunc / PromptTemplate / ToolsNode / 三编排端到端 pipeline |
 | `callbacks_test.go` | 25 测试: 5 阶段时序、上下文隔离、TimingChecker、CbStreamReader |
 | `graph_test.go` | 80+ 测试: DAG/Pregel/边界/EventLog/Branch/Callback 集成 |
-| `cmd/example/main.go` | 综合示例程序 (20 个场景,覆盖 Graph/DAG/Pregel/FieldMapping/Workflow/Chain/Parallel/Branch/Stream/Collect/Transform/Callback/Bridge/RAG/ToolCallingPipeline) |
-| `research/` | 研究文档: ch2/ch3/ch4/ch5/ch6 实现契约、差距审计、验证记录和 Provider Schema 契约 |
+| `cmd/example/main.go` | 综合示例程序 (23 个场景,覆盖 Graph/DAG/Pregel/FieldMapping/Workflow/Chain/Parallel/Branch/Stream/Collect/Transform/Callback/Bridge/RAG/ToolCallingPipeline/Checkpoint/Schema/Provider/ReAct/Host) |
+| `agent/react.go` | ReAct Agent Graph Builder (NewAgent, pre-handler, branch, DefaultStreamToolCallChecker) |
+| `agent/types.go` | AgentConfig, MessageRewriter, MessageModifier, StreamToolCallChecker, reactState |
+| `agent/react_test.go` | 23 个 ReAct Agent 测试 |
+| `compose/multiagent.go` | Host Multi-Agent Graph Builder (NewMultiAgent, Specialist, Summarizer) |
+| `compose/multiagent_test.go` | 25 个 Host Multi-Agent 测试 |
+| `compose/state.go` | State 基础设施 (WithGenLocalState, ProcessState, GetState, WithNodePreHandler, ToolsNode) |
+| `compose/state_test.go` | 11 个 State 基础设施测试 |
+| `research/` | 研究文档: ch2/ch3/ch4/ch5/ch6/ch7 实现契约、差距审计、验证记录 |
 
 ---
 
@@ -384,7 +462,7 @@ git diff --check
 
 ## 明确未实现的边界
 
-**本复刻版是教育子集 (educational subset)。ChatModel/Retriever 组件接口已实现 (Chapter 4),Bridge Adapter 模式已演示 (I3)。以下为明确未实现的部分:**
+**本复刻版是教育子集 (educational subset)。ChatModel/Retriever 组件接口已实现 (Chapter 4),Bridge Adapter 模式已演示 (I3),PromptTemplate/Tool/ToolsNode 桥接已实现 (Chapter 5),Canonical Schema / Stream Concat / Provider Adapter 已实现 (Chapter 6),ReAct Agent + Host Multi-Agent 已实现 (Chapter 7)。以下为明确未实现的部分:**
 
 本复刻版聚焦于 Eino Compose Runtime 的核心图编译与执行引擎。以下为明确未实现的部分:
 
@@ -407,6 +485,15 @@ git diff --check
 
 ### 类型系统局限
 - `fmtType()` 仅覆盖 `string/int/float64/bool` 四种基础类型,其余返回 `"any"`
+
+### 第七章 Agent Flow 明确排除
+- **Agent Option 双通道多态**: 不实现 `composeOptions` + `implSpecificOptFn` 双通道,仅暴露显式 option 函数
+- **HandOff Callback**: 不实现 Host ↔ Specialist 专用回调,复用 graph 级通用 callback
+- **Agent 级 Interrupt/Resume**: Ch4 的 checkpoint/interrupt 在 graph 层已实现,但不与 agent loop 深度集成
+- **Claude/Gemini 专用 StreamToolCallChecker**: 仅提供默认 OpenAI 风格 checker + 注入点
+- **Streaming ToolsNode**: 工具仅 Invoke 模式 (匹配 Ch5 教育子集范围)
+- **增强型 ToolResult**: tool result 仅 string 类型
+- **ExportGraph / 动态图修改**: agent 图一次性构建不可修改
 
 ---
 
@@ -468,3 +555,5 @@ Go Eino Compose Runtime Replica 成功实现了 Eino 的核心设计理念:
 13. **Chapter 4 Component Interfaces**: 独立的 ChatModel/Retriever 接口 + Fake 实现 + Lambda 桥接 + 四模式降级测试
 14. **桥接审计 (R1/R2)**: 六层抽象 90%+ 完成度,3 个关键缺口已在 `research/ch4-r2-replica-bridge-audit.md` 记录
 15. **Chapter 5 PromptTemplate / Tool / ToolsNode**: ChatTemplate 接口 + MessageTemplate 渲染 + BridgeTool 领域接口 + ToolsNode 工具执行 + Workflow/Chain/Graph 三编排,全程确定性无外部依赖
+16. **Chapter 6 Canonical Schema / Stream Concat / Provider Adapters**: Message / AgenticMessage 双消息模型 + ToolCall/ToolResult 规范 + ConcatItems stream 合并 + OpenAI/Claude/Gemini Provider Adapter 骨架
+17. **Chapter 7 Agent Flow**: ReAct 推理-行动循环 (Graph Builder 编码) + Host Multi-Agent 多专家路由 (Specialist-as-Tool) + State 基础设施 + MessageRewriter/Modifier 双语义 + Tool Return Directly 双机制 + Address 隔离 Callback Handler
