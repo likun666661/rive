@@ -6,6 +6,11 @@
 
 输出文件位于 [`manual/`](./manual/) 目录下。
 
+如果要把这套材料讲给别人，优先阅读
+[`manual/teaching-manual-outline.md`](./manual/teaching-manual-outline.md)：
+它把 7 章内容整理成一份 90-120 分钟教学细纲，包含讲解目标、逻辑主线、
+代码走读、演示建议、练习题和代码附录。
+
 ## 演示内容
 
 - 一次宽泛的研究/文档请求可以被转换为一个 Work DAG。
@@ -47,6 +52,12 @@
 | 组件、模型、工具与提示契约 | [`manual/05-components-model-tool-prompt.md`](./manual/05-components-model-tool-prompt.md) |
 | Schema 与提供者适配器 | [`manual/06-schema-provider-adapters.md`](./manual/06-schema-provider-adapters.md) |
 | Agent 流程、ReAct 与多 Agent 宿主 | [`manual/07-agent-flow-react-multiagent.md`](./manual/07-agent-flow-react-multiagent.md) |
+
+## 教学细纲
+
+- [`manual/teaching-manual-outline.md`](./manual/teaching-manual-outline.md)：
+  面向讲授者的完整教学路线图，按 90-120 分钟课程组织每章的讲解主线、
+  关键误解、练习题和代码索引。
 
 ## 实践经验
 

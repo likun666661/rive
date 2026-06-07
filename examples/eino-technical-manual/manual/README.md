@@ -26,6 +26,13 @@ The intended reading pattern for every chapter is:
 | 6 | `06-schema-provider-adapters.md` | Schema model, provider adapters, streams, serialization and interop |
 | 7 | `07-agent-flow-react-multiagent.md` | ReAct agent graph, host multi-agent flow, callback isolation |
 
+## Teaching Outline
+
+`teaching-manual-outline.md` is the presenter-facing outline for turning these
+chapters into a 90-120 minute teaching session. It covers the chapter sequence,
+transition logic, source walkthrough plan, exercises, common misconceptions,
+and a consolidated code appendix.
+
 ## Notes
 
 - These files are a technical guide, not upstream Eino documentation.
