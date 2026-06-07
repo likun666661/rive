@@ -11,6 +11,8 @@ type graphCompileOptions struct {
 	maxSteps        int
 	eagerDisabled   bool
 	genLocalState   *genLocalStateEntry
+	eventLog        *EventLog
+	eventSinks      []EventSink
 }
 
 type genLocalStateEntry struct {
@@ -41,6 +43,18 @@ func WithMaxRunSteps(steps int) CompileOption {
 func WithEagerExecutionDisabled() CompileOption {
 	return func(o *graphCompileOptions) {
 		o.eagerDisabled = true
+	}
+}
+
+func WithEventLog(eventLog *EventLog) CompileOption {
+	return func(o *graphCompileOptions) {
+		o.eventLog = eventLog
+	}
+}
+
+func WithEventSinks(sinks ...EventSink) CompileOption {
+	return func(o *graphCompileOptions) {
+		o.eventSinks = append(o.eventSinks, sinks...)
 	}
 }
 

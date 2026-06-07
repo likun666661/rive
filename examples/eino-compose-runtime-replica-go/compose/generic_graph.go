@@ -92,6 +92,11 @@ func (gg *Graph[I, O]) Compile(ctx context.Context, opts ...CompileOption) (Runn
 	if err != nil {
 		return nil, err
 	}
+	if o.eventLog != nil {
+		r.eventLog = o.eventLog
+	} else if len(o.eventSinks) > 0 {
+		r.eventLog = NewEventLog(o.eventSinks...)
+	}
 
 	if o.nodeTriggerMode == AllPredecessor {
 		r.dag = true

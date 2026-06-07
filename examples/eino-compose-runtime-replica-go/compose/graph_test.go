@@ -2,8 +2,11 @@ package compose
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -28,6 +31,12 @@ func nodeReverse(ctx context.Context, in string) (string, error) {
 
 func nodeFailing(ctx context.Context, in string) (string, error) {
 	return "", errors.New("forced failure")
+}
+
+type failingEventSink struct{}
+
+func (failingEventSink) WriteEvent(Event) error {
+	return errors.New("sink failed")
 }
 
 func TestDuplicateNode(t *testing.T) {
@@ -569,6 +578,51 @@ func TestEventLogLifecycle(t *testing.T) {
 
 	if el.Events[0].GraphName != "test_lifecycle" {
 		t.Fatalf("expected graph name test_lifecycle, got %s", el.Events[0].GraphName)
+	}
+}
+
+func TestEventLogJSONLSinkWritesImmediately(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "events.jsonl")
+	sink, err := NewJSONLEventSink(path)
+	if err != nil {
+		t.Fatalf("NewJSONLEventSink: %v", err)
+	}
+	defer sink.Close()
+
+	el := NewEventLog(sink)
+	el.LogNodeStart("node_1", 1, map[string]any{"input": "value"})
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 JSONL line before close, got %d: %q", len(lines), data)
+	}
+
+	var got Event
+	if err := json.Unmarshal([]byte(lines[0]), &got); err != nil {
+		t.Fatalf("event line is not valid JSON: %v", err)
+	}
+	if got.Type != EventNodeStart || got.NodeKey != "node_1" || got.Step != 1 {
+		t.Fatalf("unexpected event: %+v", got)
+	}
+	if len(el.Events) != 1 {
+		t.Fatalf("in-memory event log was not updated")
+	}
+}
+
+func TestEventLogSinkFailureDoesNotCorruptMemory(t *testing.T) {
+	el := NewEventLog(failingEventSink{})
+
+	el.LogNodeStart("node_1", 1, "input")
+
+	if len(el.Events) != 1 {
+		t.Fatalf("expected in-memory event despite sink failure, got %d", len(el.Events))
+	}
+	if len(el.SinkErrors()) != 1 {
+		t.Fatalf("expected one sink error, got %d", len(el.SinkErrors()))
 	}
 }
 
@@ -2725,6 +2779,61 @@ func TestEventLogIntegrationWithRunner(t *testing.T) {
 	}
 	if !hasNodeEnd {
 		t.Fatal("expected EventNodeEnd")
+	}
+}
+
+func TestEventLogJSONLSinkIntegrationWithGraphCompileOption(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "graph-events.jsonl")
+	sink, err := NewJSONLEventSink(path)
+	if err != nil {
+		t.Fatalf("NewJSONLEventSink: %v", err)
+	}
+	defer sink.Close()
+
+	g := NewGraph[string, string]()
+	g.AddLambdaNode("check_live_trace", InvokableLambda(func(ctx context.Context, in string) (string, error) {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", err
+		}
+		trace := string(data)
+		if !strings.Contains(trace, `"type":"graph_start"`) {
+			return "", fmt.Errorf("expected graph_start to be durable before node completion: %s", trace)
+		}
+		if !strings.Contains(trace, `"type":"node_start"`) {
+			return "", fmt.Errorf("expected node_start to be durable before node completion: %s", trace)
+		}
+		return in + "_done", nil
+	}))
+	g.AddEdge(START, "check_live_trace")
+	g.AddEdge("check_live_trace", END)
+
+	r, err := g.Compile(
+		context.Background(),
+		WithGraphName("jsonl_graph"),
+		WithEventSinks(sink),
+	)
+	if err != nil {
+		t.Fatalf("Compile failed: %v", err)
+	}
+
+	result, err := r.Invoke(context.Background(), "live")
+	if err != nil {
+		t.Fatalf("Invoke failed: %v", err)
+	}
+	if result != "live_done" {
+		t.Fatalf("expected live_done, got %q", result)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	trace := string(data)
+	for _, want := range []string{`"type":"graph_start"`, `"type":"node_start"`, `"type":"node_end"`, `"type":"graph_end"`} {
+		if !strings.Contains(trace, want) {
+			t.Fatalf("expected durable trace to contain %s, got %s", want, trace)
+		}
 	}
 }
 
