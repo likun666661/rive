@@ -31,6 +31,20 @@ Rive 是本地优先 agent team runtime 的体系文档。
 25. [Phase 12 Git worktree Workspace Branch / Ref Integration 测试计划](./docs/25-phase12-worktree-ref-integration-test-plan.md)
 26. [Phase 13 Reusable Workflow Template 计划](./docs/26-reusable-workflow-template-plan.md)
 
+## 当前能力快照
+
+Rive 当前已经不只是协议文档，而是可本地 dogfood 的多智能体 runtime：
+
+- Work DAG：用 `rive work ...` / `team work ...` 建立可追踪的任务图、依赖、accept/reopen/retry 语义。
+- Reusable workflow：`workflow.yaml + prompts/*.md` 可导入为 immutable template version，再用 `rive workflow run` 重复实例化和执行。
+- Scheduler：`rive scheduler run/status/resume` 能按 DAG ready node 调度 worker pool，支持 retry/resume、失败分类和可观测 activity。
+- Node-level runner policy：workflow node 可声明 `runner: opencode|codex`、`worker`、`workspace_mode`、`acceptance_mode`；同一个 scheduler run 内可以混合 OpenCode cheap worker 和 Codex judge/merge node。
+- Worker workspace isolation：`--workspace-mode worktree` 让 worker patch 先进入隔离 worktree/ref，commit/accept 后才合入 parent workspace。
+- Recovery UX：`rive scheduler resume --failed`、`rive work retry`、`rive branch conflict show/reject/retry-from-parent` 用 ledger 方式恢复失败和 patch conflict。
+- Debug/usage：debug trace、stdout/stderr refs、scheduler activity、usage read model 都只做诊断，不参与成功判断。
+
+核心边界：成功只来自 ledger/projection（Work DAG、dispatch、scheduler、workflow state），不能从 runner stdout、final answer 或 trace 推断。
+
 ## Agent Skill
 
 - [Rive agent skill](./skills/rive/SKILL.md) — 给 Codex / OpenCode 等外部 agent 读取的 Rive 操作手册，用来把用户目标组织成 Work DAG、调度 worker、集成 worktree ref，并按 ledger/projection 回报结果。

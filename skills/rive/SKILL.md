@@ -1,6 +1,6 @@
 ---
 name: rive
-description: Use Rive to coordinate local multi-agent software work through ledger-backed Work DAGs, reusable workflow templates, OpenCode/Codex runners, git-worktree isolation, scheduler observability, resume/retry, conflict recovery, failure classification, and neutral debug trace/usage. Use when an agent should plan a DAG, run bounded worker pools, preserve artifacts and refs, inspect worker activity, recover failed/conflicted nodes, or repeat a workflow instead of solving everything in one session.
+description: Use Rive to coordinate local multi-agent software work through ledger-backed Work DAGs, reusable workflow templates, node-level OpenCode/Codex runner policy, git-worktree isolation, scheduler observability, resume/retry, conflict recovery, failure classification, and neutral debug trace/usage. Use when an agent should plan a DAG, run mixed low-cost/strong worker pools, preserve artifacts and refs, inspect worker activity, recover failed/conflicted nodes, or repeat a workflow instead of solving everything in one session.
 ---
 
 # Rive
@@ -30,6 +30,8 @@ each have different authority.
   invent path-hit ratios, off-track/runaway judgments, or heartbeat rules.
 - Prefer OpenCode for low-cost production worker pools. Use Codex when the task
   requires Codex coverage, Codex-specific behavior, or the user explicitly asks.
+- In reusable workflows, put runner choice on the node when nodes need different
+  agents. Use run-level `--runner` only as a default fallback.
 - Do not manually edit SQLite or patch around Rive state. Use retry, resume,
   branch, work, and workflow commands.
 
@@ -51,8 +53,8 @@ Use this map to choose the right layer:
   `rive scheduler run/status/resume`, `rive scheduler resume --failed`.
 - Worktree refs/conflicts: `rive branch list/show/commit/abort/reject`,
   `rive branch conflict show/reject/retry-from-parent`.
-- Workflows: `rive workflow validate/import/list/show/run/status` with either
-  a single `workflow.yaml` or a package directory containing `prompts/*.md`.
+- Workflows: `rive workflow validate/import/list/show/run/status`; node specs
+  may carry `runner`, `worker`, `workspace_mode`, and `acceptance_mode`.
 
 ## When to Use Rive
 
@@ -122,21 +124,6 @@ Rules:
 - Avoid a giant synthesis node unless it can itself use Rive to spawn another
   DAG; otherwise its context window becomes the bottleneck.
 
-Example:
-
-```sh
-rive work create --kind objective --title "Diagnose checkout bug" --command-id plan-root-1
-rive work create --kind task --title "Inspect production logs" --command-id plan-logs-1
-rive work create --kind task --title "Inspect checkout code path" --command-id plan-code-1
-rive work create --kind review --title "Judge log and code findings" --command-id plan-judge-1
-
-rive work edge add --type decomposes-to --from <root> --to <logs_node> --command-id edge-root-logs-1
-rive work edge add --type decomposes-to --from <root> --to <code_node> --command-id edge-root-code-1
-rive work edge add --type decomposes-to --from <root> --to <judge_node> --command-id edge-root-judge-1
-rive work edge add --type depends-on --from <judge_node> --to <logs_node> --command-id edge-judge-logs-1
-rive work edge add --type depends-on --from <judge_node> --to <code_node> --command-id edge-judge-code-1
-```
-
 Inspect before running:
 
 ```sh
@@ -147,8 +134,6 @@ rive work inspect <node>
 ## Run the Scheduler
 
 For most real work, run ready nodes with a bounded worker pool.
-
-Manual review mode:
 
 ```sh
 rive scheduler run \
@@ -163,36 +148,38 @@ rive scheduler run \
   --timeout-seconds 900
 ```
 
-Automation mode that applies reported worktree patches and accepts nodes:
+Use `--acceptance-mode auto-committed` to apply reported worktree patches and
+accept nodes. Codex runs use `--runner codex --worker <codex-worker>
+--trust-project`; Codex gets isolated per-run `CODEX_HOME` and must not mutate
+global `~/.codex/config.toml`.
 
-```sh
-rive scheduler run \
-  --root <root> \
-  --runner opencode \
-  --worker opencode-worker-a \
-  --worker opencode-worker-b \
-  --command-id sched-<objective>-auto-1 \
-  --max-parallel 2 \
-  --acceptance-mode auto-committed \
-  --workspace-mode worktree \
-  --timeout-seconds 900
+When a workflow node declares runner policy, it overrides run-level defaults.
+One scheduler run can execute cheap OpenCode nodes and stronger Codex
+judge/merge nodes in the same DAG:
+
+```yaml
+nodes:
+  implement:
+    kind: task
+    runner: opencode
+    worker: opencode-worker-a
+    workspace_mode: worktree
+    acceptance_mode: auto-committed
+  judge:
+    kind: review
+    runner: codex
+    worker: codex-worker-a
+    acceptance_mode: auto-reported
+    consumes: [implement]
+edges:
+  - { type: decomposes_to, from: root, to: implement }
+  - { type: decomposes_to, from: root, to: judge }
+  - { type: depends_on, from: judge, to: implement }
 ```
 
-Codex scheduler runs are also supported:
-
-```sh
-rive scheduler run \
-  --root <root> \
-  --runner codex \
-  --worker codex-worker-a \
-  --command-id sched-<objective>-codex-1 \
-  --workspace-mode worktree \
-  --trust-project \
-  --timeout-seconds 900
-```
-
-Codex uses an isolated per-run `CODEX_HOME` and must not mutate global
-`~/.codex/config.toml`.
+`scheduler_node_runs` records each node's resolved runner, worker, workspace
+mode, and acceptance mode. Retry/resume preserves node policy; changing policy
+under the same command ID is an `idempotency_conflict`.
 
 Interpret scheduler results from `protocol`, not display text:
 
@@ -228,6 +215,8 @@ Important semantics:
 - `workflow run --no-scheduler` instantiates the Work DAG only.
 - Plain `workflow run` instantiates the Work DAG, starts the scheduler, records
   `workflow_runs.scheduler_run_id`, and returns effective state.
+- Node-level runner/worker/workspace/acceptance policy is part of the workflow
+  template hash. Changing policy should create or bump a template version.
 - Use `workflow status --run` for effective state and debug refs; do not read raw
   `workflow_runs.state` directly.
 
@@ -254,6 +243,9 @@ rive workflow run sentinel.prod-debug \
 
 rive workflow status --run <workflow_run_id>
 ```
+
+If the template has node-level runner policy, run-level `--runner` and
+`--worker` values are defaults only for nodes without explicit policy.
 
 The Sentinel example in `examples/workflows/sentinel-prod-debug/` models:
 global signal scan, parallel service investigations for `alva-backend`,
