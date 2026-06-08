@@ -5,9 +5,13 @@
 拆成多个 part，再用 OpenCode worker 并行粗读代码，最后由一个汇总节点产出
 总纲。
 
-输出文件位于 [`manual/`](./manual/) 目录下。优先阅读
+粗读输出文件位于 [`manual/`](./manual/) 目录下。优先阅读
 [`manual/00-overview.md`](./manual/00-overview.md)，它把六个分区的粗读结果
 整理成 ADK Go 的总体架构地图、主链路、阅读顺序和下一轮精读 DAG 建议。
+
+精读输出文件位于 [`manual/deep-read/`](./manual/deep-read/) 目录下。优先阅读
+[`manual/deep-read/00-final-architecture-guide.md`](./manual/deep-read/00-final-architecture-guide.md)，
+它汇总六份源码级精读报告，适合作为维护或复刻 ADK Go 架构前的技术手册。
 
 ## 运行结构
 
@@ -57,6 +61,26 @@
 - 这是一轮粗读，不等于源码审计。下一轮如果要深入，应按总纲中的建议继续
   拆分到 runner/flow、state lifecycle、tool confirmation、A2A server 等
   更细的主题。
+
+## 精读产物
+
+精读 DAG 已经真实跑完一轮，Rive root work `work_3de20f1f1c3f47a2834d3beccaa68d43`
+最终为 `done`，graph hygiene 为 `clean`。产物如下：
+
+| 章节 | 文件 | 关注点 |
+| --- | --- | --- |
+| 总纲 | [`manual/deep-read/00-final-architecture-guide.md`](./manual/deep-read/00-final-architecture-guide.md) | ADK Go 架构总图、六章索引、跨模块链路、维护者问题、下一轮 DAG |
+| 第一章 | [`manual/deep-read/01-runtime-flow-deep-dive.md`](./manual/deep-read/01-runtime-flow-deep-dive.md) | Runner / Agent / LLM Flow 主循环 |
+| 第二章 | [`manual/deep-read/02-state-lifecycle-deep-dive.md`](./manual/deep-read/02-state-lifecycle-deep-dive.md) | Session / Memory / Artifact 状态生命周期 |
+| 第三章 | [`manual/deep-read/03-tool-system-deep-dive.md`](./manual/deep-read/03-tool-system-deep-dive.md) | Tool / Function Calling / MCP / Confirmation |
+| 第四章 | [`manual/deep-read/04-callback-plugin-deep-dive.md`](./manual/deep-read/04-callback-plugin-deep-dive.md) | Callback / Plugin / Instruction 扩展机制 |
+| 第五章 | [`manual/deep-read/05-workflow-a2a-deep-dive.md`](./manual/deep-read/05-workflow-a2a-deep-dive.md) | Workflow Agents / AgentTool / Remote A2A |
+| 第六章 | [`manual/deep-read/06-entrypoint-deploy-deep-dive.md`](./manual/deep-read/06-entrypoint-deploy-deep-dive.md) | CLI / Server / Deploy / Telemetry / Examples |
+
+这轮 dogfood 的一个工程结论是：大规模阅读节点不适合让 OpenCode 在节点内部继续
+使用自己的 `task` fan-out，否则会和 Rive 外层 DAG 争夺编排权，容易出现外层
+dispatch 长时间不 report。后半程改为禁用 OpenCode 内部 `task` tool 后，Rive
+作为唯一编排层，剩余节点能稳定收口。
 
 ## 下一轮精读 Workflow
 

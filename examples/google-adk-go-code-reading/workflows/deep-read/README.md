@@ -91,3 +91,24 @@ rive workflow run google-adk-go.deep-read \
 - ADK Go 代码怎么落地。
 
 同时必须包含源码路径、关键类型/函数、调用链、测试证据、风险和后续追问。
+
+## 已完成的一轮真实运行
+
+这个 workflow 已经在本地对 `google/adk-go` 基线
+`81a63d8feb7d713b1731f0c740d95574eb64dafa` 跑完一轮，产物整理在：
+
+- [`../../manual/deep-read/`](../../manual/deep-read/)
+- [`../../manual/deep-read/00-final-architecture-guide.md`](../../manual/deep-read/00-final-architecture-guide.md)
+
+收口信息：
+
+- workflow run：`wfrun_67d031ab402d41d0ada4796b6ae0259c`
+- final scheduler：`sched_4bf6fcf9efb14635b1a9645505801e4f`
+- root work：`work_3de20f1f1c3f47a2834d3beccaa68d43`
+- root state：`done`
+- graph hygiene：`clean`
+
+运行中观察到：OpenCode 在大型阅读节点里可能主动使用内部 `task` fan-out，
+导致 Rive 外层 dispatch 长时间保持 `open`。后续重试使用禁用 OpenCode `task`
+tool 的 wrapper，让 Rive 保持唯一编排层，剩余 `workflow-a2a` 和 final judge
+节点稳定完成。
