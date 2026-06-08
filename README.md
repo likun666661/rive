@@ -62,4 +62,5 @@ Rive 启动 OpenCode / Codex worker 时不会假设自己来自交互式 shell�
 ## Examples
 
 - [Eino technical manual dogfood](./examples/eino-technical-manual/) — 用 Rive Work DAG + OpenCode workers 阅读 CloudWeGo Eino 代码并产出技术手册的真实 dogfood 示例。
+- [Google ADK Go code-reading dogfood](./examples/google-adk-go-code-reading/) — 用 Rive Work DAG + OpenCode workers 粗读 `google/adk-go`，按目录分区产出中文架构大纲和总纲。
 - [Sentinel reusable workflow template](./examples/workflows/sentinel-prod-debug/) — 可导入/复跑的生产 debug workflow 模板包，包含 DAG 和节点 prompt。
