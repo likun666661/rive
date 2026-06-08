@@ -57,3 +57,31 @@
 - 这是一轮粗读，不等于源码审计。下一轮如果要深入，应按总纲中的建议继续
   拆分到 runner/flow、state lifecycle、tool confirmation、A2A server 等
   更细的主题。
+
+## 下一轮精读 Workflow
+
+精读 DAG 和节点 prompt 已整理成可导入的 Rive workflow package：
+
+- [`workflows/deep-read/workflow.yaml`](./workflows/deep-read/workflow.yaml)
+- [`workflows/deep-read/prompts/`](./workflows/deep-read/prompts/)
+
+这个 workflow 继续沿用粗读的六个分区，但把每个节点的要求提升为源码级
+精读：必须写出问题背景、为什么难、设计思路、源码走读、执行链路、测试证据、
+风险和下一轮问题。最后的 `final-architecture-guide` 节点只消费六份精读
+报告，不重新通读仓库。
+
+快速验证：
+
+```sh
+rive workflow validate examples/google-adk-go-code-reading/workflows/deep-read
+```
+
+实例化但不启动 worker：
+
+```sh
+rive workflow run google-adk-go.deep-read \
+  --command-id run-google-adk-go-deep-read-dry \
+  --no-scheduler \
+  --param repo_path=/Users/likun/Desktop/workspace-for-google-adk-go/adk-go \
+  --param output_dir=/tmp/rive-google-adk-go-deep-read
+```

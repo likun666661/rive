@@ -1,0 +1,183 @@
+api_version: rive.workflow/v0
+id: google-adk-go.deep-read
+version: 1
+title: Google ADK Go 精读：{{source_ref}}
+params:
+  repo_path:
+    type: string
+    required: true
+  output_dir:
+    type: string
+    required: true
+  source_ref:
+    type: string
+    default: 81a63d8feb7d713b1731f0c740d95574eb64dafa
+  depth:
+    type: enum
+    values: [architecture, implementation, maintainer]
+    default: implementation
+nodes:
+  runtime-flow-deep-dive:
+    kind: task
+    runner: opencode
+    title: 精读 Runner / Agent / LLM Flow 主循环
+    prompt:
+      file: prompts/runtime-flow-deep-dive.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - execution_trace
+        - tests
+        - risks
+        - next_questions
+  state-lifecycle-deep-dive:
+    kind: task
+    runner: opencode
+    title: 精读 Session / Memory / Artifact 状态生命周期
+    prompt:
+      file: prompts/state-lifecycle-deep-dive.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - state_lifecycle
+        - tests
+        - risks
+        - next_questions
+  tool-system-deep-dive:
+    kind: task
+    runner: opencode
+    title: 精读 Tool / Function Calling / MCP / Confirmation
+    prompt:
+      file: prompts/tool-system-deep-dive.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - tool_lifecycle
+        - tests
+        - risks
+        - next_questions
+  callback-plugin-deep-dive:
+    kind: task
+    runner: opencode
+    title: 精读 Callback / Plugin / Instruction 扩展机制
+    prompt:
+      file: prompts/callback-plugin-deep-dive.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - extension_points
+        - tests
+        - risks
+        - next_questions
+  workflow-a2a-deep-dive:
+    kind: task
+    runner: opencode
+    title: 精读 Workflow Agents / AgentTool / Remote A2A
+    prompt:
+      file: prompts/workflow-a2a-deep-dive.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - orchestration_flows
+        - tests
+        - risks
+        - next_questions
+  entrypoint-deploy-deep-dive:
+    kind: task
+    runner: opencode
+    title: 精读 CLI / Server / Deploy / Telemetry / Examples
+    prompt:
+      file: prompts/entrypoint-deploy-deep-dive.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - entrypoint_map
+        - tests
+        - risks
+        - next_questions
+  final-architecture-guide:
+    kind: review
+    runner: opencode
+    title: 汇总 ADK Go 精读技术手册
+    consumes:
+      - runtime-flow-deep-dive
+      - state-lifecycle-deep-dive
+      - tool-system-deep-dive
+      - callback-plugin-deep-dive
+      - workflow-a2a-deep-dive
+      - entrypoint-deploy-deep-dive
+    prompt:
+      file: prompts/final-architecture-guide.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - executive_summary
+        - architecture_map
+        - deep_read_index
+        - cross_module_flows
+        - maintainer_questions
+        - next_dag
+edges:
+  - type: decomposes_to
+    from: root
+    to: runtime-flow-deep-dive
+  - type: decomposes_to
+    from: root
+    to: state-lifecycle-deep-dive
+  - type: decomposes_to
+    from: root
+    to: tool-system-deep-dive
+  - type: decomposes_to
+    from: root
+    to: callback-plugin-deep-dive
+  - type: decomposes_to
+    from: root
+    to: workflow-a2a-deep-dive
+  - type: decomposes_to
+    from: root
+    to: entrypoint-deploy-deep-dive
+  - type: decomposes_to
+    from: root
+    to: final-architecture-guide
+  - type: depends_on
+    from: final-architecture-guide
+    to: runtime-flow-deep-dive
+  - type: depends_on
+    from: final-architecture-guide
+    to: state-lifecycle-deep-dive
+  - type: depends_on
+    from: final-architecture-guide
+    to: tool-system-deep-dive
+  - type: depends_on
+    from: final-architecture-guide
+    to: callback-plugin-deep-dive
+  - type: depends_on
+    from: final-architecture-guide
+    to: workflow-a2a-deep-dive
+  - type: depends_on
+    from: final-architecture-guide
+    to: entrypoint-deploy-deep-dive
