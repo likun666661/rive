@@ -3972,24 +3972,6 @@ fn process_group_for_child_pid(child_pid: u32) -> Option<libc::pid_t> {
     Some(-pid)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(unix)]
-    #[test]
-    fn process_group_for_child_pid_rejects_broadcast_and_overflow() {
-        assert_eq!(process_group_for_child_pid(0), None);
-        assert_eq!(process_group_for_child_pid(1), None);
-        assert_eq!(process_group_for_child_pid(2), Some(-2));
-        assert_eq!(
-            process_group_for_child_pid(i32::MAX as u32),
-            Some(-(i32::MAX as libc::pid_t))
-        );
-        assert_eq!(process_group_for_child_pid(i32::MAX as u32 + 1), None);
-    }
-}
-
 fn build_common_prompt(context: RunnerPromptContext<'_>, adapter_hints: Option<&str>) -> String {
     let body = String::from_utf8_lossy(context.body);
     let branch_instructions = context
@@ -4224,4 +4206,22 @@ fn path_relative_to(path: &Path, root: &Path) -> Result<String> {
         .with_context(|| format!("{} is outside {}", path.display(), root.display()))?
         .to_string_lossy()
         .to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn process_group_for_child_pid_rejects_broadcast_and_overflow() {
+        assert_eq!(process_group_for_child_pid(0), None);
+        assert_eq!(process_group_for_child_pid(1), None);
+        assert_eq!(process_group_for_child_pid(2), Some(-2));
+        assert_eq!(
+            process_group_for_child_pid(i32::MAX as u32),
+            Some(-(i32::MAX as libc::pid_t))
+        );
+        assert_eq!(process_group_for_child_pid(i32::MAX as u32 + 1), None);
+    }
 }
