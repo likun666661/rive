@@ -3932,26 +3932,61 @@ fn terminate_child(child: &mut Child) {
     }
     #[cfg(unix)]
     {
-        let process_group = format!("-{}", child.id());
-        let _ = Command::new("/bin/kill")
-            .arg("-TERM")
-            .arg(&process_group)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        signal_child_process_group(child, libc::SIGTERM);
         thread::sleep(Duration::from_millis(200));
         if matches!(child.try_wait(), Ok(None)) {
-            let _ = Command::new("/bin/kill")
-                .arg("-KILL")
-                .arg(&process_group)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            signal_child_process_group(child, libc::SIGKILL);
         }
     }
     #[cfg(not(unix))]
     {
         let _ = child.kill();
+    }
+}
+
+#[cfg(unix)]
+fn signal_child_process_group(child: &mut Child, signal: libc::c_int) {
+    let Some(process_group) = process_group_for_child_pid(child.id()) else {
+        if signal == libc::SIGKILL {
+            let _ = child.kill();
+        }
+        return;
+    };
+
+    let result = unsafe { libc::kill(process_group, signal) };
+    if result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        return;
+    }
+
+    if signal == libc::SIGKILL {
+        let _ = child.kill();
+    }
+}
+
+#[cfg(unix)]
+fn process_group_for_child_pid(child_pid: u32) -> Option<libc::pid_t> {
+    let pid = libc::pid_t::try_from(child_pid).ok()?;
+    if pid <= 1 {
+        return None;
+    }
+    Some(-pid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn process_group_for_child_pid_rejects_broadcast_and_overflow() {
+        assert_eq!(process_group_for_child_pid(0), None);
+        assert_eq!(process_group_for_child_pid(1), None);
+        assert_eq!(process_group_for_child_pid(2), Some(-2));
+        assert_eq!(
+            process_group_for_child_pid(i32::MAX as u32),
+            Some(-(i32::MAX as libc::pid_t))
+        );
+        assert_eq!(process_group_for_child_pid(i32::MAX as u32 + 1), None);
     }
 }
 
