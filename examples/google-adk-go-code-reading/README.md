@@ -12,6 +12,9 @@
 精读输出文件位于 [`manual/deep-read/`](./manual/deep-read/) 目录下。优先阅读
 [`manual/deep-read/00-final-architecture-guide.md`](./manual/deep-read/00-final-architecture-guide.md)，
 它汇总六份源码级精读报告，适合作为维护或复刻 ADK Go 架构前的技术手册。
+追加的第七章
+[`manual/deep-read/07-agent-flow-react-multi-agent-deep-dive.md`](./manual/deep-read/07-agent-flow-react-multi-agent-deep-dive.md)
+专门深读 Agent Flow、ReAct 循环、transfer-to-agent、多 Agent 路由、策略插件和后续复刻 DAG。
 
 ## 运行结构
 
@@ -76,11 +79,17 @@
 | 第四章 | [`manual/deep-read/04-callback-plugin-deep-dive.md`](./manual/deep-read/04-callback-plugin-deep-dive.md) | Callback / Plugin / Instruction 扩展机制 |
 | 第五章 | [`manual/deep-read/05-workflow-a2a-deep-dive.md`](./manual/deep-read/05-workflow-a2a-deep-dive.md) | Workflow Agents / AgentTool / Remote A2A |
 | 第六章 | [`manual/deep-read/06-entrypoint-deploy-deep-dive.md`](./manual/deep-read/06-entrypoint-deploy-deep-dive.md) | CLI / Server / Deploy / Telemetry / Examples |
+| 第七章 | [`manual/deep-read/07-agent-flow-react-multi-agent-deep-dive.md`](./manual/deep-read/07-agent-flow-react-multi-agent-deep-dive.md) | Agent Flow / ReAct / transfer-to-agent / Multi-Agent / 复刻 DAG |
 
 这轮 dogfood 的一个工程结论是：大规模阅读节点不适合让 OpenCode 在节点内部继续
 使用自己的 `task` fan-out，否则会和 Rive 外层 DAG 争夺编排权，容易出现外层
 dispatch 长时间不 report。后半程改为禁用 OpenCode 内部 `task` tool 后，Rive
 作为唯一编排层，剩余节点能稳定收口。
+
+第七章是后续追加的一轮专题 research DAG：四个 OpenCode reader 分区读取
+LLM Agent ReAct loop、transfer/multi-agent routing、planner/reflection/skills、
+examples/configurable patterns，再由 final writer 合成中文深读章节。它不是代码实现，
+而是给 `rive-adk-go` 后续复刻 Agent Flow / ReAct / 多 Agent 能力使用的实现计划和风险清单。
 
 ## 下一轮精读 Workflow
 
