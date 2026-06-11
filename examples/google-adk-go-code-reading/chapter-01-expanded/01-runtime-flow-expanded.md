@@ -73,6 +73,109 @@ Session 是事实存储
 
 这六个词后面会反复出现。
 
+### 1.1 初学者最容易缺的桥：字符串怎么变成代码动作
+
+在继续看 demo 前，必须先补一座桥。很多已经做过 agent 的人会默认知道这件事，但初学者往往卡在这里：
+
+**LLM 本身只是在生成 token，本质上就是字符串；代码环境到底凭什么能"执行"LLM 的输出？**
+
+最朴素的答案是：
+
+```text
+LLM 输出一段结构化意图
+  -> runtime 把它解析成程序对象
+  -> 根据 name 找到本地注册的函数
+  -> 把 args 反序列化成函数入参
+  -> 执行函数
+  -> 把函数结果序列化成工具响应
+  -> 再喂回 LLM
+```
+
+很多时候，这段"结构化意图"可以理解成 JSON：
+
+```json
+{
+  "name": "get_weather",
+  "args": {
+    "city": "Tokyo"
+  }
+}
+```
+
+程序侧拿到后，会变成类似这样的对象：
+
+```go
+event.FunctionCall{
+    ID:   "fc-1",
+    Name: "get_weather",
+    Args: map[string]any{"city": "Tokyo"},
+}
+```
+
+然后 runtime 做一件非常普通的事情：查表。
+
+```text
+Tools["get_weather"] -> weatherTool
+```
+
+查到以后执行：
+
+```go
+result, err := weatherTool.Run(ctx, args)
+```
+
+执行结果再变成：
+
+```go
+event.FunctionResponse{
+    ID: "fc-1",
+    Name: "get_weather",
+    Result: map[string]any{
+        "city": "Tokyo",
+        "temperature": 22,
+        "condition": "sunny",
+    },
+}
+```
+
+最后 runtime 把这个 function response 放回对话历史。下一轮 LLM 看到的不再只是用户问题，还会看到：
+
+```text
+assistant/model: 我调用了 get_weather(city=Tokyo)
+tool: get_weather 返回 Tokyo 22°C sunny
+```
+
+于是模型才能基于工具结果生成最终回答。
+
+这就是 tool calling 的最小心智模型：
+
+```text
+自然语言问题
+  -> 模型输出结构化调用意图
+  -> 代码解析并执行真实函数
+  -> 代码把真实函数结果编码回消息
+  -> 模型基于结果继续生成文本
+```
+
+所以，"模型调用工具"这个说法容易误导。更准确地说：
+
+**模型提出一个工具调用请求，runtime 负责把请求变成真实代码执行。**
+
+ADK Go 复刻版后面的所有机制，都是在把这件事工程化：
+
+- `ToolDeclaration`：提前告诉模型可调用哪些工具、参数长什么样。
+- `FunctionCall`：承载模型输出的结构化调用意图。
+- `FunctionTool`：把工具名映射到真实 Go 函数。
+- `FunctionResponse`：把函数执行结果放回对话历史。
+- `Event`：把用户消息、模型调用、工具结果、最终回答都统一记录下来。
+- `Session`：保存这些事件，让下一轮模型还能看到完整上下文。
+
+如果只讲 Runner / Flow / Event，而不先讲这座桥，初学者会觉得 runtime 像魔法：明明 LLM 只会输出字符串，为什么代码突然执行了一个函数？理解这座桥以后，后面的 Flow 就不神秘了。Flow 只是在循环执行：
+
+```text
+问模型 -> 看有没有 FunctionCall -> 有就执行工具 -> 把 FunctionResponse 放回 history -> 再问模型
+```
+
 ---
 
 ## 2. 先看最小天气查询 Demo
@@ -95,7 +198,7 @@ weatherTool := tool.NewFunctionTool("get_weather", "Get current weather for a ci
 )
 ```
 
-这个工具只是一个 Go 函数。它的名字是 `get_weather`，输入是 `map[string]any`，输出也是 `map[string]any`。
+这个工具只是一个 Go 函数。它的名字是 `get_weather`，输入是 `map[string]any`，输出也是 `map[string]any`。换句话说，工具系统的底层不是魔法，就是"工具名 -> Go 函数"这张表。
 
 接着构造 FakeModel：
 
@@ -116,6 +219,8 @@ FakeModel 的响应队列有两个响应：
 
 1. 第一轮返回 function call：调用 `get_weather(city=Tokyo)`。
 2. 第二轮返回最终文本答案。
+
+这里的 `model.FunctionCallResponse(...)` 就是在模拟真实 LLM 输出的结构化工具调用意图。真实 provider 可能通过 JSON、tool call delta、function call part 等格式表达；复刻版统一落到 `event.FunctionCall` 这个对象上。
 
 再把 Model 和 Tool 放进 Flow：
 
@@ -1461,4 +1566,3 @@ session history + same-invocation prior events
 ## 16. 本章一句话总结
 
 ADK Go 复刻版的第一章不是在讲"怎么问模型一句话"，而是在讲一次 invocation 的运行事实如何被组织起来：Runner 管会话入口和持久化，Agent 管生命周期，Flow 管 model/tool 循环，Event 统一承载文本、函数调用、工具结果和副作用，Session 保存稳定历史。理解这条主链路，后面的 State、Tool、Callback、Workflow、ReAct 才都有位置可放。
-
