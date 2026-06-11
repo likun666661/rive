@@ -1,0 +1,114 @@
+api_version: rive.workflow/v0
+id: google-adk-go.teaching-manual
+version: 1
+title: Google ADK Go teaching manual outline
+params:
+  rive_repo:
+    type: string
+    required: true
+  replica_repo:
+    type: string
+    required: true
+  output_dir:
+    type: string
+    required: true
+  target_file:
+    type: string
+    required: true
+nodes:
+  ch01-runtime-flow:
+    kind: task
+    runner: opencode
+    title: Teaching section Ch01 Runtime Flow
+    prompt:
+      file: prompts/ch01-runtime-flow.md
+    output_contract:
+      format: markdown
+      required_sections: [teaching_goal, core_story, code_walkthrough, demos, pitfalls, exercises]
+  ch02-state-lifecycle:
+    kind: task
+    runner: opencode
+    title: Teaching section Ch02 State Lifecycle
+    prompt:
+      file: prompts/ch02-state-lifecycle.md
+    output_contract:
+      format: markdown
+      required_sections: [teaching_goal, core_story, code_walkthrough, demos, pitfalls, exercises]
+  ch03-tool-system:
+    kind: task
+    runner: opencode
+    title: Teaching section Ch03 Tool System
+    prompt:
+      file: prompts/ch03-tool-system.md
+    output_contract:
+      format: markdown
+      required_sections: [teaching_goal, core_story, code_walkthrough, demos, pitfalls, exercises]
+  ch04-callback-plugin:
+    kind: task
+    runner: opencode
+    title: Teaching section Ch04 Callback Plugin Instruction
+    prompt:
+      file: prompts/ch04-callback-plugin.md
+    output_contract:
+      format: markdown
+      required_sections: [teaching_goal, core_story, code_walkthrough, demos, pitfalls, exercises]
+  ch05-workflow-a2a:
+    kind: task
+    runner: opencode
+    title: Teaching section Ch05 Workflow A2A
+    prompt:
+      file: prompts/ch05-workflow-a2a.md
+    output_contract:
+      format: markdown
+      required_sections: [teaching_goal, core_story, code_walkthrough, demos, pitfalls, exercises]
+  ch06-entrypoint-deploy:
+    kind: task
+    runner: opencode
+    title: Teaching section Ch06 Entrypoint Deploy Telemetry
+    prompt:
+      file: prompts/ch06-entrypoint-deploy.md
+    output_contract:
+      format: markdown
+      required_sections: [teaching_goal, core_story, code_walkthrough, demos, pitfalls, exercises]
+  ch07-agent-flow:
+    kind: task
+    runner: opencode
+    title: Teaching section Ch07 Agent Flow ReAct Multi-Agent
+    prompt:
+      file: prompts/ch07-agent-flow.md
+    output_contract:
+      format: markdown
+      required_sections: [teaching_goal, core_story, code_walkthrough, demos, pitfalls, exercises]
+  final-teaching-outline:
+    kind: review
+    runner: opencode
+    title: Final ADK teaching manual outline
+    consumes:
+      - ch01-runtime-flow
+      - ch02-state-lifecycle
+      - ch03-tool-system
+      - ch04-callback-plugin
+      - ch05-workflow-a2a
+      - ch06-entrypoint-deploy
+      - ch07-agent-flow
+    prompt:
+      file: prompts/final-teaching-outline.md
+    output_contract:
+      format: markdown
+      required_sections: [roadmap, chapters, appendices]
+edges:
+  - { type: decomposes_to, from: root, to: ch01-runtime-flow }
+  - { type: decomposes_to, from: root, to: ch02-state-lifecycle }
+  - { type: decomposes_to, from: root, to: ch03-tool-system }
+  - { type: decomposes_to, from: root, to: ch04-callback-plugin }
+  - { type: decomposes_to, from: root, to: ch05-workflow-a2a }
+  - { type: decomposes_to, from: root, to: ch06-entrypoint-deploy }
+  - { type: decomposes_to, from: root, to: ch07-agent-flow }
+  - { type: decomposes_to, from: root, to: final-teaching-outline }
+  - { type: depends_on, from: final-teaching-outline, to: ch01-runtime-flow }
+  - { type: depends_on, from: final-teaching-outline, to: ch02-state-lifecycle }
+  - { type: depends_on, from: final-teaching-outline, to: ch03-tool-system }
+  - { type: depends_on, from: final-teaching-outline, to: ch04-callback-plugin }
+  - { type: depends_on, from: final-teaching-outline, to: ch05-workflow-a2a }
+  - { type: depends_on, from: final-teaching-outline, to: ch06-entrypoint-deploy }
+  - { type: depends_on, from: final-teaching-outline, to: ch07-agent-flow }

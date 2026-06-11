@@ -16,6 +16,12 @@
 [`manual/deep-read/07-agent-flow-react-multi-agent-deep-dive.md`](./manual/deep-read/07-agent-flow-react-multi-agent-deep-dive.md)
 专门深读 Agent Flow、ReAct 循环、transfer-to-agent、多 Agent 路由、策略插件和后续复刻 DAG。
 
+教学手册细纲位于
+[`manual/teaching-manual-outline.md`](./manual/teaching-manual-outline.md)。它基于七章精读和
+`rive-adk-go` 复刻工程整理成 90–120 分钟课程路线图，覆盖 Runtime Flow、State、Tool、
+Callback/Plugin、Workflow/A2A、Entrypoint/Deploy、Agent Flow/ReAct 七个章节的讲授目标、
+代码走读、演示建议、误区和练习题。
+
 ## 运行结构
 
 - 源仓库：`https://github.com/google/adk-go`
@@ -117,4 +123,21 @@ rive workflow run google-adk-go.deep-read \
   --no-scheduler \
   --param repo_path=/Users/likun/Desktop/workspace-for-google-adk-go/adk-go \
   --param output_dir=/tmp/rive-google-adk-go-deep-read
+```
+
+## 教学细纲 Workflow
+
+教学细纲 DAG 和节点 prompt 也已整理成可导入的 Rive workflow package：
+
+- [`workflows/teaching-manual/workflow.yaml`](./workflows/teaching-manual/workflow.yaml)
+- [`workflows/teaching-manual/prompts/`](./workflows/teaching-manual/prompts/)
+
+这个 workflow 会先并行生成七份章节 teaching section，再由 final collector 合成
+[`manual/teaching-manual-outline.md`](./manual/teaching-manual-outline.md)。它适合在精读产物更新后
+重新生成课程级细纲。
+
+快速验证：
+
+```sh
+rive workflow validate examples/google-adk-go-code-reading/workflows/teaching-manual
 ```
