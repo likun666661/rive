@@ -257,6 +257,35 @@ temp:scratch = "tmp-data"
 
 ## 4. State 写入路径：从 StateDelta 到三层 store
 
+先定义 `StateDelta`。
+
+`State` 是当前能读到的完整 key-value 上下文；`StateDelta` 是 **这一次 invocation / 这一个 event 对 state 做了哪些修改**。
+
+如果把 state 想成一张当前表：
+
+```text
+State:
+  user:report_language = "en-US"
+  topic = "old-topic"
+```
+
+那么一次 callback 或 tool 可以产生一份变更记录：
+
+```text
+StateDelta:
+  user:report_language = "zh-CN"
+  topic = "sales-analysis"
+  temp:scratch = "tool-cache"
+```
+
+这份 delta 的价值不是"再存一遍完整 state"，而是记录"这一步改了什么"。后续 `AppendEvent` 才能基于这份变更记录做三件事：
+
+- 把 `user:` 变化路由到 user 级共享 state。
+- 把无前缀变化留在当前 session state。
+- 把 `temp:` 变化在持久化前清掉。
+
+所以 `StateDelta` 是 event action 的一部分：它让 event 不只表示"模型/工具说了什么"，也表示"这一步对运行时状态做了什么修改"。
+
 教学大纲里要求画出这条路径：
 
 ```text

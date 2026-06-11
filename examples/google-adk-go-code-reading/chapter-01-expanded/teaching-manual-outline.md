@@ -215,6 +215,8 @@ State 是 agent workflow 运行时维护的可读写 key-value 工作上下文�
 
 **状态写入路径**：
 
+`StateDelta` 是一次 invocation / 一个 event 对 `State` 的变更记录，不是完整 state。它回答"这一步改了哪些 key"，例如 `user:report_language=zh-CN`、`topic=sales-analysis`、`temp:scratch=...`。`AppendEvent` 根据这份 delta 做 scope routing：app/user/session 分流，temp 持久化前清理。
+
 ```
 CallbackContext.State().Set("app:env", "prod")
     → actions.StateDelta["app:env"] = "prod"  (delta 记录)
