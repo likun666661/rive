@@ -129,7 +129,7 @@ Memory 的核心安全属性是：**不同 user 的 memory 不能互查**。这�
 两种 memory service 实现：
 | 实现 | 位置 | 后端 |
 |------|------|------|
-| InMemory | `memory/inmemory.go` | 内存 map + 关键词匹配 |
+| InMemory | `memory/inmemory.go` | 内存 word-intersection stub |
 | VertexAI | `memory/vertexai/vertexai.go` | VertexAI MemoryBank API |
 
 ---
@@ -162,9 +162,9 @@ Memory 的核心安全属性是：**不同 user 的 memory 不能互查**。这�
         │                   │                     │
    ┌────┼────┬──────┐  ┌────┼─────┐      ┌───────┼───────┐
    ▼    ▼    ▼      ▼  ▼    ▼     ▼      ▼       ▼       ▼
-  InMem DB  VertexAI InMem  GCS        InMem  VertexAI
-                    UserScoped?      (keyword (MemoryBank)
-                    ("user:" prefix)  match)
+  InMem DB  VertexAI InMem  GCS        InMemStub VertexAI
+                    UserScoped?      (word       (MemoryBank
+                    ("user:" prefix)  intersect)  similarity)
 ```
 
 ### 3.2 Request Validation 统一模式
@@ -244,7 +244,7 @@ Memory 通过 **状态键** 实现增量更新（`memory/vertexai/vertexai.go:37
 // 只将新事件送入 MemoryBank 生成记忆
 ```
 
-InMemory 实现中，`AddSessionToMemory` 直接遍历所有 events，提取 text 内容建立关键词索引（`memory/inmemory.go:59-107`）。
+当前 InMemory 实现中，`AddSessionToMemory` 直接遍历所有 events，提取 text 内容并建立 word-intersection stub（`memory/inmemory.go:59-107`）。这不是 Memory 的最终产品语义；原版语义应以 VertexAI MemoryBank / semantic retrieval 为基线。
 
 ---
 
@@ -270,7 +270,7 @@ InMemory 实现中，`AddSessionToMemory` 直接遍历所有 events，提取 tex
 | `artifact/gcsartifact/service.go` | GCS artifact 实现 |
 | `artifact/gcsartifact/gcs_client.go` | GCS 客户端接口抽象 |
 | `memory/service.go` | Memory Service 接口 |
-| `memory/inmemory.go` | In-memory 关键词匹配 memory 实现 |
+| `memory/inmemory.go` | In-memory word-intersection stub；和原版语义检索有差距 |
 | `memory/vertexai/vertexai.go` | VertexAI MemoryBank 实现 |
 | `memory/vertexai/vertexai_client.go` | VertexAI MemoryBank API 客户端 |
 | `internal/sessionutils/utils.go` | ExtractStateDeltas / MergeStates 公共工具 |
@@ -322,7 +322,7 @@ Memory 生命周期:
 - `artifact/artifact_key_test.go`: artifactKey 序列化往返测试
 
 **Memory 测试**:
-- `internal/memory/memory_test.go`: 测试 AddSessionToMemory + SearchMemory（关键词匹配）+ 多用户隔离
+- `internal/memory/memory_test.go`: 测试 AddSessionToMemory + SearchMemory stub 调用链 + 多用户隔离
 - `memory/inmemory_test.go`: 测试不同 appName/userID 的隔离、空存储查询
 
 ### 4.4 未决风险
@@ -335,7 +335,7 @@ Memory 生命周期:
 
 4. **Session 和 Event 的对象一致性问题**：`AppendEvent` 方法同时修改 session 对象的状态和 service 存储。如果其中一个失败（如 vertexai remote call 成功但本地 append 失败），会导致状态不一致。目前没有分布式事务或补偿机制。
 
-5. **Memory 的 SearchMemory 简单性**：InMemory 实现仅做关键词匹配（`memory/inmemory.go:143-160`），不涉及语义理解。VertexAI 实现使用 MemoryBank 的相似性搜索，两者行为差异较大，迁移时需注意。
+5. **Memory 的 InMemory stub 差距**：InMemory 实现只是 word-intersection stub（`memory/inmemory.go:143-160`），不代表原版 Memory 的语义检索能力。VertexAI 实现使用 MemoryBank 的相似性搜索，教学和生产语义应以这一类后端为基线。
 
 6. **同类型 Session 的类型断言脆弱**：`AppendEvent` 中使用 `curSession.(*session)` / `curSession.(*localSession)` 类型断言（如 `session/inmemory.go:208`），这要求调用者必须传递对应实现创建的具体类型，而不是任意的 `session.Session` 实现。
 
@@ -441,7 +441,7 @@ Memory 生命周期:
 
 3. **Artifact 的 `user:` 前缀约定**：`fileHasUserNamespace` 在 `inmemory.go` 和 `gcsartifact/service.go` 中分别实现。是否应该将此判断逻辑移至 `artifact/service.go` 公共层，避免实现间行为不一致？
 
-4. **MemoryService 的搜索能力差异**：InMemory 实现仅支持精确关键词匹配，VertexAI MemoryBank 支持相似性搜索。如果用户从 InMemory 迁移到 VertexAI，搜索结果会有显著差异。是否有计划为 InMemory 添加至少向量/embedding 搜索能力？
+4. **MemoryService 的本地 stub 替换**：InMemory 当前只是 word-intersection stub，VertexAI MemoryBank 支持相似性搜索。是否有计划为本地实现补齐向量/embedding 或 MemoryBank-compatible 检索能力？
 
 5. **Database Session Service 的乐观并发**：`storageUpdateTime > sessionUpdateTime` 使用 `>` 而非 `>=`。这意味着同一微秒内的两次 AppendEvent 不会被检测为 stale。这是有意设计的宽松策略，还是微秒精度不足的问题？
 

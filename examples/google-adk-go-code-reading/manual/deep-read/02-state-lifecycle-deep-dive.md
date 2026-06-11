@@ -20,7 +20,7 @@ Memory 提供**跨 Session 的长期知识检索**。典型场景：
 
 - 用户在多轮会话中透露了偏好（如"我喜欢 Python"），后续新会话的 Agent 需要记起。
 - 搜索返回的是 `[]Entry`，每个 Entry 包含 `Content *genai.Content`、`Author`、`Timestamp`、`CustomMetadata`。
-- Memory 通过 `AddSessionToMemory` 将 Session 的 Events 灌输到长期存储，再通过 `SearchMemory` 按关键词匹配返回。
+- Memory 通过 `AddSessionToMemory` 将 Session 的 Events 灌输到长期存储，再通过 `SearchMemory` 做长期相关性/语义检索。
 
 ### 1.3 Artifact 解决什么问题
 
@@ -35,8 +35,8 @@ Artifact 是 Agent/Tool 在对话过程中**产生或引用的文件**。典型�
 | 维度 | Session | Memory | Artifact |
 |------|---------|--------|----------|
 | **生命周期** | 会话创建 → 事件追加 → 会话结束/删除 | 长期存在，跨 Session 累积 | 按文件独立存在，支持版本演进 |
-| **数据模型** | 有序事件列表 + KV 状态 | 语义化 Content 片段 + 关键词索引 | 文件 blob + 版本号 |
-| **查询模式** | Key 精确查询 / 时间窗口 / 最近 N 条 | 全文/关键词搜索 | 文件名 + 版本号精确获取 |
+| **数据模型** | 有序事件列表 + KV 状态 | 长期记忆 Content 片段 + 语义/相关性索引 | 文件 blob + 版本号 |
+| **查询模式** | Key 精确查询 / 时间窗口 / 最近 N 条 | 语义/相关性搜索 | 文件名 + 版本号精确获取 |
 | **作用域** | app + user + session | app + user（跨 session） | app + user + session（或 user 级） |
 | **存储后端** | SQL/内存/Vertex AI | 内存/Vertex AI MemoryBank | 内存/GCS |
 | **并发语义** | 事件追加需防 stale | 批量覆盖写入 | 版本号自增、有竞态窗口 |
@@ -264,7 +264,9 @@ type Service interface {
 - `SearchResponse`: `Memories []Entry`
 - `Entry`: `ID` + `Content *genai.Content` + `Author` + `Timestamp` + `CustomMetadata`
 
-### 4.8 `memory/inmemory.go` — 内存关键词匹配
+### 4.8 `memory/inmemory.go` — 本地 word-intersection stub
+
+这一节记录的是当前本地 in-memory stub，不是 Memory 的最终产品语义。原版 ADK 的 Memory 教学主线应以长期相关性/语义检索为准。
 
 **存储结构** (L54-57)：
 ```go
@@ -276,9 +278,9 @@ type inMemoryService struct {
 }
 ```
 
-**AddSessionToMemory** (L59-107)：遍历 session 的所有 events，跳过无 Content 的。对每个 Part 的 Text 分词（以空格 split，转小写），构建 `words map[string]struct{}`。按 app+user 定位，按 sessionID 覆盖写入（最新一次覆盖之前）。
+**AddSessionToMemory** (L59-107)：遍历 session 的所有 events，跳过无 Content 的。当前 stub 对每个 Part 的 Text 做简单分词（以空格 split，转小写），构建 `words map[string]struct{}`。按 app+user 定位，按 sessionID 覆盖写入（最新一次覆盖之前）。
 
-**SearchMemory** (L109-141)：将 query 分词后，在对应 app+user 的 store 中遍历所有 session 的 events，用 `checkMapsIntersect` 做词集交集。
+**SearchMemory** (L109-141)：当前 stub 将 query 分词后，在对应 app+user 的 store 中遍历所有 session 的 events，用 `checkMapsIntersect` 做词集交集。这只能证明调用链、生命周期和隔离边界，不能代表原版 Memory 的语义检索能力。
 
 **性能特征**：O(S × E × W)，S 为 session 数，E 为每 session 的 event 数，W 为词数。无索引结构。
 
@@ -287,6 +289,7 @@ type inMemoryService struct {
 - `vertexAIService` 包装 `vertexAIClient`。
 - `StateKeySessionLastUpdateTime`: 如果设置，`AddSessionToMemory` 会从 session state 中读取一个 `time.Time` 值，只提交该时间之后的新 events。如果为空，提交整个 session。
 - 类型断言 `tm, ok := t.(time.Time)` 失败会报错，要求 state 值必须是 `time.Time` 类型。
+- `SearchMemory` 通过 MemoryBank `RetrieveMemories` 执行检索，客户端请求使用 `SimilaritySearchParams.SearchQuery`。这是原版 ADK Memory 的 similarity retrieval 后端。
 
 ### 4.10 `artifact/service.go` — Artifact 接口与验证
 
@@ -549,7 +552,7 @@ Get 时的 state 合并:
 
 | 测试用例 | 语义 |
 |----------|------|
-| `find events` | 多 session 多 event 的关键词匹配 |
+| `find events` | 多 session 多 event 的当前 stub 检索路径 |
 | `no leakage for different appName` | app 隔离 |
 | `no leakage for different user` | user 隔离 |
 | `no matches` | 无匹配返回空 |

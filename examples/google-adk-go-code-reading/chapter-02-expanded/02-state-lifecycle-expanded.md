@@ -92,7 +92,7 @@ trend.png version 2
 | 存储 | 解决什么 | 典型数据 | 查询方式 | 生命周期 |
 | --- | --- | --- | --- | --- |
 | Session | 当前对话线程 | events + scoped KV | sessionID 精确读取 | 会话生命周期 |
-| Memory | 跨 session 长期知识 | 从 events 提取的文本记忆 | keyword search | 用户长期生命周期 |
+| Memory | 跨 session 长期知识 | 从 events 提取的长期记忆 | 语义/相关性搜索 | 用户长期生命周期 |
 | Artifact | 文件产物 | text/blob + version | fileName + version | 文件生命周期 |
 
 这就是本章的起点。
@@ -109,7 +109,7 @@ trend.png version 2
 | `artifact/service.go` | `Service` 接口、`SaveRequest`、`LoadRequest`、request validation | Artifact 的 API 边界 |
 | `artifact/inmemory.go` | `Save`、`Load`、`List`、`Versions`、`resolveIdentity` | 版本自增和 `user:` 文件命名空间 |
 | `memory/service.go` | `Service`、`SearchRequest`、`Entry` | Memory 的接口形状 |
-| `memory/inmemory.go` | `AddSessionToMemory`、`SearchMemory`、`wordsIntersect` | 关键词记忆搜索 |
+| `memory/inmemory.go` | `AddSessionToMemory`、`SearchMemory`、`wordsIntersect` | 当前本地 stub；和原版 Memory 语义有差距 |
 | `context/callback_context.go` | `callbackContextState`、`trackedArtifacts` | CallbackContext 的 write-through state 和 artifact delta |
 | `runner/runner_test.go` | scoped state、temp state、artifact、memory 测试 | 行为证据 |
 
@@ -651,9 +651,9 @@ AddSessionToMemory(session)
 SearchMemory(appName, userID, query)
 ```
 
-### 8.1 AddSessionToMemory：从事件里提取文本词项
+### 8.1 AddSessionToMemory：从事件里摄取长期记忆材料
 
-复刻版 in-memory 实现：
+当前本地 in-memory 实现会从 session event 中抽取文本：
 
 ```go
 for _, ev := range curSession.Events() {
@@ -680,35 +680,48 @@ for _, ev := range curSession.Events() {
 - 有 content 的 event。
 - 有 text 的 part。
 
-它不会摄取 function call args，也不会摄取二进制 artifact。
+它不会摄取 function call args，也不会摄取二进制 artifact。作为教学代码，这段能说明"Memory 来自 session 历史的显式摄取"；但它还不是原版 ADK 的完整 Memory 能力。
 
-### 8.2 SearchMemory：关键词交集，不是语义搜索
+### 8.2 SearchMemory：原版说法是语义/相关性检索
 
-`SearchMemory` 先把 query 分词：
+Memory 不是按 key 精确读取，也不应该把长期记忆理解成普通字符串匹配。更贴近原版 ADK 的说法是：
+
+- `SearchMemory` 接收自然语言 query。
+- Memory service 返回和 query 相关的长期记忆条目。
+- 具体检索算法由后端决定：可以是 MemoryBank、向量检索、摘要索引或其他托管记忆系统。
+
+我在本机原版 `adk-go` 里核对到两处直接证据：
+
+- `agent/callback_context.go` 的注释把 `SearchMemory` 描述为 semantic search。
+- `memory/vertexai/vertexai_client.go` 的 VertexAI MemoryBank 后端调用 `RetrieveMemories`，参数使用 `SimilaritySearchParams.SearchQuery`。
+
+所以教学主线应该是：
+
+> ADK Memory 表达的是跨 session 的长期相关性/语义检索能力；用户问一个自然语言 query，运行时把相关长期记忆取回，再交给后续 agent workflow 使用。
+
+### 8.3 当前本地实现差距：in-memory 只是临时 stub
+
+当前本地 `memory/inmemory.go` 里还能看到一个简化实现：
 
 ```go
 for _, w := range strings.Fields(req.Query) {
     queryWords[strings.ToLower(w)] = struct{}{}
 }
-```
 
-再找交集：
-
-```go
 if wordsIntersect(e.words, queryWords) {
     memories = append(memories, Entry{...})
 }
 ```
 
-所以复刻版 Memory 是关键词交集搜索，不是向量语义搜索。
+这段只能当作本地 in-memory stub 或测试替身。它可以用来验证：
 
-这点必须讲清楚。教学上可以说：
+- memory entries 的生命周期。
+- app/user 隔离。
+- `AddSessionToMemory` 的摄取时机。
 
-> Memory 的接口表达的是长期记忆能力；当前 in-memory 实现只是最小关键词版本，用来说明生命周期和隔离边界。
+但它不应该作为 Memory 的正确产品语义来教。读者要带走的是原版 ADK 的抽象：Memory 是长期语义/相关性检索；这个本地 stub 需要替换成真正的 MemoryBank/向量/语义检索后端。
 
-测试 `TestInMemoryService_AddAndSearchMemory` 用 `"quick hello"` 同时搜到两个 session 的事件；`TestInMemoryService_NoMatches` 验证没有关键词交集时返回 0。
-
-### 8.3 Memory 的隔离边界
+### 8.4 Memory 的隔离边界
 
 Memory store 的 key 是：
 
@@ -727,7 +740,7 @@ type appUserKey struct {
 
 这和 user-scoped artifact 很像：都可以跨 session，但不能跨 app/user。
 
-### 8.4 AddSessionToMemory 是覆盖，不是增量追加
+### 8.5 AddSessionToMemory 是覆盖，不是增量追加
 
 `AddSessionToMemory` 最后写：
 
@@ -842,16 +855,18 @@ list versions -> max + 1 -> write
 
 ### 10.3 Memory
 
-复刻版 memory 是关键词交集。
+Memory 的原版语义是长期相关性/语义检索。当前本地 in-memory 后端只是简化 stub，不能代表最终设计。
 
-生产级 memory 可能是：
+可替换的正确后端可以是：
 
 - 向量检索。
 - 摘要提取。
 - 增量 ingestion。
-- MemoryBank API。
+- Vertex AI MemoryBank。
 
-但接口层的教学意义已经足够：Session 是短期事件，Memory 是长期可搜索知识。
+原版 `memory/vertexai` 已经展示了这个方向：它通过 Vertex AI MemoryBank 的 `RetrieveMemories` 和 `SimilaritySearchParams.SearchQuery` 做托管 similarity retrieval。
+
+但接口层的教学意义已经足够：Session 是短期事件，Memory 是长期可搜索知识；本地 stub 要向语义/相似度检索后端演进。
 
 ---
 
@@ -897,7 +912,7 @@ list versions -> max + 1 -> write
 
 ### 11.6 Memory 搜索和隔离
 
-`TestInMemoryService_AddAndSearchMemory` 验证关键词搜索。
+`TestInMemoryService_AddAndSearchMemory` 只能验证当前 in-memory stub 的检索路径；教学时不要把它提升为 Memory 的最终语义。
 
 `TestInMemoryService_MemorySurvivesAcrossSessions` 验证 memory 跨 session。
 
@@ -929,27 +944,31 @@ list versions -> max + 1 -> write
 
 不是。`temp:` 会在持久化前从 event delta 和 session state 中清掉。
 
-### 12.4 "Memory 是语义搜索"
+### 12.4 "Memory 只是本地 stub 能力"
 
-复刻版不是。它只是 `strings.Fields` + lowercase + words intersect。
+不对。原版 ADK 的 Memory 抽象是长期相关性/语义检索，VertexAI MemoryBank 后端使用 similarity search。当前本地 in-memory 的 word-intersection 行为只是 stub 差距。
 
-### 12.5 "Artifact List 会返回文件内容"
+### 12.5 "看到本地 in-memory 测试通过，就说明 Memory 做完了"
+
+不对。测试只能说明生命周期、隔离边界和 stub 调用链能跑通。真正对齐原版语义，还要把后端替换成 MemoryBank/向量/语义检索。
+
+### 12.6 "Artifact List 会返回文件内容"
 
 不会。`List` 只返回 file names。要内容必须 `Load`。
 
-### 12.6 "Artifact 版本跟事件数量有关"
+### 12.7 "Artifact 版本跟事件数量有关"
 
 无关。Artifact 每个文件独立自增版本。
 
-### 12.7 "`user:` artifact 可以跨用户"
+### 12.8 "`user:` artifact 可以跨用户"
 
 不能。它只是跨 session，不跨 app/user。
 
-### 12.8 "AddSessionToMemory 是增量追加"
+### 12.9 "AddSessionToMemory 是增量追加"
 
 复刻版不是。同一个 session 再次 Add 会覆盖该 session 的 memory entries。
 
-### 12.9 "CallbackContext 可以只写 delta，不写 durable state"
+### 12.10 "CallbackContext 可以只写 delta，不写 durable state"
 
 复刻版选择 write-through，是为了同一步里的后续 callback/tool 可以马上读到更新。只写 delta 会让当前 invocation 的读取语义更复杂。
 
@@ -980,7 +999,7 @@ list versions -> max + 1 -> write
 | 类型 | 生命周期 | 查询方式 | 数据模型 |
 | --- | --- | --- | --- |
 | Session | 会话 | sessionID | events + KV |
-| Memory | 长期 | keyword query | text entries |
+| Memory | 长期 | 语义/相关性 query | text entries |
 | Artifact | 文件 | file + version | blob/text |
 
 ### 第 5-8 分钟：讲四种 state scope
@@ -1026,9 +1045,10 @@ Set(key, value)
 讲：
 
 - AddSessionToMemory 摄取 session events。
-- SearchMemory 做关键词交集。
+- SearchMemory 的原版说法是长期相关性/语义检索。
 - 按 app/user 隔离。
 - 同 session 再 Add 是覆盖。
+- 当前本地 in-memory 只是 stub；VertexAI MemoryBank 后端是 similarity retrieval。
 
 最后用测试名收口。
 
@@ -1080,9 +1100,9 @@ Load(report.txt, Version: 0) -> "v2"
 
 Session 1 保存 `user:preferences.json`，Session 2 读取它。然后换 user，确认读不到。
 
-### 任务 5：解释 memory search 的局限
+### 任务 5：解释本地 memory stub 的局限
 
-为什么 query `"programming language"` 不一定能搜到 `"I like Python"`？如果要支持语义搜索，需要改哪些地方？
+为什么当前本地 stub 不能代表原版 ADK 的 Memory 语义？如果要对齐 VertexAI MemoryBank / semantic retrieval，需要替换哪些地方？
 
 ---
 
@@ -1097,9 +1117,10 @@ Session 1 保存 `user:preferences.json`，Session 2 读取它。然后换 user�
 7. Artifact 第一次保存某文件时 version 是多少？第二次呢？
 8. `Load` 不指定 version 时读什么？
 9. `user:` artifact 能跨 session 吗？能跨 user 吗？
-10. Memory 的 in-memory 搜索是语义搜索还是关键词交集？
+10. Memory 的原版设计语义是什么？当前本地 in-memory stub 的差距是什么？
 11. `AddSessionToMemory` 对同一个 session 是追加还是覆盖？
 12. Partial event 会进入 Memory 吗？为什么？
+13. 原版 ADK Go 的 VertexAI MemoryBank 后端使用什么检索参数？
 
 参考答案：
 
@@ -1112,13 +1133,13 @@ Session 1 保存 `user:preferences.json`，Session 2 读取它。然后换 user�
 7. v1，v2。
 8. 最新版本。
 9. 能跨 session；不能跨 user/app。
-10. 关键词交集。
+10. 原版设计语义是跨 session 的长期相关性/语义检索；当前本地 in-memory stub 只是 word-intersection，不能代表最终 Memory 设计。
 11. 覆盖同 session entries。
 12. 不会。Partial 是流式过程片段，不是稳定长期记忆来源。
+13. 它调用 Vertex AI MemoryBank 的 `RetrieveMemories`，并使用 `SimilaritySearchParams.SearchQuery`。
 
 ---
 
 ## 16. 本章一句话总结
 
 Chapter 02 的核心不是"多写几个存储接口"，而是把 agent workflow 里的状态生命周期分清楚：Session 保存当前对话线程的事件和短期状态，Memory 保存跨 session 的长期可搜索知识，Artifact 保存独立版本化文件；StateDelta 和四种前缀负责把一次 invocation 中产生的状态更新路由到正确作用域，CallbackContext 的 write-through 则保证这些更新既能被记录，也能在当前运行中立刻可见。
-

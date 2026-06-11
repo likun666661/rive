@@ -16,7 +16,7 @@ ADK Go 是一个基于 **Go 1.23 push-iterator（`iter.Seq2`）** 构建的 Agen
 
 1. **执行核心**：`Runner.Run` → `Agent.Run` → `llmAgent.run` → `Flow.Run` → `runOneStep` 形成主调用链。每次 `runOneStep` 执行 `preprocess（RequestProcessor 管道 13 个处理器）→ callLLM（Before/After/OnError 回调）→ postprocess（ResponseProcessor 管道）→ handleFunctionCalls（并行 goroutine + WaitGroup）→ agent transfer` 的完整循环，直到 LLM 返回 `IsFinalResponse() == true`。
 
-2. **状态体系**：Session（对话历史 + KV State，支持 app:/user:/temp: 三级前缀）、Memory（跨 session 关键词搜索）、Artifact（版本化文件，支持 user: 命名空间）三者独立为 `Service` 接口，通过 `InvocationContext` 注入 agent 运行时；StateDelta 采用 **写穿（write-through）** 策略——状态修改同时写入 delta 和真实 state，无事务回滚。
+2. **状态体系**：Session（对话历史 + KV State，支持 app:/user:/temp: 三级前缀）、Memory（跨 session 长期相关性/语义检索）、Artifact（版本化文件，支持 user: 命名空间）三者独立为 `Service` 接口，通过 `InvocationContext` 注入 agent 运行时；StateDelta 采用 **写穿（write-through）** 策略——状态修改同时写入 delta 和真实 state，无事务回滚。
 
 3. **扩展与编排**：Callback/Plugin 双层扩展（Plugin 先于 Callback，均 early-exit）覆盖 Agent/Model/Tool 三个生命周期；Workflow Agents（Sequential/Parallel/Loop）通过 `iter.Seq2` 组合实现编排与背压；AgentTool 将子 Agent 封装为 Tool 在沙箱 session 中运行；Remote A2A 通过 A2A 协议实现跨进程 Agent 通信；入口层通过 `launcher.Config` + sublauncher 体系统一控制台、REST、A2A、Agent Engine、Cloud Run 等多种部署形态。
 

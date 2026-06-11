@@ -191,12 +191,12 @@ Agent 对话过程中需要管理三种性质完全不同的数据：
 | 存储 | 示例 | 关键特征 |
 |------|------|----------|
 | Session | 用户查天气，模型返回 function call，工具返回结果，模型回复 | 一次对话线程内的短期 KV + 事件流 |
-| Memory | Session 1 说"我喜欢 Python"，Session 2 应回忆起 Python 偏好 | 跨 Session 的长期知识，关键词搜索 |
+| Memory | Session 1 说"我喜欢 Python"，Session 2 应回忆起 Python 偏好 | 跨 Session 的长期知识，语义/相关性搜索 |
 | Artifact | Agent 生成了图表 PNG，需持久化并返回给用户 | 按文件独立存在、支持版本演进 |
 
 ### 为什么难
 
-四种维度的差异不可调和：生命周期（session 短期 vs memory 长期 vs artifact 按文件）、数据模型（有序事件+KV vs 关键词索引 vs 文件 blob+版本）、查询模式（Key 查询 vs 关键词搜索 vs 文件名+版本）、作用域（app+user+session vs app+user vs app+user+session/user:）。
+四种维度的差异不可调和：生命周期（session 短期 vs memory 长期 vs artifact 按文件）、数据模型（有序事件+KV vs 长期记忆索引 vs 文件 blob+版本）、查询模式（Key 查询 vs 语义/相关性搜索 vs 文件名+版本）、作用域（app+user+session vs app+user vs app+user+session/user:）。
 
 ### 核心抽象
 
@@ -231,7 +231,7 @@ AppendEvent:
 4. `artifact/service.go` — `Service` interface (L23-30), `SaveRequest`/`LoadRequest` (L46, L85)。
 5. `artifact/inmemory.go` — `Save` (L51-69): `maxVersion + 1`；`Load` (L72-98): `req.Version > 0` 精确查找；`resolveIdentity` (L39-49): `user:` 前缀跨 session 共享。
 6. `memory/service.go` — `Service` interface (L19)：`AddSessionToMemory` + `SearchMemory`。
-7. `memory/inmemory.go` — `AddSessionToMemory` (L40-91): 遍历 events，分词后按 (app, user, sessionID) 存储；`SearchMemory` (L93-128): query 分词后 `wordsIntersect`。
+7. `memory/inmemory.go` — `AddSessionToMemory` (L40-91): 遍历 events 后按 (app, user, sessionID) 存储；当前本地 `SearchMemory` 仍是 `wordsIntersect` stub，教学时标记为和原版语义检索有差距。
 8. `context/callback_context.go` — `callbackContextState` (L152-187): `Get` 先查 delta → 回退 durable; `Set` 同时写 delta + durable; `trackedArtifacts` (L195-235): decorate `Save` 自动记录版本到 `ArtifactDelta`。
 
 ### 演示建议
@@ -239,23 +239,23 @@ AppendEvent:
 1. **三 session 状态隔离演示**（3 min）：sess-1 设置 `app:env=production`, `user:theme=dark`, `topic=session1`；sess-2 通过 `GetMergedState` 看到前两个但看不到 `topic` 和 `temp:` 前缀 key。
 2. **白板画 state 写入流程**（2 min）：CallbackContext.Set → AppendEvent → applyStateDelta → trimTemp → removeTemp → ExtractStateDeltas → updateApp/User。
 3. **Artifact 版本管理**（2 min）：Save v1 → Save v2（版本自增）→ Load latest → Load Version=1。
-4. **Memory 跨 session 搜索**（2 min）：AddSessionToMemory(sess1) + AddSessionToMemory(sess2) → SearchMemory("state config") → 不同 user 搜索返回 0 条。
+4. **Memory 跨 session 搜索**（2 min）：AddSessionToMemory(sess1) + AddSessionToMemory(sess2) → SearchMemory("我有什么长期偏好") → 返回相关长期记忆；不同 user 搜索返回 0 条。
 
 ### 容易误解点
 
 1. **"temp: 前缀的 key 会持久化"** → 不会。`AppendEvent` 的 `trimTempDeltaState` + `removeTempKeysFromState` 彻底清理。
 2. **"app: 和 user: key 只存在特定存储中"** → 也写入了 `session.state`。`GetMergedState` 返回三层合并视图。
 3. **Artifact `List` 返回文件内容** → 只返回文件名列表。
-4. **Memory 搜索是语义搜索** → 只是简单关键词交集 `wordsIntersect`，非向量搜索。
+4. **Memory 只是本地 stub 能力** → 不对。原版说法是语义/相关性检索；当前本地 `wordsIntersect` 只是 stub 差距。
 5. **"Memory 的 AddSessionToMemory 是增量追加"** → 每次调用覆盖整个 session 的所有 events（幂等但不增量）。
 
 ### 练习题
 
 - **Q1**：创建两个 session（同一 app 同一 user），验证 `GetMergedState` 能看到/看不到哪些 key。
 - **Q2**：写出 artifact Save v1 → Save v2 → Load latest → Load version 1 的调用代码。
-- **Q3**：判断正误：A) `app:` key 不写入 session.state；B) temp key 在 AppendEvent 后被移除但 invocation 内可见；C) Memory 使用向量语义匹配；D) Artifact version 从 0 开始。
+- **Q3**：判断正误：A) `app:` key 不写入 session.state；B) temp key 在 AppendEvent 后被移除但 invocation 内可见；C) Memory 的设计语义是长期相关性/语义检索；D) Artifact version 从 0 开始。
 - **Q4**：说明 CallbackContext write-through 策略的优缺点。
-- **Q5**：如何在 Memory 中添加向量语义搜索？需要改动哪些接口？
+- **Q5**：如何把当前本地 Memory stub 替换成原版语义/相关性检索后端？需要改动哪些接口？
 
 ### 代码附录
 
@@ -266,7 +266,7 @@ AppendEvent:
 | `artifact/service.go` | `Service`, `SaveRequest`, `LoadRequest` | 23,46,85 | Artifact 接口和验证 | `inmemory_test.go` |
 | `artifact/inmemory.go` | `Save`, `Load`, `resolveIdentity`, `List` | 51,72,39,129 | 版本自增 + user namespace | `inmemory_test.go` |
 | `memory/service.go` | `Service` | 19 | Memory 接口 | `inmemory_test.go` |
-| `memory/inmemory.go` | `AddSessionToMemory`, `SearchMemory`, `wordsIntersect` | 40,93,130 | **关键词交集搜索** | `inmemory_test.go` |
+| `memory/inmemory.go` | `AddSessionToMemory`, `SearchMemory`, `wordsIntersect` | 40,93,130 | 当前本地 stub；应替换为原版语义/相关性检索后端 | `inmemory_test.go` |
 | `context/callback_context.go` | `callbackContextState`, `trackedArtifacts`, `RunWithCallbackContext` | 152,195,255 | **write-through state + artifact tracking** | `callback_context_test.go` |
 | `runner/runner.go` | `Runner.Run` | 124 | **入口主循环** | `runner_test.go` |
 
