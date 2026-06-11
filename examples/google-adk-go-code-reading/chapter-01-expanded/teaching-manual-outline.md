@@ -200,6 +200,10 @@ Agent 对话过程中需要管理三种性质完全不同的数据：
 
 ### 核心抽象
 
+**State 定义**：
+
+State 是 agent workflow 运行时维护的可读写 key-value 工作上下文，不是完整 event history，也不是长期 Memory 或文件 Artifact。它保存后续 callback/tool/model request 需要读取的结构化变量，例如 `app:env`、`user:report_language`、`topic`、`temp:scratch`。讲四层作用域前必须先说明：scope 解决的是同一类 key-value state 在不同生命周期里的可见范围和持久化规则。
+
 **四层作用域**：
 
 | 前缀 | 作用域 | 生命周期 | 存储位置 |

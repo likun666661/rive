@@ -119,6 +119,36 @@ trend.png version 2
 
 ## 3. 四种 state scope：同样是 key，生命周期完全不同
 
+先把最基础的问题讲清楚：这里的 **state** 到底是什么？
+
+在 agent workflow 里，state 是运行时维护的一组 **可读写 key-value 工作上下文**。它不是模型输出的一整段文本，也不是完整对话历史，而是代码和 agent 在多步执行过程中需要随时读写的结构化变量。
+
+举几个例子：
+
+```text
+app:env = "production"          // 应用级配置
+user:report_language = "zh-CN"  // 用户偏好
+topic = "sales-analysis"        // 当前 session 的任务主题
+temp:scratch = "tool-cache"     // 当前 invocation 的临时中间结果
+```
+
+这些值有三个特征：
+
+- 它们是结构化 key-value，不是自然语言聊天记录。
+- 它们会影响后续 callback、tool、model request 或 agent step 怎么运行。
+- 它们可能被代码修改，所以需要明确"写到哪里、谁能看到、什么时候清掉"。
+
+把 state 和本章另外三个概念区分开，会更容易理解：
+
+| 概念 | 它是什么 | 典型问题 |
+| --- | --- | --- |
+| Event | 已发生的对话/工具调用历史 | "上一轮模型和工具说了什么？" |
+| State | 当前运行可读写的 key-value 上下文 | "当前用户偏好、任务参数、中间结果是什么？" |
+| Memory | 跨 session 的长期相关性/语义检索 | "这个用户以前透露过什么长期偏好？" |
+| Artifact | 独立版本化文件 | "生成的报告、图片、CSV 存在哪里？" |
+
+所以"四种 state scope"讨论的不是四种 store，而是同一类 key-value state 在不同生命周期里的可见范围。同样是一个 key，如果写成 `app:env`、`user:env`、`env`、`temp:env`，它的共享范围和持久化规则完全不同。
+
 `session/session.go` 文件开头已经把四种 scope 写在注释里：
 
 ```go
