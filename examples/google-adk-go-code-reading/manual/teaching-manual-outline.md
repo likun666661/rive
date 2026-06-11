@@ -19,9 +19,10 @@
 | 5 | Ch05 | Workflow / AgentTool / Remote A2A | 14 min | 72 | 从单 agent 到多 agent——"一个 agent 不够，怎么组合多个？" |
 | 6 | Ch06 | Entrypoint / Deploy / Telemetry | 10 min | 82 | 从开发到产品——"写好了 agent，怎么暴露出去？" |
 | 7 | Ch07 | Agent Flow / ReAct / Multi-Agent | 14 min | 96 | 收官——"前面 6 章全为了这一章：ReAct 是组合，不是魔法" |
-| — | Q&A | 自由问答 + 总结 thesis | 14 min | 110 | 开放讨论，回顾 6 条关键 thesis |
+| 8 | Smoke | 真实 DeepSeek/OpenAI-compatible tool-calling smoke | 6 min | 102 | 从 FakeModel 走到真实 LLM，验证架构不是纸面设计 |
+| — | Q&A | 自由问答 + 总结 thesis | 8 min | 110 | 开放讨论，回顾 6 条关键 thesis |
 
-**主线串联**：Runner → Agent → Flow → Tool/State → Multi-Agent
+**主线串联**：Runner → Agent → Flow → Tool/State → Multi-Agent → Real LLM Smoke
 
 **每个转场只需一句话**：
 - Ch01→Ch02："Runner 跑完一次调用，events 持久化到 session——但不同 session 之间的状态和数据怎么共享？"
@@ -30,6 +31,7 @@
 - Ch04→Ch05："单 agent 搞定了，现在需要多个 agent 串联、并联、按需委派。"
 - Ch05→Ch06："agent 组合好了，怎么通过 console、REST、部署到云上让人用？"
 - Ch06→Ch07："最后一步：把所有概念（Model + Tool + Plugin + Workflow + Config）组合成完整的 ReAct agent 和可配置的 agent tree。"
+- Ch07→Smoke："FakeModel 能证明控制流，真实 DeepSeek 才能证明 tool declaration、history 回灌和 provider adapter 真的闭环。"
 
 ### 如果现场只有 30 分钟怎么压缩
 
@@ -39,8 +41,9 @@
 4. **Ch05 压缩到 5 分钟**——只讲 Sequential/Parallel/Loop 三种 workflow 的对比表 + AgentTool 一句话。
 5. **Ch06 压缩到 3 分钟**——只展示 `launcher.Config` 稳定协议 + telemetry span 四类。
 6. **Ch07 压缩到 2 分钟**——一句话："ReAct = Flow.Run 的 for 循环 + transfer_to_agent + 策略插件"，交给课后自学。
+7. **Real LLM Smoke 压缩到 2 分钟**——只展示 `go run ./cmd/realllm` 输出：`model_call -> tool_result -> final_answer`。
 
-30 分钟不可求全，核心是在听众脑中植入 **"四层分离 / state 四作用域 / ReAct 是 Flow 循环"** 三个概念。
+30 分钟不可求全，核心是在听众脑中植入 **"四层分离 / state 四作用域 / ReAct 是 Flow 循环 / 真实 LLM 需要 history 回灌"** 四个概念。
 
 ---
 
@@ -113,14 +116,18 @@ Runner.Run
 8. `flow/flow.go` — `handleFunctionCalls` (L368)：并发 goroutine 通过 `sync.WaitGroup` 并行执行工具。
 9. `flow/flow.go` — `executeTransfer` (L767-831)：递归调用目标 agent 的 Execute，支持链式 transfer（A→B→C），深度限制 10 层。
 10. `model/model.go` — `LLM` 接口 (L47-50)、`FakeModel` (L55-81)：**教学复刻精髓**——无需真实 LLM 即可测试整个 Flow 循环。
-11. `event/event.go` — `Event` 结构体 (L105-146)、`IsFinalResponse` (L166-187)：循环终止判定。
-12. `session/session.go` — `Session` 接口 (L108-116)、`inMemorySession.AppendEvent` (L170-193)。
+11. `model/contents.go` — `ContentsFromEvents`：把 session/model/tool events 转为真实 LLM request history。
+12. `model/openai.go` — `OpenAICompatibleModel`, `NewDeepSeekModel`：OpenAI-compatible `/chat/completions` adapter，支持 tool calls 和 tool responses。
+13. `cmd/realllm/main.go` — 真实 DeepSeek smoke：强制模型调用 `get_weather`，再基于 tool result 生成 final answer。
+14. `event/event.go` — `Event` 结构体 (L105-146)、`IsFinalResponse` (L166-187)：循环终止判定。
+15. `session/session.go` — `Session` 接口 (L108-116)、`inMemorySession.AppendEvent` (L170-193)。
 
 ### 演示建议
 
 1. **Live coding 30 行天气查询 demo**（3 min）：`NewFunctionTool` → `NewFakeModel` → `Flow` → `llmagent.New` → `Runner.Run`，展示 3 个 events 输出。
 2. **Partial 事件不持久化**（2 min）：产生一个 partial + 一个 final event，验证 session 里的 events 只有 user + final。
 3. **Agent Transfer 路由**（2 min）：两次 invocation，第一次触发 transfer_to_agent，第二次直接命中 specialist。
+4. **真实 DeepSeek smoke**（3 min）：`DEEPSEEK_API_KEY=... go run ./cmd/realllm`，确认输出包含 `model_call get_weather`、`tool_result get_weather`、`final_answer`、`persisted_events: 4`。
 
 ### 容易误解点
 
@@ -129,6 +136,8 @@ Runner.Run
 3. **"Partial 事件不持久化 = 丢掉"** → partial 事件被 yield 给调用方，只是不写入 session history。
 4. **"FakeModel 的响应队列用完了会怎样"** → 返回 `"no more queued responses"` 错误。
 5. **"每个 step 都调 GenerateContent"** → 如果 `BeforeModelCallback` 返回了非 nil response，实际 model 调用被跳过。
+6. **"FakeModel 过了就等于真实 LLM 过了"** → 不成立。真实 LLM 第二轮必须看到上一轮 model function call 和 tool response；这由 `ContentsFromEvents` + `Flow.runOneStep(..., priorEvents)` 保证。
+7. **"DeepSeek endpoint 写成 `https://api.deepseek.com` 就够了"** → Go client 在本机直连 `/chat/completions` 曾出现 EOF，稳定路径是 `https://api.deepseek.com/v1`。
 
 ### 练习题
 
@@ -137,6 +146,8 @@ Runner.Run
 - **Q3**：什么条件下 `Flow.Run` 会跳过 `callModel` 直接返回 event？
 - **Q4**：Runner 配置了 MemoryService 和 ArtifactService，但 agent 和 flow 中都没有使用。这些服务在 Ch01 运行时中起作用吗？
 - **Q5**：如果 `findAgentToRun` 的实现中没有跳过 user 事件，会发生什么？
+- **Q6**：为什么真实 LLM tool-calling loop 需要把同一次 invocation 内的 model event 和 tool event 也喂回下一次 model request？
+- **Q7**：`cmd/realllm` 为什么要求 session 最终有 4 个 persisted events？分别是哪四个？
 
 ### 代码附录
 
@@ -147,11 +158,14 @@ Runner.Run
 | `llmagent/llmagent.go` | `New` | 29 | Agent→Flow 胶水层 | `llmagent_test.go` |
 | `flow/flow.go` | `Flow`, `Run`, `runOneStep`, `callModel`, `handleFunctionCalls`, `executeTransfer` | 79,103,151,241,368,767 | **核心多步循环** + 回调链顺序 | `flow_test.go` |
 | `model/model.go` | `LLM` interface, `FakeModel`, `LLMRequest`, `LLMResponse` | 15,37,47,55 | 最小化 LLM 抽象 + 预定义响应队列 | `model_test.go` |
+| `model/contents.go` | `ContentsFromEvents` | 全文件 | Session/Event → LLM request history | `openai_test.go`, `history_test.go` |
+| `model/openai.go` | `OpenAICompatibleModel`, `NewDeepSeekModel`, `GenerateContent` | 全文件 | 真实 OpenAI-compatible/DeepSeek adapter | `openai_test.go` |
 | `event/event.go` | `Event`, `EventActions`, `IsFinalResponse`, `NewEvent` | 68,100,166,148 | 核心数据单元 + 循环终止判定 | `event_test.go` |
 | `session/session.go` | `Session` interface, `inMemorySession`, `Service`, `AppendEvent` | 107,142,363,446 | 会话状态 | `session_test.go` |
 | `cmd/demo/main.go` | `runChapter01` | 121 | **最简完整链路演示** | — |
+| `cmd/realllm/main.go` | `run`, `get_weather` smoke | 全文件 | 真实 DeepSeek tool-calling smoke | — |
 
-**关键测试**：`TestRunnerSimpleTextRun`, `TestRunnerToolCallAndFinalResponse`, `TestRunnerPartialEventsNotPersisted`, `TestRunnerAutoCreateSession`, `TestRunnerSessionReuse`.
+**关键测试**：`TestRunnerSimpleTextRun`, `TestRunnerToolCallAndFinalResponse`, `TestRunnerPartialEventsNotPersisted`, `TestRunnerAutoCreateSession`, `TestRunnerSessionReuse`, `TestFlowFeedsPriorStepEventsIntoNextModelRequest`, `TestOpenAICompatibleModelToolCallResponse`。
 
 ---
 
@@ -276,7 +290,7 @@ AppendEvent:
 
 LLM Agent 面临的工具来源极其多样：Go 函数（泛型 TArgs→JSON Schema 推断）、MCP 服务器（JSON-RPC over stdio/SSE）、Gemini 原生工具（genai.Tool）、子 Agent（InputSchema）、Skill 文件系统。
 
-核心问题：**如何让 Flow 在主循环中无差别地调度这些工具，同时每种来源能以最小代价接入？**
+核心问题：**如何让 Flow 在主循环中无差别地调度这些工具，同时每种来源能以最小代价接入？** 这在 FakeModel 阶段只是结构问题；接入 DeepSeek/OpenAI-compatible 后，它会变成真实协议问题：`tool.Declaration` 必须能转成 OpenAI `tools[].function.parameters`，模型返回的 `tool_calls[].function.arguments` 必须能回到 `event.FunctionCall.Args`。
 
 ### 为什么难
 
@@ -303,6 +317,7 @@ Tool (最小公共接口: Name / Description / IsLongRunning)
 1. **时序不同**：declaration 在 LLM 请求**之前**被注入，execution 在 LLM 返回 FunctionCall **之后**才触发。
 2. **协议插口不同**：declaration 面向 LLM（FunctionDeclaration），execution 面向工具实现者（Run）。
 3. **来源可能合一也可能分离**：本地 Go 函数的 declaration 和 execution 在同一个 struct；Gemini 原生工具由 Gemini API 闭环。
+4. **真实模型需要标准协议桥接**：`model/openai.go` 负责把 `tool.Declaration` 转成 OpenAI-compatible `tools`，把 `tool_calls` 转回 `event.FunctionCall`，把 tool result 转成 role=`tool` 的 message。
 
 ### 复刻版代码走读
 
@@ -313,6 +328,8 @@ Tool (最小公共接口: Name / Description / IsLongRunning)
 5. `tool/context.go` — `ToolContext` 接口 (全文件 76 行): `InvocationContext()`, `RequestConfirmation()`, `Actions()`。
 6. `flow/flow.go` — FunctionCall 生命周期 (L368-496): preprocess → injectToolDeclarations → callModel → handleFunctionCalls → executeToolCall → mergeResultsToEvent。
 7. `flow/flow.go` — `lookupTool` 分派 (L475-492): type switch 区分 `StreamingFunctionTool` / `ContextFunctionTool` / `FunctionTool`。
+8. `model/openai.go` — `openAIToolsFromDeclarations`, `llmResponseFromOpenAIChoice`, `openAIToolMessagesFromContent`：真实 provider 的 tool declaration / tool call / tool response 三段桥接。
+9. `cmd/realllm/main.go` — `NewFunctionToolWithDeclaration("get_weather", ...)`：最小真实 LLM tool-calling 验证入口。
 
 ### 演示建议
 
@@ -321,6 +338,7 @@ Tool (最小公共接口: Name / Description / IsLongRunning)
 3. **Rejected Confirmation**（1 min）：`SetConfirmed(false)` → `ErrConfirmationRejected`。
 4. **Streaming Tool Non-Live**（2 min）：`generate_report` 返回三个 chunks，`CollectStreamChunks` 合并为单条结果。
 5. **Long-Running Tool**（1 min）：`NewLongRunningFunctionTool` → declaration description 包含 "Do not call again" 注解。
+6. **真实 Tool Declaration Smoke**（2 min）：展示 `cmd/realllm` 中 `get_weather` 的 JSON Schema 如何进入 DeepSeek request，并从 stdout 看到真实 `model_call: get_weather args=...`。
 
 ### 容易误解点
 
@@ -330,6 +348,8 @@ Tool (最小公共接口: Name / Description / IsLongRunning)
 4. **Streaming Non-Live 丢失增量语义**：`CollectStreamChunks` 将所有 chunk 合并为单条结果，完全失去流式低延迟语义。
 5. **`nil` 作为 interface 的 typed nil 陷阱**：`*jsonschema.Schema` 赋值给 `interface{}` 时，nil 指针不会转成 nil interface。
 6. **`ConfirmationProvider` 签名不一致**：`functiontool` 的 Provider 签名（类型安全，编译时检查）vs `tool` 包级别签名（运行时类型检查）。
+7. **真实 provider 不会理解 Go struct**：OpenAI-compatible 模型只看 JSON Schema 和 JSON arguments；`NewFunctionToolWithDeclaration` 不只是文档，它决定模型是否知道怎么调用工具。
+8. **Tool result 必须以 tool message 回灌**：只把 function response 存成本地 event 不够，第二轮 model request 还必须包含 role=`tool` 的结果 message。
 
 ### 练习题
 
@@ -339,6 +359,8 @@ Tool (最小公共接口: Name / Description / IsLongRunning)
 - **Q4**：对比 `FilterToolset` vs `WithConfirmation` 的安全职责。
 - **Q5**：`StreamingFunctionTool` 在 Live 与 Non-Live 模式下的行为差异。
 - **Q6**：如何避免 Confirmation 逻辑的四重复制？
+- **Q7**：`tool.Declaration` 转成 OpenAI-compatible `tools` 时，`InputSchema` 缺失会有什么风险？为什么 smoke 里要显式写 `required: ["city"]`？
+- **Q8**：如果模型返回 malformed JSON arguments，`OpenAICompatibleModel.GenerateContent` 应该返回什么错误？这个错误应该在 Flow 的哪一层被观察到？
 
 ### 代码附录
 
@@ -353,9 +375,11 @@ Tool (最小公共接口: Name / Description / IsLongRunning)
 | `tool/context.go` | `ToolContext`, `toolContextImpl`, `NewToolContext`, `RequestConfirmation` | 全文件 76 行 | 3.6 | `tool_confirmation_streaming_long_running_test.go` |
 | `flow/flow.go` | `handleFunctionCalls`, `executeToolCall`, `injectToolDeclarations`, `resolveToolsets`, `lookupTool` | 368-496 | 3.6 | `flow_test.go` |
 | `flow/flow.go` | `mergeResultsToEvent` | 591-681 | 3.6 | — |
+| `model/openai.go` | `openAIToolsFromDeclarations`, `openAIMessagesFromContent`, `llmResponseFromOpenAIChoice` | 全文件 | 3.7 真实 provider bridge | `openai_test.go` |
+| `cmd/realllm/main.go` | DeepSeek `get_weather` smoke | 全文件 | 3.7 真实工具声明验证 | — |
 | `cmd/demo/main.go` | `demoFilteredTools`, `demoConfirmedToolCall`, `demoRejectedConfirmation`, `demoStreamingToolNonLive`, `demoLongRunningTool` | 559-807 | 3.1-3.5 | — |
 
-**简化边界汇总**：无 MCP（连接管理/Ping/重连未实现）；无 `typeutil.ConvertToWithJSONSchema`（使用 `map[string]any`）；无 RequestConfirmationRequestProcessor（仅 `WithConfirmation` + `SetConfirmed`）；无 Live bidi streaming；无 Gemini 原生工具；无 AgentTool。
+**简化边界汇总**：无 MCP（连接管理/Ping/重连未实现）；无 `typeutil.ConvertToWithJSONSchema`（使用 `map[string]any`）；无 RequestConfirmationRequestProcessor（仅 `WithConfirmation` + `SetConfirmed`）；无 Live bidi streaming；无 Gemini 原生工具；OpenAI-compatible adapter 已有最小 DeepSeek smoke，但还没有 streaming、tool choice、usage accounting、retry/backoff、provider-specific error taxonomy。
 
 ---
 
@@ -680,9 +704,10 @@ START → ChatModel ──(ToolCall?)──→ Tools → ChatModel (loop, Pregel
 
 **Flow.Run 主循环** (flow.go:103)：
 ```go
+var allEvents []*event.Event
 for step := 1; ; step++ {
     if ctx.Ended() { return allEvents, nil }
-    stepEvents, err := f.runOneStep(ctx, step)
+    stepEvents, err := f.runOneStep(ctx, step, allEvents)
     allEvents = append(allEvents, stepEvents...)
     for _, ev := range stepEvents {
         if ev != nil && ev.Actions.EndInvocation { return allEvents, nil }
@@ -691,6 +716,8 @@ for step := 1; ; step++ {
     if modelEvent.IsFinalResponse() { return allEvents, nil }
 }
 ```
+
+`allEvents` 被传入下一次 `runOneStep` 不是实现细节，而是实现真实 LLM tool-calling 的关键：第一轮 model 输出 function call、Flow 执行 tool 后，第二轮 model request 必须包含同一次 invocation 内刚产生的 model event 和 tool event。否则真实 DeepSeek 只能看到原始 user message，看不到 `get_weather` 的结果。
 
 **Agent Transfer 流程**：
 1. `InjectTransferTool` (transfer.go:197): 注入 `transfer_to_agent` 工具声明 + 系统指令。
@@ -717,6 +744,7 @@ for step := 1; ; step++ {
 4. **RetryReflect**（1 min）：AlwaysFailTool + RetryReflectPlugin → `OnToolError` 注入 reflection 字段。
 5. **Hidden Args**（1 min）：FunctionCallModifierPlugin BeforeModel 注入 `user_id` → AfterModel 剥离并存入 state。
 6. **Configurable Construction**（2 min）：JSON 定义 root + specialist → `agentconfig.FromJSON` → `Build` → 验证子树。
+7. **真实 LLM ReAct Smoke**（3 min）：运行 `go run ./cmd/realllm`，用真实 DeepSeek 验证 `model_call -> tool_result -> final_answer`，并检查 session 里 4 个 persisted events。
 
 ### 容易误解点
 
@@ -726,6 +754,8 @@ for step := 1; ; step++ {
 4. **"ExitLoop 和 EndInvocation 是同一件事"** → ExitLoopTool 设置 `Actions.EndInvocation=true`。但对 LoopAgent，终止信号是 `Actions.Escalate`。消费者不同。
 5. **"Hidden Args 在工具声明阶段永久修改 ToolDeclarations"** → `req` 是每轮新创建的 LLMRequest，修改只影响当前 step，不跨迭代持久化。
 6. **"Config 构建的 agent 和代码构建的 agent 行为不同"** → 内部调用 `llmagent.New` 和 `workflow.New*Agent`，产出标准 `agent.Agent` 实例。
+7. **"ReAct 只要 session history 就够了"** → 当前 invocation 内的 model/tool events 尚未写入 session，必须通过 `priorEvents` 传给下一轮 request；session history 只覆盖 invocation 之前已经持久化的事件。
+8. **"真实 LLM adapter 只是替换 FakeModel"** → 还要解决三件事：tool declaration 转 `tools`、tool call JSON arguments 解码、tool response 以 role=`tool` 回灌。
 
 ### 练习题
 
@@ -735,12 +765,15 @@ for step := 1; ; step++ {
 - **Q4**：为 `demoAgentTransfer` 添加 `DisallowTransferToParent=true` 的 specialist，验证下一轮路由。
 - **Q5**：如果不使用 ExitLoopTool，如何让 agent 提前终止 flow？给出两种替代方案。
 - **Q6**：从 `tool/transfer/tool.go` 到 `flow/flow.go` 再到 `runner/runner.go`，画出 `transfer_to_agent` 完整信息流图。
+- **Q7**：解释为什么 `TestFlowFeedsPriorStepEventsIntoNextModelRequest` 必须存在；如果删掉这条测试，真实 LLM smoke 最可能在哪一步退化？
+- **Q8**：把 `cmd/realllm` 改成两次工具调用（天气 + 搜索），需要修改哪些 request history / event 检查？
 
 ### 代码附录
 
 | 文件 | 核心类型/函数 | 行号 | 讲解点 | 测试文件 |
 |------|-------------|------|--------|---------|
 | `flow/flow.go` | `Flow.Run`, `runOneStep`, `callModel`, `handleFunctionCalls`, `executeTransfer`, `mergeResultsToEvent` | 103,151,241,368,767,591 | **核心 ReAct 循环** + transfer 执行 | `flow_test.go` |
+| `flow/history_test.go` | `TestFlowFeedsPriorStepEventsIntoNextModelRequest` | 全文件 | 真实 LLM tool-calling 的 history 回灌保护 | `history_test.go` |
 | `agent/agent.go` | `Agent` 接口, `baseAgent.Execute`, `New` | 41,144,176 | Agent 生命周期 | `agent_test.go` |
 | `runner/runner.go` | `Runner.Run`, `findAgentToRun`, `isTransferableAcrossAgentTree` | 124,192,220 | 会话 + 路由 + 可转移性检查 | `runner_test.go` |
 | `tool/transfer/tool.go` | `TransferToAgentTool`, `ComputeTransferTargets`, `InjectTransferTool`, `TransferInstructions` | 24,136,197,174 | **动态工具注入** | `tool_test.go` |
@@ -749,6 +782,7 @@ for step := 1; ; step++ {
 | `plugin/functionmodifier/plugin.go` | `New`, `BeforeModel`, `AfterModel` | 26,35,80 | Hidden Args 注入/剥离 | `plugin_test.go` |
 | `agent/agentconfig/config.go` | `Build`, `FromJSON`, `buildNode`, `buildLLMAgent`, `validateNoDuplicateNames`, `validateToolRefs` | 67,291,128,145,87,104 | **JSON config loader** | `config_test.go` |
 | `cmd/demo/main.go` | `runChapter07`, `demoReActLoop`, `demoAgentTransfer`, `demoPolicyExtensions`, `demoConfigurableConstruction` | 1225-1727 | 四个教学 demo | N/A |
+| `cmd/realllm/main.go` | `run`, `get_weather` smoke | 全文件 | 真实 DeepSeek ReAct smoke | N/A |
 
 ---
 
@@ -880,13 +914,14 @@ for step := 1; ; step++ {
 | Confirmation | `WithConfirmation` + `SetConfirmed` 核心模式 | `RequestConfirmationRequestProcessor` event 搜索 |
 | AgentTool artifact | 无 artifact 转发 | `forwarding_artifact_service` |
 | AgentTool IsLongRunning | 始终 false | 支持长运行工具 |
-| Config loader | 仅 JSON, 仅 FakeModel | YAML + 真实模型 + 回调配置 |
+| Config loader | 仅 JSON，config-built agent 仍用 FakeModel | YAML + 真实模型 + 回调配置 |
+| Real LLM adapter | OpenAI-compatible/DeepSeek 最小 chat + tools smoke；无 streaming/usage/retry taxonomy | Provider-specific Gemini/OpenAI/Vertex adapter 更完整 |
 
 ### 对应 ADK Go 真代码的说明
 
 - **复刻版的核心抽象直接映射原版**：Runner → `runner/runner.go`, Flow → `internal/llminternal/base_flow.go`, Agent → `agent/agent.go`, Tool → `tool/tool.go`。
 - **原版更复杂的关键差异**：
-  - `ContentsRequestProcessor`（contents_processor.go:37-187）在每轮请求中从 session events 重建对话历史——**复刻版假设 contents 由外部构建**。
+  - `ContentsRequestProcessor`（contents_processor.go:37-187）在每轮请求中从 session events 重建对话历史——**复刻版已有 `model.ContentsFromEvents` + `Flow` 内部 history 回灌，但仍是简化版，不处理 provider-specific content 转换和复杂 filtering**。
   - `StreamAggregator`（stream_aggregator.go）维护复杂状态机处理流式分块——**复刻版使用 slice-based fake**。
   - `handleFunctionCalls` 中函数调用/响应的重排，涉及并行 goroutine + ackChan——**复刻版用 sync.WaitGroup 简化**。
   - 入口层 `cmd/launcher/` 原版有 console/web/api/a2a/webui/pubsub/eventarc 7 种 sublauncher——**复刻版仅 console + web**。
@@ -899,6 +934,7 @@ for step := 1; ; step++ {
 3. **Ch04：Logging Plugin + Cache Plugin**（30 行，展示纯观察 vs 控制流干预）。
 4. **Ch05：SequentialAgent + ParallelAgent**（25 行，展示组合模式）。
 5. **Ch07：`demoReActLoop` + `demoAgentTransfer`**（35 行，展示 ReAct 和 transfer）。
+6. **Real LLM Smoke：`cmd/realllm`**（15 行讲解即可，执行命令即可）：展示 DeepSeek 真实模型如何消费 tool declaration，并证明 history 回灌让第二轮 model 能看到 tool result。
 
 ---
 
@@ -913,9 +949,9 @@ for step := 1; ; step++ {
         │                  │                  │
         ▼                  ▼                  ▼
    ┌──────────┐      ┌──────────┐       ┌──────────┐
-   │ 扩展 1：  │      │ 扩展 2：  │       │ 扩展 3：  │
+   │ 已完成：  │      │ 扩展 2：  │       │ 扩展 3：  │
    │ 真实 LLM  │      │ A2A v1   │       │ Live      │
-   │ 集成      │      │ 协议实现  │       │ Streaming │
+   │ Smoke     │      │ 协议实现  │       │ Streaming │
    └──────────┘      └──────────┘       └──────────┘
         │                  │                  │
         ▼                  ▼                  ▼
@@ -927,7 +963,7 @@ for step := 1; ; step++ {
 ```
 
 **推荐扩展顺序**：
-1. **真实 LLM 集成**：将 `FakeModel` 替换为 `openai.Client` 或 `genai.Client` 的 `GenerateContent` 调用——验证 `LLMRequest`/`LLMResponse` 契约是否能适配真实 Provider。
+1. **真实 LLM Smoke（已完成最小版）**：`cmd/realllm` 已用 DeepSeek/OpenAI-compatible adapter 验证 `LLMRequest`/`LLMResponse` + tool-calling loop；后续扩展是 streaming、usage accounting、retry/backoff、provider-specific error taxonomy。
 2. **A2A v1 协议实现**：将 `FakeA2AClient` 替换为真实 HTTP/gRPC 传输，实现 `A2AClient` 接口的 `SendStreamingMessage` 和 `CancelTask`。
 3. **Live Streaming**：为 `StreamingFunctionTool` 增加真正的 goroutine-based 流式 push 模式，实现 bidi 通信。
 4. **OTel Telemetry**：将 `telemetry.Recorder` 替换为 OpenTelemetry SDK 集成，导出到 stdout 或 GCP。
@@ -938,5 +974,6 @@ for step := 1; ; step++ {
 
 > 版本：2026-06-11
 > 对应复刻代码：`/Users/likun/Desktop/workspace-for-google-adk-go/rive-adk-go/`
+> 真实 LLM smoke commit：`f631c95 Add real DeepSeek LLM smoke`
 > 对应精读总纲：`examples/google-adk-go-code-reading/manual/deep-read/00-final-architecture-guide.md`
 > 7 份章节 artifact：`/tmp/rive-adk-teaching-manual-20260611/01-runtime-flow-section.md` ~ `07-agent-flow-section.md`
