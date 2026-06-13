@@ -26,8 +26,13 @@ The second dogfood run produced maintainer-level deep-read artifacts under
 [`manual/deep-read/`](./manual/deep-read/). Start with
 [`manual/deep-read/00-final-deep-read-guide.md`](./manual/deep-read/00-final-deep-read-guide.md).
 
+The synthesized teaching outline is
+[`manual/teaching-manual-outline.md`](./manual/teaching-manual-outline.md). It is
+the human-facing course plan built from the coarse and deep-read reports.
+
 | File | Focus |
 | --- | --- |
+| [`manual/teaching-manual-outline.md`](./manual/teaching-manual-outline.md) | Detailed teaching outline for explaining pie's agent runtime |
 | [`manual/00-overview.md`](./manual/00-overview.md) | Cross-module architecture map, deep-read index, and next DAG |
 | [`manual/01-ai-provider-streaming.md`](./manual/01-ai-provider-streaming.md) | `pie-ai`, providers, streaming events, DS4/local model path |
 | [`manual/02-agent-core-runtime.md`](./manual/02-agent-core-runtime.md) | `pie-agent-core`, harness, session, compaction, agent loop |
