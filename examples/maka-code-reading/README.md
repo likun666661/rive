@@ -37,6 +37,7 @@ then read the individual reader reports as needed.
 The deep-read workflow produced a second set of artifacts under
 [`manual/deep-read/`](./manual/deep-read/). Start with
 [`manual/deep-read/00-final-deep-read-guide.md`](./manual/deep-read/00-final-deep-read-guide.md).
+The follow-up implementation roadmap is in [`plan.md`](./plan.md).
 
 | File | Focus |
 | --- | --- |
