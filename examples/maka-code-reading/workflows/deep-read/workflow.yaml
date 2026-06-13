@@ -1,0 +1,151 @@
+api_version: rive.workflow/v0
+id: maka.deep-read
+version: 1
+title: Maka 精读：{{source_ref}}
+params:
+  repo_path:
+    type: string
+    required: true
+  output_dir:
+    type: string
+    required: true
+  source_ref:
+    type: string
+    default: local-main
+  depth:
+    type: enum
+    values: [deep, security, maintainer]
+    default: maintainer
+nodes:
+  permission-tool-safety:
+    kind: task
+    runner: opencode
+    title: 精读 Permission / Tool Safety
+    prompt:
+      file: prompts/permission-tool-safety.md
+    output_contract:
+      format: markdown
+      required_sections: [scope, problem, source_evidence, flow_analysis, risk_matrix, tests, next_actions]
+  ipc-surface-security:
+    kind: task
+    runner: opencode
+    title: 精读 IPC Surface Security
+    prompt:
+      file: prompts/ipc-surface-security.md
+    output_contract:
+      format: markdown
+      required_sections: [scope, problem, source_evidence, flow_analysis, handler_matrix, risk_matrix, next_actions]
+  path-containment:
+    kind: task
+    runner: opencode
+    title: 精读 Path Containment
+    prompt:
+      file: prompts/path-containment.md
+    output_contract:
+      format: markdown
+      required_sections: [scope, problem, source_evidence, containment_matrix, bypass_scenarios, tests, next_actions]
+  credential-settings-security:
+    kind: task
+    runner: opencode
+    title: 精读 Credential / Settings Security
+    prompt:
+      file: prompts/credential-settings-security.md
+    output_contract:
+      format: markdown
+      required_sections: [scope, problem, source_evidence, lifecycle, risk_matrix, migration_plan, tests]
+  bot-gateway-attack-surface:
+    kind: task
+    runner: opencode
+    title: 精读 Bot Bridge / OpenGateway Attack Surface
+    prompt:
+      file: prompts/bot-gateway-attack-surface.md
+    output_contract:
+      format: markdown
+      required_sections: [scope, problem, source_evidence, flow_analysis, attack_surface, mitigations, next_actions]
+  memory-gates:
+    kind: task
+    runner: opencode
+    title: 精读 Memory 9-Gate Runtime Enforcement
+    prompt:
+      file: prompts/memory-gates.md
+    output_contract:
+      format: markdown
+      required_sections: [scope, problem, source_evidence, gate_matrix, enforcement_gaps, tests, next_actions]
+  jsonl-durability:
+    kind: task
+    runner: opencode
+    title: 精读 JSONL Durability / Migration
+    prompt:
+      file: prompts/jsonl-durability.md
+    output_contract:
+      format: markdown
+      required_sections: [scope, problem, source_evidence, durability_matrix, recovery_plan, tests, next_actions]
+  telemetry-cost:
+    kind: task
+    runner: opencode
+    title: 精读 Telemetry / Cost Completeness
+    prompt:
+      file: prompts/telemetry-cost.md
+    output_contract:
+      format: markdown
+      required_sections: [scope, problem, source_evidence, accounting_flow, loss_windows, tests, next_actions]
+  external-tool-injection:
+    kind: task
+    runner: opencode
+    title: 精读 Rive / Office / Explore External Tool Injection
+    prompt:
+      file: prompts/external-tool-injection.md
+    output_contract:
+      format: markdown
+      required_sections: [scope, problem, source_evidence, tool_matrix, injection_risks, cleanup_policy, next_actions]
+  visual-smoke-test-infra:
+    kind: task
+    runner: opencode
+    title: 精读 Visual Smoke / Test Infrastructure
+    prompt:
+      file: prompts/visual-smoke-test-infra.md
+    output_contract:
+      format: markdown
+      required_sections: [scope, problem, source_evidence, coverage_matrix, gaps, ci_strategy, next_actions]
+  final-deep-read-guide:
+    kind: review
+    runner: opencode
+    title: 汇总 Maka 精读维护者指南
+    consumes:
+      - permission-tool-safety
+      - ipc-surface-security
+      - path-containment
+      - credential-settings-security
+      - bot-gateway-attack-surface
+      - memory-gates
+      - jsonl-durability
+      - telemetry-cost
+      - external-tool-injection
+      - visual-smoke-test-infra
+    prompt:
+      file: prompts/final-deep-read-guide.md
+    output_contract:
+      format: markdown
+      required_sections: [executive_summary, architecture_theses, top_findings, priority_roadmap, teaching_outline, next_dag]
+edges:
+  - { type: decomposes_to, from: root, to: permission-tool-safety }
+  - { type: decomposes_to, from: root, to: ipc-surface-security }
+  - { type: decomposes_to, from: root, to: path-containment }
+  - { type: decomposes_to, from: root, to: credential-settings-security }
+  - { type: decomposes_to, from: root, to: bot-gateway-attack-surface }
+  - { type: decomposes_to, from: root, to: memory-gates }
+  - { type: decomposes_to, from: root, to: jsonl-durability }
+  - { type: decomposes_to, from: root, to: telemetry-cost }
+  - { type: decomposes_to, from: root, to: external-tool-injection }
+  - { type: decomposes_to, from: root, to: visual-smoke-test-infra }
+  - { type: decomposes_to, from: root, to: final-deep-read-guide }
+  - { type: depends_on, from: final-deep-read-guide, to: permission-tool-safety }
+  - { type: depends_on, from: final-deep-read-guide, to: ipc-surface-security }
+  - { type: depends_on, from: final-deep-read-guide, to: path-containment }
+  - { type: depends_on, from: final-deep-read-guide, to: credential-settings-security }
+  - { type: depends_on, from: final-deep-read-guide, to: bot-gateway-attack-surface }
+  - { type: depends_on, from: final-deep-read-guide, to: memory-gates }
+  - { type: depends_on, from: final-deep-read-guide, to: jsonl-durability }
+  - { type: depends_on, from: final-deep-read-guide, to: telemetry-cost }
+  - { type: depends_on, from: final-deep-read-guide, to: external-tool-injection }
+  - { type: depends_on, from: final-deep-read-guide, to: visual-smoke-test-infra }

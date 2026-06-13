@@ -13,8 +13,10 @@ The reading workflow is intentionally split by architectural boundary:
 - docs, notes, tests, scripts, and product roadmap
 - final overview that consumes the reader outputs
 
-Every reader node is read-only and writes one Markdown artifact. The final
-overview node reads those artifacts and produces the coarse architecture map.
+Every reader node is read-only and writes one Markdown artifact. The coarse
+workflow final overview node reads those artifacts and produces the architecture
+map. The deep-read workflow then expands the highest-risk areas into
+maintainer-level notes and a prioritized repair roadmap.
 
 ## Output
 
@@ -32,7 +34,25 @@ then read the individual reader reports as needed.
 | [`manual/05-renderer-ui.md`](./manual/05-renderer-ui.md) | Renderer UI and `packages/ui` components, assistant stream, artifact preview |
 | [`manual/06-docs-tests-roadmap.md`](./manual/06-docs-tests-roadmap.md) | README, docs, historical notes, tests, scripts, and product direction |
 
-## Actual Run
+The deep-read workflow produced a second set of artifacts under
+[`manual/deep-read/`](./manual/deep-read/). Start with
+[`manual/deep-read/00-final-deep-read-guide.md`](./manual/deep-read/00-final-deep-read-guide.md).
+
+| File | Focus |
+| --- | --- |
+| [`manual/deep-read/00-final-deep-read-guide.md`](./manual/deep-read/00-final-deep-read-guide.md) | Synthesized maintainer guide, P0/P1/P2 findings, roadmap, teaching outline, next DAG |
+| [`manual/deep-read/01-permission-tool-safety.md`](./manual/deep-read/01-permission-tool-safety.md) | Permission matrix, `wrapToolExecute`, watchdog pause/resume, parked approvals |
+| [`manual/deep-read/02-ipc-surface-security.md`](./manual/deep-read/02-ipc-surface-security.md) | Main/preload IPC handler surface, runtime validation gaps, renderer escalation paths |
+| [`manual/deep-read/03-path-containment.md`](./manual/deep-read/03-path-containment.md) | Workspace path containment helpers, platform edge cases, `realpath` assumptions |
+| [`manual/deep-read/04-credential-settings-security.md`](./manual/deep-read/04-credential-settings-security.md) | `safeStorage` credential store, settings secrets, migration plan |
+| [`manual/deep-read/05-bot-gateway-attack-surface.md`](./manual/deep-read/05-bot-gateway-attack-surface.md) | Bot bridge and OpenGateway inbound/session/SSE/token attack surface |
+| [`manual/deep-read/06-memory-gates.md`](./manual/deep-read/06-memory-gates.md) | 9-gate memory contract, runtime integration gaps, privacy gates |
+| [`manual/deep-read/07-jsonl-durability.md`](./manual/deep-read/07-jsonl-durability.md) | Session JSONL durability, corruption handling, migration and recovery |
+| [`manual/deep-read/08-telemetry-cost.md`](./manual/deep-read/08-telemetry-cost.md) | LLM/tool telemetry, cache and reasoning token accounting, write loss windows |
+| [`manual/deep-read/09-external-tool-injection.md`](./manual/deep-read/09-external-tool-injection.md) | Rive/office/explore external tool invocation, injection and cleanup policies |
+| [`manual/deep-read/10-visual-smoke-test-infra.md`](./manual/deep-read/10-visual-smoke-test-infra.md) | Visual smoke scripts, screenshot gates, accessibility and CI strategy |
+
+## Coarse Run
 
 - Source repository: `/Users/likun/Desktop/workspace-for-maka/maka`
 - Source ref: `335220a`
@@ -48,12 +68,33 @@ then read the individual reader reports as needed.
 - Result: workflow `completed`, root work `done`, graph hygiene `clean`, 7
   scheduler node-runs accepted, 0 scheduler failures
 
+## Deep Run
+
+- Source repository: `/Users/likun/Desktop/workspace-for-maka/maka`
+- Source ref: `335220a`
+- Workflow run: `wfrun_094cfc44d665449b935549965cc46476`
+- Initial scheduler run: `sched_3eeb709a829f4d65aaa4aa85fde03607`
+- Recovery scheduler run: `sched_f72afcbcdfe741f7b4b02793cbf30aae`
+- Root work: `work_6d70dfa7a88f44ca9c7642567523e590`
+- Runner: OpenCode
+- Worker shape: 10 focused reader nodes + 1 final maintainer guide node
+- Parallelism: `max_parallel=3`
+- Acceptance mode: `auto-reported`
+- Workspace mode: `shared`, because the workflow is read-only and writes only
+  external Markdown artifacts
+- Result: initial scheduler hit one OpenCode certificate failure, classified as
+  `certificate_error` with `retry_after_certificate_fix`; `rive scheduler resume --failed`
+  superseded the failed attempt, preserved the trace, and completed with root
+  work `done`, graph hygiene `clean`, 11 accepted node-runs, and 1 superseded
+  failed node-run
+
 ## Workflow
 
 Validate the package:
 
 ```sh
 rive workflow validate examples/maka-code-reading/workflows/coarse-read
+rive workflow validate examples/maka-code-reading/workflows/deep-read
 ```
 
 Run without starting workers:
@@ -86,3 +127,22 @@ rive workflow run maka.coarse-read \
 `shared` workspace mode is acceptable here because the workflow is read-only and
 all writes are restricted to the external output directory. Use `worktree` for
 implementation workflows.
+
+Run the deep-read workflow:
+
+```sh
+rive workflow run maka.deep-read \
+  --command-id run-maka-deep-read \
+  --runner opencode \
+  --worker opencode-reader-a \
+  --worker opencode-reader-b \
+  --worker opencode-reader-c \
+  --max-parallel 3 \
+  --acceptance-mode auto-reported \
+  --workspace-mode shared \
+  --timeout-seconds 3600 \
+  --param repo_path=/Users/likun/Desktop/workspace-for-maka/maka \
+  --param output_dir=/tmp/rive-maka-deep-read/deep-read \
+  --param source_ref=335220a \
+  --param depth=maintainer
+```
