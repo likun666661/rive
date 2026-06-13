@@ -1,0 +1,228 @@
+api_version: rive.workflow/v0
+id: pie.deep-read
+version: 1
+title: pie 精读：{{source_ref}}
+params:
+  repo_path:
+    type: string
+    required: true
+  output_dir:
+    type: string
+    required: true
+  source_ref:
+    type: string
+    default: f1c35a3
+  depth:
+    type: enum
+    values: [deep, maintainer, audit]
+    default: maintainer
+nodes:
+  trigger-state-machine:
+    kind: task
+    runner: opencode
+    title: 精读 Trigger 状态机
+    prompt:
+      file: prompts/trigger-state-machine.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - state_machine
+        - side_effects
+        - tests
+        - risks
+        - next_questions
+  loop-inbox-internals:
+    kind: task
+    runner: opencode
+    title: 精读 Loop 标签提取与 Inbox 闭环
+    prompt:
+      file: prompts/loop-inbox-internals.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - parsing_edges
+        - concurrency
+        - tests
+        - risks
+        - next_questions
+  session-branch-model:
+    kind: task
+    runner: opencode
+    title: 精读 JSONL Session 分支模型
+    prompt:
+      file: prompts/session-branch-model.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - branch_examples
+        - compaction_integrity
+        - tests
+        - risks
+        - next_questions
+  lsp-integration-report:
+    kind: task
+    runner: opencode
+    title: 精读 LSP Supervisor 集成
+    prompt:
+      file: prompts/lsp-integration-report.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - integration_timeline
+        - performance
+        - tests
+        - risks
+        - next_questions
+  tool-call-parsing-matrix:
+    kind: task
+    runner: opencode
+    title: 精读跨 Provider Tool Call 解析
+    prompt:
+      file: prompts/tool-call-parsing-matrix.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - provider_matrix
+        - fuzz_cases
+        - tests
+        - risks
+        - next_questions
+  goal-evaluator-internals:
+    kind: task
+    runner: opencode
+    title: 精读 /goal Evaluator 与 OnTurnEndHook
+    prompt:
+      file: prompts/goal-evaluator-internals.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - evaluator_loop
+        - false_decisions
+        - tests
+        - risks
+        - next_questions
+  automation-security-audit:
+    kind: review
+    runner: opencode
+    title: 自动化安全审计
+    consumes:
+      - trigger-state-machine
+      - loop-inbox-internals
+    prompt:
+      file: prompts/automation-security-audit.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - executive_summary
+        - threat_model
+        - trigger_risks
+        - loop_inbox_risks
+        - mitigations
+        - open_questions
+  session-integrity-review:
+    kind: review
+    runner: opencode
+    title: Session 完整性审查
+    consumes:
+      - session-branch-model
+    prompt:
+      file: prompts/session-integrity-review.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - executive_summary
+        - integrity_model
+        - compaction_resume
+        - export_import
+        - risks
+        - recommendations
+  provider-conformance-test-plan:
+    kind: review
+    runner: opencode
+    title: Provider 一致性测试计划
+    consumes:
+      - tool-call-parsing-matrix
+    prompt:
+      file: prompts/provider-conformance-test-plan.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - executive_summary
+        - conformance_matrix
+        - mock_server_plan
+        - test_cases
+        - risks
+        - recommendations
+  final-deep-read-guide:
+    kind: review
+    runner: opencode
+    title: 汇总 pie 精读技术手册
+    consumes:
+      - trigger-state-machine
+      - loop-inbox-internals
+      - session-branch-model
+      - lsp-integration-report
+      - tool-call-parsing-matrix
+      - goal-evaluator-internals
+      - automation-security-audit
+      - session-integrity-review
+      - provider-conformance-test-plan
+    prompt:
+      file: prompts/final-deep-read-guide.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - executive_summary
+        - architecture_lessons
+        - deep_read_index
+        - risk_register
+        - recommended_followups
+        - appendix
+edges:
+  - { type: decomposes_to, from: root, to: trigger-state-machine }
+  - { type: decomposes_to, from: root, to: loop-inbox-internals }
+  - { type: decomposes_to, from: root, to: session-branch-model }
+  - { type: decomposes_to, from: root, to: lsp-integration-report }
+  - { type: decomposes_to, from: root, to: tool-call-parsing-matrix }
+  - { type: decomposes_to, from: root, to: goal-evaluator-internals }
+  - { type: decomposes_to, from: root, to: automation-security-audit }
+  - { type: decomposes_to, from: root, to: session-integrity-review }
+  - { type: decomposes_to, from: root, to: provider-conformance-test-plan }
+  - { type: decomposes_to, from: root, to: final-deep-read-guide }
+  - { type: depends_on, from: automation-security-audit, to: trigger-state-machine }
+  - { type: depends_on, from: automation-security-audit, to: loop-inbox-internals }
+  - { type: depends_on, from: session-integrity-review, to: session-branch-model }
+  - { type: depends_on, from: provider-conformance-test-plan, to: tool-call-parsing-matrix }
+  - { type: depends_on, from: final-deep-read-guide, to: trigger-state-machine }
+  - { type: depends_on, from: final-deep-read-guide, to: loop-inbox-internals }
+  - { type: depends_on, from: final-deep-read-guide, to: session-branch-model }
+  - { type: depends_on, from: final-deep-read-guide, to: lsp-integration-report }
+  - { type: depends_on, from: final-deep-read-guide, to: tool-call-parsing-matrix }
+  - { type: depends_on, from: final-deep-read-guide, to: goal-evaluator-internals }
+  - { type: depends_on, from: final-deep-read-guide, to: automation-security-audit }
+  - { type: depends_on, from: final-deep-read-guide, to: session-integrity-review }
+  - { type: depends_on, from: final-deep-read-guide, to: provider-conformance-test-plan }
