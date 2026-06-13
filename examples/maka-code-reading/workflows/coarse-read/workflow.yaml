@@ -1,0 +1,183 @@
+api_version: rive.workflow/v0
+id: maka.coarse-read
+version: 1
+title: Maka 粗读：{{source_ref}}
+params:
+  repo_path:
+    type: string
+    required: true
+  output_dir:
+    type: string
+    required: true
+  source_ref:
+    type: string
+    default: local-main
+  depth:
+    type: enum
+    values: [coarse, architecture, maintainer]
+    default: architecture
+nodes:
+  core-contracts:
+    kind: task
+    runner: opencode
+    title: 粗读 Maka Core Schemas / Contracts
+    prompt:
+      file: prompts/core-contracts.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - flows
+        - tests
+        - risks
+        - next_questions
+  runtime-backends-tools:
+    kind: task
+    runner: opencode
+    title: 粗读 Maka Runtime / Backends / Tools
+    prompt:
+      file: prompts/runtime-backends-tools.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - flows
+        - tests
+        - risks
+        - next_questions
+  storage-persistence:
+    kind: task
+    runner: opencode
+    title: 粗读 Maka Storage / Persistence
+    prompt:
+      file: prompts/storage-persistence.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - flows
+        - tests
+        - risks
+        - next_questions
+  desktop-main-ipc:
+    kind: task
+    runner: opencode
+    title: 粗读 Maka Desktop Main / IPC / Preload
+    prompt:
+      file: prompts/desktop-main-ipc.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - flows
+        - tests
+        - risks
+        - next_questions
+  renderer-ui:
+    kind: task
+    runner: opencode
+    title: 粗读 Maka Renderer / UI
+    prompt:
+      file: prompts/renderer-ui.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - flows
+        - tests
+        - risks
+        - next_questions
+  docs-tests-roadmap:
+    kind: task
+    runner: opencode
+    title: 粗读 Maka Docs / Tests / Roadmap
+    prompt:
+      file: prompts/docs-tests-roadmap.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - flows
+        - tests
+        - risks
+        - next_questions
+  final-architecture-overview:
+    kind: review
+    runner: opencode
+    title: 汇总 Maka 粗读架构总览
+    consumes:
+      - core-contracts
+      - runtime-backends-tools
+      - storage-persistence
+      - desktop-main-ipc
+      - renderer-ui
+      - docs-tests-roadmap
+    prompt:
+      file: prompts/final-architecture-overview.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - executive_summary
+        - architecture_map
+        - deep_read_index
+        - cross_module_flows
+        - risks
+        - next_dag
+edges:
+  - type: decomposes_to
+    from: root
+    to: core-contracts
+  - type: decomposes_to
+    from: root
+    to: runtime-backends-tools
+  - type: decomposes_to
+    from: root
+    to: storage-persistence
+  - type: decomposes_to
+    from: root
+    to: desktop-main-ipc
+  - type: decomposes_to
+    from: root
+    to: renderer-ui
+  - type: decomposes_to
+    from: root
+    to: docs-tests-roadmap
+  - type: decomposes_to
+    from: root
+    to: final-architecture-overview
+  - type: depends_on
+    from: final-architecture-overview
+    to: core-contracts
+  - type: depends_on
+    from: final-architecture-overview
+    to: runtime-backends-tools
+  - type: depends_on
+    from: final-architecture-overview
+    to: storage-persistence
+  - type: depends_on
+    from: final-architecture-overview
+    to: desktop-main-ipc
+  - type: depends_on
+    from: final-architecture-overview
+    to: renderer-ui
+  - type: depends_on
+    from: final-architecture-overview
+    to: docs-tests-roadmap
