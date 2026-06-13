@@ -1,0 +1,183 @@
+api_version: rive.workflow/v0
+id: pie.coarse-read
+version: 1
+title: pie 粗读：{{source_ref}}
+params:
+  repo_path:
+    type: string
+    required: true
+  output_dir:
+    type: string
+    required: true
+  source_ref:
+    type: string
+    default: local-main
+  depth:
+    type: enum
+    values: [coarse, architecture, maintainer]
+    default: architecture
+nodes:
+  ai-provider-streaming:
+    kind: task
+    runner: opencode
+    title: 粗读 pie-ai Provider / Model / Streaming
+    prompt:
+      file: prompts/ai-provider-streaming.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - flows
+        - tests
+        - risks
+        - next_questions
+  agent-core-runtime:
+    kind: task
+    runner: opencode
+    title: 粗读 pie-agent-core Runtime / Harness / Session
+    prompt:
+      file: prompts/agent-core-runtime.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - flows
+        - tests
+        - risks
+        - next_questions
+  coding-cli-tools:
+    kind: task
+    runner: opencode
+    title: 粗读 pie-coding-agent CLI / TUI / Tools
+    prompt:
+      file: prompts/coding-cli-tools.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - flows
+        - tests
+        - risks
+        - next_questions
+  automation-loops-triggers:
+    kind: task
+    runner: opencode
+    title: 粗读 Loops / Triggers / Inbox / Hooks
+    prompt:
+      file: prompts/automation-loops-triggers.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - flows
+        - tests
+        - risks
+        - next_questions
+  mcp-and-fefe-hub:
+    kind: task
+    runner: opencode
+    title: 粗读 MCP / fefe-hub Integration
+    prompt:
+      file: prompts/mcp-and-fefe-hub.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - flows
+        - tests
+        - risks
+        - next_questions
+  roadmap-docs-issues:
+    kind: task
+    runner: opencode
+    title: 粗读 Docs / Issues / Product Roadmap
+    prompt:
+      file: prompts/roadmap-docs-issues.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - problem
+        - why_hard
+        - design_approach
+        - code_walkthrough
+        - flows
+        - tests
+        - risks
+        - next_questions
+  final-architecture-overview:
+    kind: review
+    runner: opencode
+    title: 汇总 pie 粗读架构总览
+    consumes:
+      - ai-provider-streaming
+      - agent-core-runtime
+      - coding-cli-tools
+      - automation-loops-triggers
+      - mcp-and-fefe-hub
+      - roadmap-docs-issues
+    prompt:
+      file: prompts/final-architecture-overview.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - executive_summary
+        - architecture_map
+        - deep_read_index
+        - cross_module_flows
+        - risks
+        - next_dag
+edges:
+  - type: decomposes_to
+    from: root
+    to: ai-provider-streaming
+  - type: decomposes_to
+    from: root
+    to: agent-core-runtime
+  - type: decomposes_to
+    from: root
+    to: coding-cli-tools
+  - type: decomposes_to
+    from: root
+    to: automation-loops-triggers
+  - type: decomposes_to
+    from: root
+    to: mcp-and-fefe-hub
+  - type: decomposes_to
+    from: root
+    to: roadmap-docs-issues
+  - type: decomposes_to
+    from: root
+    to: final-architecture-overview
+  - type: depends_on
+    from: final-architecture-overview
+    to: ai-provider-streaming
+  - type: depends_on
+    from: final-architecture-overview
+    to: agent-core-runtime
+  - type: depends_on
+    from: final-architecture-overview
+    to: coding-cli-tools
+  - type: depends_on
+    from: final-architecture-overview
+    to: automation-loops-triggers
+  - type: depends_on
+    from: final-architecture-overview
+    to: mcp-and-fefe-hub
+  - type: depends_on
+    from: final-architecture-overview
+    to: roadmap-docs-issues
