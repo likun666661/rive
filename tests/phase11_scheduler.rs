@@ -531,6 +531,33 @@ printf 'scheduler env worker done\n' | "{team_bin}" report --dispatch "$RIVE_DIS
     );
 }
 
+fn write_env_probe_scheduler_worker(path: &Path) {
+    let rive_bin = env!("CARGO_BIN_EXE_rive");
+    let team_bin = env!("CARGO_BIN_EXE_team");
+    write_executable(
+        path,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+STATE_ROOT="${{RIVE_STATE_WORKSPACE:-$RIVE_WORKSPACE}}"
+RUN_ROOT="$STATE_ROOT/.rive/debug/runs/$RIVE_RUN_ID"
+test "$XDG_DATA_HOME" = "$RUN_ROOT/opencode-data"
+test "$XDG_CACHE_HOME" = "$RUN_ROOT/opencode-cache"
+test "$XDG_STATE_HOME" = "$RUN_ROOT/opencode-state"
+test "$TMPDIR" = "$RUN_ROOT/opencode-tmp"
+test -d "$XDG_DATA_HOME"
+test -d "$XDG_CACHE_HOME"
+test -d "$XDG_STATE_HOME"
+test -d "$TMPDIR"
+RESULT="scheduler-env-$RIVE_RUN_ID.txt"
+printf 'data=%s\ncache=%s\nstate=%s\ntmp=%s\n' "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" "$TMPDIR" > "$RIVE_WORKSPACE/$RESULT"
+SNAPSHOT_ID=$("{rive_bin}" snapshot capture --path "$RIVE_WORKSPACE/$RESULT" --label phase11-env-probe --agent "$RIVE_AGENT_ID" --dispatch "$RIVE_DISPATCH_ID" | sed -n 's/.*"snapshot_id": "\([^"]*\)".*/\1/p' | head -n 1)
+printf 'scheduler env probe done\n' | "{team_bin}" report --dispatch "$RIVE_DISPATCH_ID" --status done --snapshot "$SNAPSHOT_ID" --artifact-ref "file:$RESULT" --command-id "phase11-env-probe-report-$RIVE_RUN_ID" --stdin >/dev/null
+"#
+        ),
+    );
+}
+
 fn write_no_report_worker(path: &Path) {
     write_executable(
         path,
@@ -695,6 +722,50 @@ fn scheduler_auto_reported_runs_ready_nodes_and_accepts_root() {
         )
         .unwrap();
     assert_eq!(accepted_events, 4);
+}
+
+#[test]
+fn scheduler_parallel_opencode_workers_get_isolated_state_dirs() {
+    let temp = init_workspace();
+    add_worker(&temp, "worker-a");
+    add_worker(&temp, "worker-b");
+    let (root, _, _, _) = setup_graph(&temp);
+    let fake = temp.path().join("fake-opencode-scheduler-env");
+    write_env_probe_scheduler_worker(&fake);
+
+    let response = run_json(&mut scheduler_command(
+        &temp,
+        &fake,
+        &root,
+        "phase11-sched-env-isolation",
+    ));
+
+    assert_eq!(response["protocol"]["scheduler"]["state"], "completed");
+    let node_runs = response["protocol"]["launched_nodes"].as_array().unwrap();
+    assert_eq!(node_runs.len(), 3);
+    let workspace_root = fs::canonicalize(temp.path()).unwrap();
+    let mut data_homes = Vec::new();
+    for run in node_runs {
+        let run_id = run["worker_run_id"].as_str().unwrap();
+        let run_root = workspace_root.join(".rive/debug/runs").join(run_id);
+        let env =
+            fs::read_to_string(temp.path().join(format!("scheduler-env-{run_id}.txt"))).unwrap();
+        let data_home = run_root.join("opencode-data");
+        assert!(env.contains(&format!("data={}", data_home.display())));
+        assert!(env.contains(&format!(
+            "cache={}",
+            run_root.join("opencode-cache").display()
+        )));
+        assert!(env.contains(&format!(
+            "state={}",
+            run_root.join("opencode-state").display()
+        )));
+        assert!(env.contains(&format!("tmp={}", run_root.join("opencode-tmp").display())));
+        data_homes.push(data_home);
+    }
+    data_homes.sort();
+    data_homes.dedup();
+    assert_eq!(data_homes.len(), 3);
 }
 
 #[test]

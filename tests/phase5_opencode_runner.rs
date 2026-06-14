@@ -140,6 +140,32 @@ printf '{"final":"RIVE_PHASE5_REPLAY_OK"}\n'
     );
 }
 
+fn write_env_probe_opencode(path: &Path) {
+    let rive_bin = env!("CARGO_BIN_EXE_rive");
+    let team_bin = env!("CARGO_BIN_EXE_team");
+    write_executable(
+        path,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+RUN_ROOT="$RIVE_WORKSPACE/.rive/debug/runs/$RIVE_RUN_ID"
+test "$XDG_DATA_HOME" = "$RUN_ROOT/opencode-data"
+test "$XDG_CACHE_HOME" = "$RUN_ROOT/opencode-cache"
+test "$XDG_STATE_HOME" = "$RUN_ROOT/opencode-state"
+test "$TMPDIR" = "$RUN_ROOT/opencode-tmp"
+test -d "$XDG_DATA_HOME"
+test -d "$XDG_CACHE_HOME"
+test -d "$XDG_STATE_HOME"
+test -d "$TMPDIR"
+printf 'data=%s\ncache=%s\nstate=%s\ntmp=%s\n' "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" "$TMPDIR" > "$RIVE_WORKSPACE/opencode-env.txt"
+SNAPSHOT_ID=$("{rive_bin}" snapshot capture --path "$RIVE_WORKSPACE/opencode-env.txt" --label fake-opencode-env --agent "$RIVE_AGENT_ID" --dispatch "$RIVE_DISPATCH_ID" | sed -n 's/.*"snapshot_id": "\([^"]*\)".*/\1/p' | head -n 1)
+printf 'env probe done\n' | "{team_bin}" report --dispatch "$RIVE_DISPATCH_ID" --status done --snapshot "$SNAPSHOT_ID" --command-id "fake-env-report-$RIVE_RUN_ID" --stdin >/dev/null
+printf '{{"final":"RIVE_PHASE5_ENV_OK"}}\n'
+"#
+        ),
+    );
+}
+
 fn runner_command(temp: &TempDir, opencode_bin: &Path, command_id: &str) -> Command {
     let mut command = rive_cmd();
     command
@@ -171,6 +197,38 @@ fn runner_command_with_token(
     let mut command = runner_command(temp, opencode_bin, command_id);
     command.arg("--agent-token").arg(token);
     command
+}
+
+#[test]
+fn opencode_runner_isolates_global_state_dirs() {
+    let temp = init_workspace();
+    let fake = temp.path().join("fake-opencode-env");
+    write_env_probe_opencode(&fake);
+
+    let response = run_json_with_stdin(
+        &mut runner_command(&temp, &fake, "runner-env"),
+        "Probe OpenCode environment.\n",
+    );
+
+    let run_id = response["protocol"]["runner"]["run_id"].as_str().unwrap();
+    let run_root = fs::canonicalize(temp.path())
+        .unwrap()
+        .join(".rive/debug/runs")
+        .join(run_id);
+    let env = fs::read_to_string(temp.path().join("opencode-env.txt")).unwrap();
+    assert!(env.contains(&format!(
+        "data={}",
+        run_root.join("opencode-data").display()
+    )));
+    assert!(env.contains(&format!(
+        "cache={}",
+        run_root.join("opencode-cache").display()
+    )));
+    assert!(env.contains(&format!(
+        "state={}",
+        run_root.join("opencode-state").display()
+    )));
+    assert!(env.contains(&format!("tmp={}", run_root.join("opencode-tmp").display())));
 }
 
 #[test]

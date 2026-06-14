@@ -546,6 +546,7 @@ impl<'a> OrchestratorRunner<'a> {
                 .arg("--dangerously-skip-permissions")
                 .arg(&prompt);
             apply_runner_env_sources(&mut command, &self.workspace.root)?;
+            apply_isolated_opencode_env(&mut command, &run_dir)?;
             apply_orchestrator_env(
                 &mut command,
                 OrchestratorEnvInput {
@@ -3345,6 +3346,7 @@ impl RunnerAdapter for OpenCodeAdapter {
             .arg("--dangerously-skip-permissions")
             .arg(input.prompt);
         apply_runner_env_sources(&mut command, &input.workspace.root)?;
+        apply_isolated_opencode_env(&mut command, input.run_dir)?;
         apply_common_env(&mut command, &input);
         Ok(command)
     }
@@ -3812,6 +3814,22 @@ fn parse_env_value(value: &str) -> String {
         }
     }
     value.to_string()
+}
+
+fn apply_isolated_opencode_env(command: &mut Command, run_dir: &Path) -> Result<()> {
+    let data_home = run_dir.join("opencode-data");
+    let cache_home = run_dir.join("opencode-cache");
+    let state_home = run_dir.join("opencode-state");
+    let tmp_dir = run_dir.join("opencode-tmp");
+    for path in [&data_home, &cache_home, &state_home, &tmp_dir] {
+        fs::create_dir_all(path)?;
+    }
+    command
+        .env("XDG_DATA_HOME", data_home)
+        .env("XDG_CACHE_HOME", cache_home)
+        .env("XDG_STATE_HOME", state_home)
+        .env("TMPDIR", tmp_dir);
+    Ok(())
 }
 
 fn apply_common_env(command: &mut Command, input: &RunnerProcessInput<'_>) {
