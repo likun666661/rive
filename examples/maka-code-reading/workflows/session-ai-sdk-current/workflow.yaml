@@ -1,0 +1,162 @@
+api_version: rive.workflow/v0
+id: maka.session-ai-sdk-current
+version: 1
+title: Maka 当前 Session + AI SDK Backend 现状分析：{{source_ref}}
+params:
+  repo_path:
+    type: string
+    required: true
+  output_dir:
+    type: string
+    required: true
+  source_ref:
+    type: string
+    default: local-main
+  previous_ref:
+    type: string
+    default: 05ca5a3
+  depth:
+    type: enum
+    values: [current, maintainer, audit]
+    default: maintainer
+nodes:
+  session-lifecycle:
+    kind: task
+    runner: opencode
+    title: 当前 Session Lifecycle / Manager 现状分析
+    prompt:
+      file: prompts/session-lifecycle.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - scope
+        - problem
+        - current_design
+        - source_evidence
+        - lifecycle_flow
+        - tests
+        - risks
+        - next_actions
+  ai-sdk-backend-refactor:
+    kind: task
+    runner: opencode
+    title: 当前 AI SDK Backend / ModelAdapter / ToolRuntime / RunTrace 现状分析
+    prompt:
+      file: prompts/ai-sdk-backend-refactor.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - scope
+        - problem
+        - current_design
+        - source_evidence
+        - call_flow
+        - tests
+        - risks
+        - next_actions
+  desktop-session-bridge:
+    kind: task
+    runner: opencode
+    title: 当前 Desktop Main / IPC / Credential Bridge 现状分析
+    prompt:
+      file: prompts/desktop-session-bridge.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - scope
+        - problem
+        - current_design
+        - source_evidence
+        - ipc_flow
+        - tests
+        - risks
+        - next_actions
+  storage-trace-recovery:
+    kind: task
+    runner: opencode
+    title: 当前 Storage / JSONL Recovery / Telemetry Trace 现状分析
+    prompt:
+      file: prompts/storage-trace-recovery.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - scope
+        - problem
+        - current_design
+        - source_evidence
+        - recovery_flow
+        - tests
+        - risks
+        - next_actions
+  bot-gateway-regression:
+    kind: task
+    runner: opencode
+    title: 当前 Bot / OpenGateway / Session Abuse 回归现状分析
+    prompt:
+      file: prompts/bot-gateway-regression.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - scope
+        - problem
+        - current_design
+        - source_evidence
+        - abuse_flow
+        - tests
+        - risks
+        - next_actions
+  final-current-state:
+    kind: review
+    runner: opencode
+    title: 汇总当前 Maka Session + AI SDK Backend 维护者报告
+    consumes:
+      - session-lifecycle
+      - ai-sdk-backend-refactor
+      - desktop-session-bridge
+      - storage-trace-recovery
+      - bot-gateway-regression
+    prompt:
+      file: prompts/final-current-state.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - executive_summary
+        - current_architecture_map
+        - recent_delta
+        - risk_register
+        - verification_map
+        - recommended_next_dag
+edges:
+  - type: decomposes_to
+    from: root
+    to: session-lifecycle
+  - type: decomposes_to
+    from: root
+    to: ai-sdk-backend-refactor
+  - type: decomposes_to
+    from: root
+    to: desktop-session-bridge
+  - type: decomposes_to
+    from: root
+    to: storage-trace-recovery
+  - type: decomposes_to
+    from: root
+    to: bot-gateway-regression
+  - type: decomposes_to
+    from: root
+    to: final-current-state
+  - type: depends_on
+    from: final-current-state
+    to: session-lifecycle
+  - type: depends_on
+    from: final-current-state
+    to: ai-sdk-backend-refactor
+  - type: depends_on
+    from: final-current-state
+    to: desktop-session-bridge
+  - type: depends_on
+    from: final-current-state
+    to: storage-trace-recovery
+  - type: depends_on
+    from: final-current-state
+    to: bot-gateway-regression

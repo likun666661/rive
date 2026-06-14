@@ -53,6 +53,20 @@ The follow-up implementation roadmap is in [`plan.md`](./plan.md).
 | [`manual/deep-read/09-external-tool-injection.md`](./manual/deep-read/09-external-tool-injection.md) | Rive/office/explore external tool invocation, injection and cleanup policies |
 | [`manual/deep-read/10-visual-smoke-test-infra.md`](./manual/deep-read/10-visual-smoke-test-infra.md) | Visual smoke scripts, screenshot gates, accessibility and CI strategy |
 
+After the session/runtime hardening commits, a focused current-state workflow
+produced a third set of artifacts under
+[`manual/session-ai-sdk-current/`](./manual/session-ai-sdk-current/). Start with
+[`manual/session-ai-sdk-current/00-current-state-report.md`](./manual/session-ai-sdk-current/00-current-state-report.md).
+
+| File | Focus |
+| --- | --- |
+| [`manual/session-ai-sdk-current/00-current-state-report.md`](./manual/session-ai-sdk-current/00-current-state-report.md) | Maintainer report for current session + AI SDK backend state |
+| [`manual/session-ai-sdk-current/01-session-lifecycle.md`](./manual/session-ai-sdk-current/01-session-lifecycle.md) | SessionManager lifecycle, status transitions, abort/recover behavior |
+| [`manual/session-ai-sdk-current/02-ai-sdk-backend-refactor.md`](./manual/session-ai-sdk-current/02-ai-sdk-backend-refactor.md) | AI SDK backend split into ModelAdapter, ToolRuntime, and RunTrace |
+| [`manual/session-ai-sdk-current/03-desktop-session-bridge.md`](./manual/session-ai-sdk-current/03-desktop-session-bridge.md) | Desktop main/preload IPC, credentials, connection readiness bridge |
+| [`manual/session-ai-sdk-current/04-storage-trace-recovery.md`](./manual/session-ai-sdk-current/04-storage-trace-recovery.md) | Session JSONL recovery, telemetry repo, artifact store, trace persistence gap |
+| [`manual/session-ai-sdk-current/05-bot-gateway-regression.md`](./manual/session-ai-sdk-current/05-bot-gateway-regression.md) | Bot/OpenGateway abuse controls and session entry risks |
+
 ## Coarse Run
 
 - Source repository: `/Users/likun/Desktop/workspace-for-maka/maka`
@@ -147,3 +161,45 @@ rive workflow run maka.deep-read \
   --param source_ref=335220a \
   --param depth=maintainer
 ```
+
+Run the current session + AI SDK backend analysis workflow:
+
+```sh
+rive workflow validate examples/maka-code-reading/workflows/session-ai-sdk-current
+
+rive workflow run maka.session-ai-sdk-current \
+  --command-id run-maka-session-ai-sdk-current \
+  --runner opencode \
+  --worker opencode-reader-a \
+  --worker opencode-reader-b \
+  --worker opencode-reader-c \
+  --max-parallel 3 \
+  --acceptance-mode auto-reported \
+  --workspace-mode shared \
+  --timeout-seconds 2400 \
+  --param repo_path=/Users/likun/Desktop/workspace-for-maka/maka \
+  --param output_dir=/tmp/rive-maka-session-ai-sdk-current \
+  --param source_ref=4dd1bf1 \
+  --param previous_ref=05ca5a3 \
+  --param depth=maintainer
+```
+
+## Session + AI SDK Current Run
+
+- Source repository: `/Users/likun/Desktop/workspace-for-maka/maka`
+- Source ref: `4dd1bf1`
+- Previous ref: `05ca5a3`
+- Workflow run: `wfrun_55c1450bf8304fb784f5238be9dbfc05`
+- Scheduler run: `sched_e04c42f9b70344698a906980f54f43e5`
+- Root work: `work_c30a53ce6a0741119bbdb254cf8270f9`
+- Runner: OpenCode
+- Worker shape: 5 focused reader nodes + 1 final current-state report node
+- Parallelism: `max_parallel=3`
+- Acceptance mode: `auto-reported`
+- Workspace mode: `shared`, because the workflow is read-only and writes only
+  external Markdown artifacts
+- Result: workflow `completed`, root work `done`, graph hygiene `clean`, 6
+  scheduler node-runs accepted, 0 scheduler failures
+- Dogfood note: an earlier attempt used an old Rive debug binary from 2026-06-09
+  and left a stale interrupted scheduler run. Rebuilding Rive before rerun fixed
+  runner child collection; this run is the authoritative one.
