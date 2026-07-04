@@ -20,7 +20,8 @@ use walkdir::WalkDir;
 
 use crate::branch::{backend_from_env, BranchService};
 use crate::debug_trace::{
-    install_codex_hook, install_opencode_plugin, DebugTraceStore, TraceListFilter,
+    install_codex_hook, install_opencode_plugin, install_opencode_plugin_at, DebugTraceStore,
+    TraceListFilter,
 };
 use crate::dispatch::{
     agent_protocol, dispatch_protocol, AddAgentInput, CancelDispatchCommand, CreateDispatchInput,
@@ -3337,9 +3338,11 @@ impl RunnerAdapter for OpenCodeAdapter {
     }
 
     fn build_command(&self, input: RunnerProcessInput<'_>) -> Result<Command> {
+        let active_workspace = input.workspace_override.unwrap_or(&input.workspace.root);
+        install_opencode_plugin_at(active_workspace)?;
         let mut command = Command::new(input.binary);
         command
-            .current_dir(input.workspace_override.unwrap_or(&input.workspace.root))
+            .current_dir(active_workspace)
             .arg("run")
             .arg("--format")
             .arg("json")

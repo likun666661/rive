@@ -611,6 +611,9 @@ fn write_branch_worker(path: &Path) {
 set -eu
 test -n "$RIVE_WORKSPACE_REF"
 test -n "$RIVE_STATE_WORKSPACE"
+test "$(pwd)" = "$RIVE_WORKSPACE"
+test -f "$RIVE_WORKSPACE/.opencode/plugins/rive-trace.ts"
+grep -q 'RIVE-MANAGED-OPENCODE-TRACE-PLUGIN' "$RIVE_WORKSPACE/.opencode/plugins/rive-trace.ts"
 printf '%s\n' "$RIVE_WORKSPACE" >> "$RIVE_STATE_WORKSPACE/.rive/phase12-branch-paths.txt"
 printf 'parent=%s\nstate=%s\nbranch=%s\n' "$RIVE_STATE_WORKSPACE" "$RIVE_STATE_WORKSPACE" "$RIVE_WORKSPACE_REF" > "$RIVE_WORKSPACE/phase12-branch-result.txt"
 SNAPSHOT_ID=$("{rive_bin}" snapshot capture --path "$RIVE_WORKSPACE/phase12-branch-result.txt" --label phase12-branch-worker --agent "$RIVE_AGENT_ID" --dispatch "$RIVE_DISPATCH_ID" | sed -n 's/.*"snapshot_id": "\([^"]*\)".*/\1/p' | head -n 1)
@@ -1205,6 +1208,10 @@ fn worktree_scheduler_uses_real_git_worktree_and_commit_applies_patch() {
         .unwrap();
     assert_eq!(backend, "git-worktree");
     assert!(Path::new(&branch_path).exists());
+    let plugin_path = Path::new(&branch_path).join(".opencode/plugins/rive-trace.ts");
+    let plugin = fs::read_to_string(&plugin_path).unwrap();
+    assert!(plugin.contains("RIVE-MANAGED-OPENCODE-TRACE-PLUGIN"));
+    assert!(plugin.contains("opencode-plugin"));
     drop(conn);
     let prompt = fs::read_to_string(
         temp.path()

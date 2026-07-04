@@ -1037,7 +1037,11 @@ exit 0
 }
 
 pub fn install_opencode_plugin(workspace: &Workspace) -> Result<TraceInstallProtocol> {
-    let dir = workspace.root.join(".opencode").join("plugins");
+    install_opencode_plugin_at(&workspace.root)
+}
+
+pub fn install_opencode_plugin_at(root: &Path) -> Result<TraceInstallProtocol> {
+    let dir = root.join(".opencode").join("plugins");
     fs::create_dir_all(&dir)?;
     let path = dir.join("rive-trace.ts");
     let content = r#"// RIVE-MANAGED-OPENCODE-TRACE-PLUGIN
