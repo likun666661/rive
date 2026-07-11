@@ -100,6 +100,86 @@ detokenizer 维护该 `uid` 的解码状态，返回 `UserReply(uid, incremental
 
 这使得慢操作和不同资源的生命周期不必混在一个 call stack 中。
 
+### 模块图：谁拥有哪一段状态
+
+```mermaid
+flowchart LR
+    C[浏览器或 OpenAI 客户端]
+
+    subgraph F[前端与连接层]
+        A[FastAPI 路由\n/v1/chat/completions]
+        M[FrontendManager\nuid、ack_map、断连处理]
+        A <--> M
+    end
+
+    subgraph T[文本转换层]
+        TW[Tokenizer worker\n聊天模板、文本到 token]
+        DW[Detokenizer worker\n增量解码、文本安全边界]
+    end
+
+    subgraph P[TP 推理平面]
+        S0[Scheduler rank 0\n外部 I/O、批处理入口]
+        SN[Scheduler rank 1..N-1\n接收相同调度输入]
+        E0[Engine rank 0\n模型、KV Cache、GPU kernel]
+        EN[Engine rank 1..N-1\n模型分片、GPU kernel]
+        S0 --> E0
+        SN --> EN
+        E0 <-.TP tensor 通信.-> EN
+    end
+
+    C -->|HTTP 请求| A
+    M -->|TokenizeMsg(uid)| TW
+    TW -->|UserMsg(token IDs)| S0
+    S0 -->|原始消息与消息数同步| SN
+    S0 -->|DetokenizeMsg(uid, token IDs)| DW
+    DW -->|UserReply(uid, text, finished)| M
+    A -->|SSE chunk| C
+```
+
+图中最重要的归属关系是：`FrontendManager` 持有连接和 `uid` 到回复队列的映射；tokenizer/detokenizer 持有文本表示转换；scheduler 持有请求排队、批处理和顺序；每个 engine 持有本 rank 的模型与 GPU 状态。HTTP 路由只在两端参与，不拥有跨请求的 GPU 调度状态。
+
+### 时序图：一个流式请求如何回到同一条连接
+
+```mermaid
+sequenceDiagram
+    participant C as Browser
+    participant A as FastAPI route
+    participant F as FrontendManager
+    participant T as Tokenizer worker
+    participant S0 as Scheduler rank 0
+    participant SN as Other TP schedulers
+    participant E as Engines on all ranks
+    participant D as Detokenizer worker
+
+    C->>A: POST /v1/chat/completions (stream=true)
+    A->>F: new_user(), register uid
+    A->>F: send_one(TokenizeMsg(uid, messages, params))
+    F->>T: ZMQ PUSH TokenizeMsg
+    T->>T: apply_chat_template and encode int32 token IDs
+    T->>S0: UserMsg(uid, token IDs, sampling params)
+
+    alt tensor parallel size > 1
+        S0->>SN: PUB raw backend message
+        S0->>SN: CPU group broadcast message count
+    end
+
+    loop prefill then each decode step
+        S0->>E: schedule the same batch on every rank
+        E-->>S0: sampled token ID on primary path
+        S0->>D: DetokenizeMsg(uid, token IDs)
+        D->>D: update uid decode state
+        D->>F: UserReply(uid, incremental text, finished)
+        F-->>A: signal ack_map[uid] event
+        A-->>C: SSE chunk
+    end
+
+    D->>F: UserReply(uid, empty text, finished=true)
+    F-->>A: final event for uid
+    A-->>C: SSE [DONE] and close stream
+```
+
+`uid` 在正向消息和回程消息中保持不变，因此多个请求即使被同一个 scheduler 合批，detokenizer 与前端仍能把每段增量文本交还给正确的 HTTP 流。取消时，前端沿同一身份发送 abort 消息；它不需要中断其他请求或直接操作 GPU。
+
 ## 核心心智模型：三种表面，两个边界，一个调度核
 
 先把系统看作三种用户表面，而不是三套推理实现。
