@@ -104,35 +104,35 @@ detokenizer 维护该 `uid` 的解码状态，返回 `UserReply(uid, incremental
 
 ```mermaid
 flowchart LR
-    C[浏览器或 OpenAI 客户端]
+    C["浏览器或 OpenAI 客户端"]
 
-    subgraph F[前端与连接层]
-        A[FastAPI 路由\n/v1/chat/completions]
-        M[FrontendManager\nuid、ack_map、断连处理]
+    subgraph F["前端与连接层"]
+        A["FastAPI 路由：/v1/chat/completions"]
+        M["FrontendManager：uid、ack_map、断连处理"]
         A <--> M
     end
 
-    subgraph T[文本转换层]
-        TW[Tokenizer worker\n聊天模板、文本到 token]
-        DW[Detokenizer worker\n增量解码、文本安全边界]
+    subgraph T["文本转换层"]
+        TW["Tokenizer worker：聊天模板与文本转 token"]
+        DW["Detokenizer worker：增量解码与文本安全边界"]
     end
 
-    subgraph P[TP 推理平面]
-        S0[Scheduler rank 0\n外部 I/O、批处理入口]
-        SN[Scheduler rank 1..N-1\n接收相同调度输入]
-        E0[Engine rank 0\n模型、KV Cache、GPU kernel]
-        EN[Engine rank 1..N-1\n模型分片、GPU kernel]
+    subgraph P["TP 推理平面"]
+        S0["Scheduler rank 0：外部 I/O 与批处理入口"]
+        SN["Scheduler rank 1 到 N-1：接收相同调度输入"]
+        E0["Engine rank 0：模型、KV Cache 与 GPU kernel"]
+        EN["Engine rank 1 到 N-1：模型分片与 GPU kernel"]
         S0 --> E0
         SN --> EN
-        E0 <-.TP tensor 通信.-> EN
+        E0 <-. "TP tensor 通信" .-> EN
     end
 
     C -->|HTTP 请求| A
-    M -->|TokenizeMsg(uid)| TW
-    TW -->|UserMsg(token IDs)| S0
+    M -->|TokenizeMsg 与 uid| TW
+    TW -->|UserMsg 与 token IDs| S0
     S0 -->|原始消息与消息数同步| SN
-    S0 -->|DetokenizeMsg(uid, token IDs)| DW
-    DW -->|UserReply(uid, text, finished)| M
+    S0 -->|DetokenizeMsg 与 token IDs| DW
+    DW -->|UserReply 与 finished 标记| M
     A -->|SSE chunk| C
 ```
 
