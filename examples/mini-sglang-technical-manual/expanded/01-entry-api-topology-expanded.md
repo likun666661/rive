@@ -405,6 +405,32 @@ rank 0 的 ack 位于 `sync_all_ranks()` 之后，所以拿到它意味着所有
 
 这是一个有价值的可观测失败边界：它避免“端口已开但后端未好”的假就绪，但当前代码没有在这里展示 timeout、退出码聚合或诊断重试。
 
+### 启动时序图：为什么 API 不会早于 worker 就绪
+
+```mermaid
+sequenceDiagram
+    participant P as Parent process
+    participant F as FrontendManager
+    participant D as Detokenizer worker
+    participant T as Extra tokenizer workers
+    participant S as TP scheduler ranks
+    participant U as Uvicorn or shell
+
+    P->>F: create frontend reply socket
+    F-->>P: reply endpoint is bound
+    P->>D: spawn tokenize_worker in detokenizer role
+    P->>T: spawn optional tokenizer workers
+    P->>S: spawn one scheduler process per TP rank
+    S->>S: sync_all_ranks
+    S-->>P: primary scheduler ready ack
+    D-->>P: detokenizer ready ack
+    T-->>P: one ready ack per extra tokenizer
+    P->>P: wait for num_tokenizers plus two acks
+    P->>U: start listening for HTTP or shell input
+```
+
+这张图对应 `launch_server` 的启动顺序。父进程并不是“启动子进程后立即开放端口”，而是等待 primary scheduler、detokenizer 和额外 tokenizer 都确认初始化完成。任何一个 ack 缺失都会使启动停在明确的等待边界，而不是产生一个表面可连接、实际无法处理请求的服务。
+
 ## 源码导览（三）：`FrontendManager` 是 HTTP 与消息系统的桥
 
 打开 `python/minisgl/server/api_server.py`。
@@ -597,6 +623,28 @@ rank 0 的多 rank 接收路径先从 tokenizer PULL 取得原始 bytes。
 
 它不表示只有 rank 0 执行模型计算。
 
+### 模块图：多 rank 时消息为何必须经过 rank 0
+
+```mermaid
+flowchart LR
+    T["Tokenizer worker"]
+    R0["Scheduler rank 0：唯一外部 I/O 边界"]
+    R1["Other scheduler ranks"]
+    E0["Engine rank 0"]
+    EN["Other engine ranks"]
+    D["Detokenizer worker"]
+
+    T -->|UserMsg raw bytes| R0
+    R0 -->|PUB identical raw bytes| R1
+    R0 -->|CPU group message count| R1
+    R0 -->|local decoded messages| E0
+    R1 -->|same ordered messages| EN
+    E0 <-. "TP tensor communication" .-> EN
+    R0 -->|DetokenizeMsg only from primary| D
+```
+
+`PUB` 传递相同的原始 payload，CPU process group 广播本轮消息数；两者共同保证其他 rank 读取到与 rank 0 相同数量、相同顺序的请求。图中的 reply 只从 rank 0 发出，不代表其他 engine 没有计算，而是避免多个 rank 为同一请求产生重复的 detokenize 和前端回复。
+
 ## 源码导览（七）：回程 token 如何变成适合用户的文本
 
 `python/minisgl/message/tokenizer.py` 定义 `DetokenizeMsg(uid, next_token, finished)`。
@@ -636,6 +684,29 @@ detokenizer 将结果包成 `UserReply(uid, incremental_output, finished)`。
 因此“流式输出”至少跨越三个状态机：scheduler 的 token 进度、detokenizer 的字符安全状态、frontend 的连接等待状态。
 
 不要把任何一个单独的 yield 当作完整流式协议。
+
+### 状态图：一个 token 为什么不一定立刻成为 SSE 文本
+
+```mermaid
+flowchart LR
+    I["DetokenizeMsg：uid、next token、finished"]
+    S["DecodeStatus for uid：IDs、累积文本、各类偏移"]
+    A["追加 token ID：EOS 不写入输出 IDs"]
+    X["Decode new suffix and surrogate suffix"]
+    Q{"文本可安全输出"}
+    B["保留状态，等待后续 token"]
+    O["推进已发送偏移，生成 incremental output"]
+    R["UserReply：uid、output、finished"]
+    F["FrontendManager ack_map and event"]
+    C["SSE generator"]
+
+    I --> S --> A --> X --> Q
+    Q -->|否| B
+    Q -->|是| O --> R --> F --> C
+    B -.next token for same uid.-> I
+```
+
+这里的 `DecodeStatus` 是源码导览（七）中最值得跟踪的局部状态。detokenizer 的目标不是保证每次发出完整语义句子，而是避免把不完整 Unicode、surrogate 或会被后续 token 改写的片段过早暴露给 SSE。`finished` 仍会随 `UserReply` 回到前端，即使最后一个可见增量为空。
 
 ## 源码导览（八）：离线 `LLM` 不是另一套 engine
 
