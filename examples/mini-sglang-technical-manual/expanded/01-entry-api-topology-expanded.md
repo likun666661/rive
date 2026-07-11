@@ -353,6 +353,24 @@ scheduler 数量等于 `tp_info.size`，而 tokenizer 数量由 `num_tokenizer` 
 
 它服务于分布式初始化，与本机 IPC 消息地址是两类连接。
 
+### 配置派生图：一组 CLI 参数如何变成进程连接边界
+
+```mermaid
+flowchart LR
+    C["CLI arguments"] --> P["parse_args"]
+    P --> A["ServerArgs：frozen config"]
+    A --> T["DistributedInfo：rank 0 and TP size"]
+    A --> S["unique suffix：parent PID"]
+    S --> I["IPC addresses：backend、detokenizer、scheduler broadcast、frontend"]
+    A --> N{"num_tokenizer equals zero"}
+    N -->|yes| H["shared tokenizer and detokenizer address"]
+    N -->|no| X["separate tokenizer address"]
+    A --> D["distributed address：local TCP port plus one"]
+    T --> L["launch_server derives one config per rank"]
+```
+
+这张图的阅读重点不是参数列表，而是派生关系：同一次启动共享 PID suffix，因此各子进程能推导出同一组 IPC 端点；TP size 先以基础 `DistributedInfo` 存在于父进程配置，再由启动器替换成逐 rank 配置。共享 tokenizer 也只改变地址所有者和 worker 角色，不会跳过文本转换。
+
 ## 源码导览（二）：父进程如何启动，并为何等待
 
 阅读 `python/minisgl/server/launch.py:launch_server`。
@@ -475,6 +493,26 @@ sequenceDiagram
 
 因此 `uid` 和 finished 位共同组成“把一串异步片段还原为一次用户请求”的协议。
 
+### `uid` 状态图：前端如何把异步回复交还给原请求
+
+```mermaid
+flowchart LR
+    N["new_user"] --> M["allocate uid and create ack_map and event_map entries"]
+    M --> Q["send TokenizeMsg"]
+    Q --> W["wait_for_ack waits on the uid event"]
+    R["UserReply arrives from frontend queue"] --> K{"uid still exists"}
+    K -->|yes| A["append reply to ack_map and set event"]
+    A --> W
+    W --> G["streaming or non-streaming caller consumes replies"]
+    G --> F{"finished reply"}
+    F -->|no| W
+    F -->|yes| Z["request completes"]
+    X["client disconnect"] --> B["send AbortMsg and remove uid mappings"]
+    K -->|no| I["ignore late reply"]
+```
+
+这里的关键不是 `FrontendManager` 保存了一个普通队列，而是它以 `uid` 分区保存队列与 `asyncio.Event`。断连后映射被删除，迟到 `UserReply` 会被忽略；这避免已经不存在的 HTTP 连接因为后端回程而重新获得状态。
+
 ## 源码导览（四）：HTTP API 真实暴露了什么
 
 `GenerateRequest` 定义了 `/generate` 的请求字段：`prompt`、`max_tokens` 和 `ignore_eos`。
@@ -527,6 +565,36 @@ sequenceDiagram
 
 它不等价于已经中断正在 GPU 上执行的 forward；后者受 batch、stream 和后续 scheduler 状态约束。
 
+### HTTP 时序图：流式与非流式 API 在前端何处分叉
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant R as FastAPI route
+    participant F as FrontendManager
+
+    C->>R: chat completions request
+    R->>F: new_user and send TokenizeMsg
+    alt stream is true
+        loop each UserReply
+            F-->>R: incremental output
+            R-->>C: SSE data chunk
+        end
+        R-->>C: final chunk and DONE marker
+    else stream is false
+        loop each UserReply
+            F-->>R: incremental output
+            R->>R: append to response text
+        end
+        R-->>C: one JSON response
+    end
+    opt client disconnect during streaming
+        R->>F: abort_user and AbortMsg
+    end
+```
+
+两条 API 路径共享 uid、`TokenizeMsg`、后端调度和 `UserReply`；差异只发生在前端消费回复时。流式路径每次立即编码为 SSE，非流式路径累积到 `finished` 后才构造 JSON。取消消息是向后端表达“不再需要这个 uid”的协议，而非同步等待 GPU stop 的阻塞调用。
+
 ## 源码导览（五）：文本如何变成 `UserMsg`
 
 关键 worker 在 `python/minisgl/tokenizer/server.py:tokenize_worker`。
@@ -570,6 +638,32 @@ worker 为每个结果构造 `UserMsg(uid, input_ids, sampling_params)`。
 `python/minisgl/message/backend.py` 是这些类型的精确契约：`UserMsg`、`AbortBackendMsg`、`ExitMsg` 与 `BatchBackendMsg`。
 
 它们和 tokenizer/frontend 消息都通过 `message/utils.py` 所接入的自定义序列化途径传输。
+
+### 数据变换图：从聊天消息到 scheduler 可消费的 `UserMsg`
+
+```mermaid
+flowchart LR
+    I["TokenizeMsg：string or message dictionaries"]
+    K{"input is messages"}
+    T["apply_chat_template with generation prompt"]
+    S["use input string directly"]
+    E["tokenizer encode"]
+    V["flatten to CPU one dimensional int32 token IDs"]
+    U["UserMsg：uid、input IDs、sampling params"]
+    B{"more than one ready message"}
+    O["send one UserMsg"]
+    M["wrap as BatchBackendMsg"]
+    R["scheduler backend queue"]
+
+    I --> K
+    K -->|yes| T --> E
+    K -->|no| S --> E
+    E --> V --> U --> B
+    B -->|no| O --> R
+    B -->|yes| M --> R
+```
+
+这条转换链解释了为什么路由不应自己拼聊天模板，也解释了 `UserMsg.input_ids` 明确是 CPU `int32` tensor。到达 scheduler 前，请求已经具备统一的 token 表示和采样参数，但尚未变成 GPU 模型输入或触发 forward。
 
 ## 源码导览（六）：为什么 rank 0 是 I/O 边界
 
@@ -743,6 +837,28 @@ flowchart LR
 它让基准与 Python 调用避免 ZMQ、worker 和网络连接的开销。
 
 它也意味着不能把离线 `generate` 的行为自动等同于在线 API 的流式体验或 TP 拓扑。
+
+### 对照图：在线和离线如何复用同一个调度核
+
+```mermaid
+flowchart LR
+    subgraph ON["Online mode"]
+        H["HTTP frontend and ZMQ"] --> OI["SchedulerIOMixin online receive"]
+        OR["SchedulerIOMixin online send"] --> D["Detokenizer and SSE"]
+    end
+
+    subgraph OFF["Offline mode"]
+        L["LLM.generate pending requests"] --> LI["offline_receive_msg"]
+        LO["offline_send_result"] --> R["RequestStatus output IDs then final decode"]
+    end
+
+    OI --> C["Shared Scheduler and Engine"]
+    LI --> C
+    C --> OR
+    C --> LO
+```
+
+`LLM` 继承 `Scheduler`，复用的是调度、缓存、表管理和 engine 路径；它替换的是 I/O 适配器。在线模式通过 ZMQ、detokenizer 与前端事件流收发消息，离线模式从 `pending_requests` 取输入并把 token 留在 `RequestStatus`，最后一次性 decode。因此两者共享推理核心，却不共享网络拓扑与流式文本行为。
 
 ## 引导实验：不需要模型或 GPU 的拓扑审计
 
