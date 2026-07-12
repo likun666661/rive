@@ -126,6 +126,15 @@ engine 完成模型计算后对真实请求调用 `req.complete_one()`。
 
 重点是一个请求在不同时间有不同的“已知 token 数”“已计算 KV 数”和“已保留资源”。
 
+这里可以先记住两次不同性质的“接纳”。
+
+```text
+UserMsg -> PendingReq：请求合法且已排队，但尚未获得资源承诺
+PendingReq -> Req：请求已锁定前缀缓存句柄、获得 table row，能够进入 batch
+```
+
+第一步刻意轻量；第二步才承担 KV 容量、table row 和缓存锁的责任。把二者混为“请求已经开始执行”，是理解 serving 调度时最常见的误解。
+
 ## 核心心智模型：一份请求有四本账
 
 把 `Req` 看作一张跨设备的记账卡，而不是简单的文本对象。
@@ -175,6 +184,30 @@ append_host：host 长度加一，与新的 device_len 对齐
 普通请求需要这两个动作各发生一次、且顺序正确。
 
 这份配对关系是阅读 overlap 路径时最值得反复检查的不变量。
+
+### 数值走读：四本账如何在一次 decode 中推进
+
+假设某请求的 prompt 已有 10 个 token，其中前 6 个 token 的 KV 已命中可复用前缀；允许最多再生成 4 个 token。它在某次完整 prefill 开始前可写为：
+
+```text
+len(input_ids)  = 10       host 已确认完整 prompt
+cached_len      = 6        KV 已有效到位置 6
+device_len      = 10       本轮 GPU 将处理到位置 10
+max_device_len  = 14       10 个输入加最多 4 个输出
+extend_len      = 4        本轮必须补算位置 [6, 10) 的 KV
+```
+
+模型处理这 4 个新位置后，`complete_one()` 先推进设备侧账本：
+
+```text
+cached_len = 10
+device_len = 11
+len(input_ids) = 10        CPU 此时仍不能读取异步拷贝的 next token
+```
+
+这不是不一致 bug，而是 overlap 所需的合法中间态。GPU 已将 sampled token 写进 `token_pool` 的下一逻辑位置，所以后续 GPU decode 可以继续安排；CPU 仍必须等待 `copy_done`。事件完成后，`append_host(next_token)` 才把 host 长度推进到 11。
+
+因此这四本账并不是四份冗余数据，而是同一请求在 CPU、GPU、KV 与资源管理器中的不同提交视角。
 
 ## 术语表
 
@@ -322,6 +355,20 @@ scheduler stream:   prepare N      | wait/copy process N | prepare N+1
 
 因此，`Context` 是“隐式执行上下文”，而不是调度器队列。
 
+### 对象边界：谁保存长期状态，谁描述一次执行
+
+把这三个对象分清，后续源码会简单很多。
+
+| 对象 | 生命周期 | 主要职责 | 不应承担的职责 |
+| --- | --- | --- | --- |
+| `Req` | 从接纳到结束或取消 | 保存单请求长度账、采样参数、table row 与 cache handle | 不决定与其他请求如何合批 |
+| `Batch` | 一次 forward 前后 | 描述本轮真实请求、phase、扁平输入和 attention 元数据 | 不保存用户连接或跨轮资源所有权 |
+| `Context` | 一个 engine 进程 | 暴露当前 batch、page table、KV cache 与 backend | 不排队、不选择请求、不保存前端回复 |
+
+`Req` 的 `@dataclass(eq=False)` 也值得注意。`DecodeManager.running_reqs` 和 `finished_reqs` 按对象身份而不是字段相等性管理请求；两个 prompt 相同的用户请求仍然有不同 `uid`、table row 与资源生命周期。它也避免把带有 `torch.Tensor` 的字段当作可靠的结构相等性依据。
+
+`Context.forward_batch` 是动态作用域：engine 在 `with` 块内绑定当前 batch，模型层和 attention backend 再通过 `get_global_ctx().batch` 读取它。好处是无需在每层 `forward` 参数里传递一长串 runtime 对象；代价是同一 engine 进程不能嵌套或并发地拥有两个 active batch，代码用断言明确保护这个约束。TP 的每个 rank 是独立进程，因此各自有自己的全局 `Context`。
+
 ## 逐步源码导览（二）：从消息到 prefill 接纳
 
 ### 第六步：检查 `_process_one_msg`
@@ -374,6 +421,19 @@ scheduler stream:   prepare N      | wait/copy process N | prepare N+1
 
 它没有绕过大请求去尝试后面的小请求，因此不应被描述成全局最优 packing 或公平调度。
 
+### 接纳决策：本轮算得下，不等于生命周期承诺得起
+
+`PrefillAdder` 同时维护两个量：
+
+```text
+token_budget：本轮最多处理多少 prompt token
+reserved_size：已经运行或本轮已接纳请求在未来仍可能需要的 KV 空间
+```
+
+二者不能互相替代。假设一条长 prompt 本轮只剩 16 token 的 prefill budget，但它还需处理 1,000 个 prompt token，且允许输出 200 个 token。调度器可以本轮只执行 16 个 token 的 chunk，却仍必须按“完整剩余 prompt 加 200 输出”预留容量；否则它可能把请求推进到一半，才发现没有空间完成生成。
+
+这也解释了为何 `DecodeManager.inflight_tokens` 要并入 `reserved_size`：新 prefill 不应假定正在流式生成的旧请求已经不再需要 KV 空间。
+
 ### 第九步：检查 `PrefillAdder._try_allocate_one`
 
 该方法先检查 `TableManager.available_size`。
@@ -405,6 +465,18 @@ scheduler stream:   prepare N      | wait/copy process N | prepare N+1
 接纳成功后，`TableManager.allocate()` 取得一行。
 
 若存在已命中前缀，代码把相应 token 和 page entry 写入这一行。
+
+锁前检查与锁后复查共同构成一个小型提交协议：
+
+```text
+检查可用容量
+  -> lock 命中的 prefix handle
+  -> handle 从可逐出资源变为受保护资源
+  -> 再检查容量
+  -> 成功才分配 table_idx；失败则 unlock
+```
+
+第一次检查无法替代第二次检查，因为 lock 本身会改变 `available_size` 的含义。
 
 ### 第十步：检查 `_add_one_req` 与长 prompt
 
@@ -442,6 +514,18 @@ scheduler stream:   prepare N      | wait/copy process N | prepare N+1
 
 最终 chunk 不再是 `ChunkedReq`，才可以在一次完整 prefill 后进入 decode。
 
+这里需要一个精确但反直觉的补充：当前 `Engine.forward_batch` 的统一路径仍会计算 logits，并对 `batch.reqs` 调用 sampler；中间 chunk 的 sampled token 不是没有被计算，而是被 `_process_last_data` 跳过，因而不会写入 host token 序列或发给用户。
+
+设完整 prompt 是 `p0` 到 `p99`，而本轮预算只能处理 40 个 token：
+
+```text
+第一个 chunk：处理 p0 到 p39，末尾 logits 形式上预测位置 40
+第二个 chunk：处理 p40 到 p79，末尾 logits 形式上预测位置 80
+最终 chunk：处理 p80 到 p99，末尾 logits 才预测 prompt 之后的第一个生成 token
+```
+
+前两次“下一位置”仍是用户已经给定的 prompt 内容，不能拿 sampler 产生的候选替代真实 prompt token，更不能流给用户。`ChunkedReq.can_decode=False` 防止它进入 decode 集合，`append_host` 直接报错，`_process_last_data` 也会跳过它；三层防线共同保证中间 chunk 只推进 KV，不提交生成结果。
+
 ### 第十二步：理解 prefill-first
 
 回到 `Scheduler._schedule_next_batch`。
@@ -459,6 +543,17 @@ prefill_manager.schedule_next_batch(prefill_budget) or decode_manager.schedule_n
 这是一条当前实现的策略，不是 LLM serving 的普遍定律。
 
 它让新 prompt 尽快获得处理机会，但可能加大 decode 的等待。
+
+`or` 的语义值得按调度周期逐字理解：只有 `prefill_manager.schedule_next_batch(...)` 真正返回一个 batch，decode manager 才不会被调用。若 pending 队列为空，或队首请求因 table/KV 容量无法接纳而返回 `None`，本轮仍会退回 decode。
+
+但在持续存在可接纳新 prompt 的负载下，正在生成的请求会连续失去 GPU 时间片：
+
+```text
+本轮：新请求 C 的 prefill，已有请求 A 和 B 不生成 token
+下一轮：新请求 D 的 prefill，A 和 B 仍不生成 token
+```
+
+这就是 TTFT 与 TPOT 的取舍。prefill-first 倾向缩短新请求首 token 时间；decode-first 倾向缩短已有请求 token 间隔。特别是长 prompt 的 `ChunkedReq` 会回到 pending 队首优先续跑，因此它可能连续占用多轮 prefill。当前代码在 `_schedule_next_batch` 旁明确留有“支持 DECODE first 等策略”的 TODO；资源正确性不依赖该策略，但用户体验和公平性会随策略改变。
 
 ### 第十三步：理解 `DecodeManager`
 
@@ -504,6 +599,59 @@ prefill_manager.schedule_next_batch(prefill_budget) or decode_manager.schedule_n
 
 最后 attention backend 用 `prepare_metadata(batch)` 构建其专属元数据。
 
+### 把 Batch 看成一次 GPU 调用的编译产物
+
+`_prepare_batch` 的输入是若干不规则的 `Req`，输出则是 kernel 能消费的扁平张量和地址。最容易混淆的是三种位置：
+
+| 位置 | 含义 |
+| --- | --- |
+| 逻辑位置 | 请求序列中的 token 下标，例如位置 10 |
+| table 位置 | 请求在 `token_pool` 与 `page_table` 的行，即 `table_idx` |
+| 物理 KV 位置 | GPU KV buffer 中实际存放 K/V 的槽位 |
+
+设一个 batch 有两个真实请求：
+
+```text
+A：table_idx=3，cached_len=10，device_len=11，处理 [10, 11)
+B：table_idx=7，cached_len=2， device_len=5， 处理 [2, 5)
+```
+
+`_make_positions` 将它们展平为：
+
+```text
+positions = [10, 2, 3, 4]
+```
+
+`_make_input_tuple` 同时产生：
+
+```text
+token_mapping = [3, 7, 7, 7]
+input_ids = token_pool[token_mapping, positions]
+```
+
+模型实际得到的是一个扁平 token 序列；请求边界由 mapping 与 attention metadata 恢复。随后 `page_table[token_mapping, positions]` 得到 `batch.out_loc`，attention backend 在每层将本轮输入 token 的 K/V 写入这些物理地址。
+
+不要把 `out_loc` 与 sampled token 的写入位置混为一谈：
+
+```text
+out_loc：本轮输入 token 的 K/V 写进哪个物理 KV 槽位
+write_tuple：本轮采样的 next token ID 先写回 token_pool 的哪一个逻辑位置
+```
+
+后者让下一次 decode 能在 GPU 上直接读取上轮 sampled token，不必等待它先返回 CPU。
+
+```mermaid
+flowchart LR
+    A["Req A: table 3, range 10 to 11"] --> P["flattened positions"]
+    B["Req B: table 7, range 2 to 5"] --> P
+    P --> M["token mapping plus logical positions"]
+    M --> T["token_pool gather: batch input IDs"]
+    M --> K["page_table gather: physical KV out locations"]
+    T --> E["model and attention kernels"]
+    K --> E
+    E --> W["sampled token IDs written to token_pool"]
+```
+
 ### 第十五步：理解 page 分配的时机
 
 `CacheManager.allocate_paged` 根据 `cached_len` 和 `device_len` 求首尾页。
@@ -515,6 +663,23 @@ prefill_manager.schedule_next_batch(prefill_budget) or decode_manager.schedule_n
 若仍不能释放足够页，会触发断言。
 
 缓存匹配与具体页分配分开，是因为接纳决定“可否承诺”，而 batch 准备落实“本轮具体要写何处”。
+
+### CUDA Graph padding：固定 kernel 形状，不扩展用户语义
+
+Mini-SGLang 只对 decode batch 尝试 CUDA Graph。它启动时预先捕获一组 batch size，例如 `1`、`2`、`4`、`8`；运行时若有 3 个真实 decode 请求，则选择第一个不小于 3 的图形状：
+
+```text
+batch.reqs        = [A, B, C]
+batch.size        = 3
+batch.padded_reqs = [A, B, C, Dummy]
+batch.padded_size = 4
+```
+
+dummy request 并非空对象。它有合法 token ID、专用 `table_idx`、`uid=-1`，且其 page-table 行预先指向专用 dummy page。这样 attention kernel 的第四条 lane 能安全读写隔离的地址，不会触碰真实请求的 KV。
+
+但服务语义必须始终使用 `batch.reqs`：engine 只对真实请求 `complete_one()`，只对 `logits[:batch.size]` 采样，回程只遍历真实请求。`padded_reqs` 只用于 positions、input mapping 与 attention metadata，从而匹配被捕获图的形状。
+
+这换取较低的 decode launch 开销，但也可能计算一条额外 lane。必须保持的边界是：`padded_size` 决定 GPU 图形状，`size` 决定真实用户请求数。
 
 ## 逐步源码导览（四）：执行、采样和 overlap
 
@@ -531,6 +696,17 @@ prefill_manager.schedule_next_batch(prefill_budget) or decode_manager.schedule_n
 最后 `decode_manager.filter_reqs(batch.reqs)` 更新 decode 运行集。
 
 注意：这一步发生在 engine stream 的执行上下文中。
+
+### 两条 token 路径：GPU 连续推进，CPU 延后提交
+
+一次 forward 后的 sampled token 会同时走两条路径：
+
+```text
+GPU 路径：next_tokens_gpu -> token_pool 的下一逻辑位置 -> 下一轮 decode 输入
+CPU 路径：next_tokens_gpu -> non-blocking D to H copy -> copy_done -> append_host -> DetokenizeMsg
+```
+
+因此 GPU 可以在 host 尚未追加 token 时继续安排下一轮，而用户仍只能在 CPU 确认 copy 完成后看到文本。`complete_one()` 推进设备账本；`append_host()` 提交 host 账本；二者不能合并。
 
 ### 第十七步：阅读 `Engine.forward_batch`
 
@@ -578,6 +754,24 @@ engine 创建并记录 `copy_done_event`，再将 GPU token、CPU token tensor �
 
 因此，batch N 的 GPU 计算可以与 batch N-1 的 CPU 结果处理重叠。
 
+### 两轮时间线：overlap 真正重叠的是什么
+
+```mermaid
+sequenceDiagram
+    participant S as Scheduler stream and CPU
+    participant E as Engine stream
+    participant H as Host result handling
+
+    S->>E: enqueue forward for batch N
+    E->>E: model, sample, token pool write, async copy
+    S->>E: enqueue forward for batch N plus 1
+    E->>E: execute batch N plus 1
+    S->>H: wait copy_done for batch N
+    H->>H: append host, finish check, detokenize reply
+```
+
+这里的 overlap 不是让两个 batch 同时在同一 engine stream 上执行模型；同一 stream 仍按顺序运行。重叠发生在“batch N plus 1 的 GPU 计算”与“CPU 处理 batch N 的已拷贝结果”之间。`engine.stream.wait_stream(self.stream)` 则保证 engine 在读取 batch 元数据前，scheduler stream 上的准备工作已完成。
+
 ### 第十九步：阅读 `_process_last_data`
 
 `_process_last_data` 先解包上一批的 `next_tokens_cpu` 与 `copy_done`。
@@ -601,6 +795,10 @@ engine 创建并记录 `copy_done_event`，再将 GPU token、CPU token tensor �
 若未结束但本批是 prefill，它缓存已完成前缀，为后续请求复用。
 
 最后 `send_result(reply)` 交给 I/O 层。
+
+`copy_done.synchronize()` 是这一节最重要的 CPU 提交边界。`non_blocking=True` 仅表示发起 D-to-H copy 时 CPU 不等待；它不授予 CPU 提前读取目标 tensor 的权限。只有 event 完成后，`next_tokens_cpu[i]` 才能安全用于 `append_host`、EOS 判断和 `DetokenizeMsg`。
+
+结束请求的资源释放也要在此处发生：从 decode manager 移除真实请求、归还 table row，并将其 KV 区域交给 `cache_req(..., finished=True)` 处理。`finished_reqs` 是 overlap 窗口中的双重释放保护，不应误解为完整的并发正确性证明。
 
 ## 引导实验：不运行模型也能审计一次生命周期
 
