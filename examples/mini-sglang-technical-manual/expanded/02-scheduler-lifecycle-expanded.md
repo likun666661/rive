@@ -1108,6 +1108,68 @@ abort 经 `_process_one_msg` 尝试从 prefill/decode 移除并释放；其客�
 
 这解释计算一致性的输入边界，不是对所有分布式 serving 设计的普遍规定。
 
+## 对话式检索测验：第 1-8 题
+
+本组题用于在不查看答案的情况下复述本章关键因果链。建议一次只答一题；答不出时先回到对应源码导览，再用自己的话重建状态变化。题目只要求本章已经建立的 Scheduler、Batch、KV 与 CPU/GPU 提交边界，不要求推演下一章的物理页回收细节。
+
+### 题目 1：`UserMsg`、`PendingReq` 与 `Req`
+
+一个 `UserMsg` 在什么阶段只是 `PendingReq`？它要满足哪些条件、获得哪些资源后，才会成为真正的 `Req`？若资源暂时不足，会发生什么？
+
+### 题目 2：设备账与 host 账
+
+一个普通 decode 请求在 forward 前满足：
+
+```text
+cached_len = 10
+device_len = 11
+len(input_ids) = 11
+```
+
+`complete_one()` 已执行，但 `copy_done_event` 尚未完成，`append_host()` 尚未执行。此时三项值分别是什么？为什么这不是状态不一致 bug？
+
+### 题目 3：prefill-first 的取舍
+
+给定：
+
+```python
+prefill_manager.schedule_next_batch(...) or decode_manager.schedule_next_batch()
+```
+
+若连续到达的新请求都可被接纳为 prefill，而已有请求正在 decode，哪一类工作会连续优先？这对新请求 TTFT 与已有请求 TPOT 分别有什么影响？
+
+### 题目 4：接纳失败时 decode 是否继续
+
+已有请求 A、B 正在 decode；pending 请求 C 因 KV 容量暂时不足而无法接纳。`prefill_manager.schedule_next_batch(...)` 会返回什么？Scheduler 随后会尝试执行什么？A、B 会怎样？
+
+### 题目 5：真实请求与 graph padding
+
+一个 decode batch 有五个真实请求，而已捕获 graph size 为：
+
+```text
+[1, 2, 4, 8]
+```
+
+分别写出 `batch.reqs` 与 `batch.padded_reqs` 的概念内容。为什么选择图 8？采样、请求状态推进、回包和资源释放应按 5 还是按 8 处理？
+
+### 题目 6：生成 token 的 GPU/CPU 双路径
+
+一次 forward 采样出 next token 后：它为什么先写进 GPU `token_pool`？GPU 因此可以继续做什么？在 `copy_done_event` 完成前，CPU 还不能做什么？
+
+### 题目 7：完整 prefill 与第一轮 decode
+
+用户 prompt 的 token 为：
+
+```text
+[p0, p1, p2]
+```
+
+完整 prefill 后，GPU 上留下的主要长期产物是什么？`p2` 的最后一行 logits 能得到什么？为什么第一轮 decode 无须重新处理 `p0`、`p1`、`p2`？
+
+### 题目 8：从第一枚生成 token 到用户可见文本
+
+完整 prefill 采样出第一枚输出 token `y0` 后，为什么 `y0` 要先写入 GPU `token_pool`？为什么 CPU 不能立刻把它加入 `input_ids`？什么条件满足后，才可以调用 `append_host(y0)`？
+
 ## 本章小结
 
 LLM serving 的调度核心不是“把 token 放进列表”。
