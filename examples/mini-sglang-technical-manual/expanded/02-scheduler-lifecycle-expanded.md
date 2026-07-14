@@ -1349,6 +1349,101 @@ prefill_manager.schedule_next_batch(...) or decode_manager.schedule_next_batch()
 
 完整 prefill 采样出第一枚输出 token `y0` 后，为什么 `y0` 要先写入 GPU `token_pool`？为什么 CPU 不能立刻把它加入 `input_ids`？什么条件满足后，才可以调用 `append_host(y0)`？
 
+## 分层自测地图：补齐第二章的掌握面
+
+前面的第 1-8 题是跨主题的综合检索题，不应被当作必须按编号完成的线性关卡。
+
+例如，第 6-8 题都围绕“首枚生成 token 从 GPU 到 CPU”的同一条链路；而长 prompt、batch 编译、overlap 和结束释放等主题还需要单独检验。
+
+更合适的学习顺序是先建立模型运行时的因果链，再逐步加入调度和资源约束。
+
+```text
+第一轮：模型运行时基础
+第二轮：请求接纳与长度账
+第三轮：Batch、页表与 CUDA Graph
+第四轮：overlap、结束、取消与分布式边界
+```
+
+### 第一轮：模型运行时基础
+
+这一轮对应第 6-8 题的前置能力。
+
+应能独立说明：
+
+- 文本变 `input_ids` 是 tokenize；`input_ids` 进入 Transformer、建立 KV 并预测首 token 才是 prefill。
+- KV cache 保存的是每层已处理 token 的 K/V 浮点向量，不是 token ID，也不是传统键值数据库。
+- prefill 处理 prompt KV，并从最后位置 logits 采样 `y0`；它还没有计算 `KV(y0)`。
+- decode 将 `y0` 作为输入，读取历史 KV、写入 `KV(y0)`，并预测 `y1`。
+- `y0` 先以 token ID 进入 GPU `token_pool`，而 CPU `input_ids` 要等 D-to-H copy event 后才可追加。
+
+这轮的最小自测不应一开始就问 Scheduler 实现。应先能画出：
+
+```text
+prompt -> prefill -> y0 in token_pool -> decode y0 -> y1
+```
+
+并说明每个箭头新增的长期状态。
+
+### 第二轮：请求接纳与长度账
+
+这一轮将模型链路映射到 `Req`、`PendingReq` 与资源管理。
+
+现有第 1、2 题覆盖了其中一部分；还应单独出题考察以下内容。
+
+| 待检验主题 | 必须能回答的问题 |
+| --- | --- |
+| 三本长度账 | `cached_len`、`device_len`、`len(input_ids)` 分别表示什么；一次 prefill/decode 前后如何变化？ |
+| 基本不变量 | 为什么 `cached_len < device_len` 保证 `extend_len >= 1`？`remain_len` 与本轮 extend 的区别是什么？ |
+| 接纳边界 | `UserMsg` 何时只是 `PendingReq`，何时获得 `table_idx`、cache handle 与 `Req` 身份？ |
+| 前缀命中 | 为什么 match 会同时影响本轮计算量和未来 KV 容量估算？ |
+| 容量承诺 | 为什么估算是“未命中 prompt 后缀加最大输出”，而不是只看本轮 prefill token budget？ |
+| lock 后复查 | 为什么锁住 prefix handle 后还必须再次检查可用 KV 容量？ |
+| 队首阻塞 | 为什么 FIFO 队首请求接纳失败时，后面本可装下的请求也可能本轮不运行？ |
+
+这一轮的典型练习应一次只给出一个请求、一组长度和一个资源约束；不要在同一题同时要求推导 KV 容量、CUDA event 和 graph padding。
+
+### 第三轮：Batch、页表与 CUDA Graph
+
+这一轮处理“抽象请求如何被编译成一次 GPU 调用”。现有第 5 题只覆盖了真实请求与 dummy request 的边界，还缺少以下检查点。
+
+| 待检验主题 | 必须能回答的问题 |
+| --- | --- |
+| 三种位置 | 逻辑 token 位置、`table_idx` 行位置与物理 KV 位置各表示什么？ |
+| `_prepare_batch` | positions、input mapping、`out_loc`、write mapping 分别为哪一次读写服务？ |
+| token 与 KV 的写入边界 | 为什么 `out_loc` 指向本轮输入 token 的 KV 写入位置，而 write mapping 指向 sampled next token 的 `token_pool` 写入位置？ |
+| 页分配时机 | 为什么接纳时先承诺容量，prepare batch 时才落实本轮具体页？ |
+| graph 条件 | 为什么当前 CUDA Graph 只适用于满足条件的 decode batch，而不是 prefill？ |
+| dummy 语义隔离 | 为什么 dummy 可以参与 kernel 的固定形状计算，却不能参与采样、状态推进、回包或资源释放？ |
+
+读到这一轮时，能手工把两个不同长度请求展平为 positions 和 table mapping，比背诵函数名更重要。
+
+### 第四轮：执行、overlap、结束与分布式边界
+
+这一轮才应把多请求、多 batch 和跨 stream 的时序放在一起。现有第 3、4 题覆盖了 prefill-first 的一部分取舍，但还需要检查以下主题。
+
+| 待检验主题 | 必须能回答的问题 |
+| --- | --- |
+| `ChunkedReq` | 为什么中间 chunk 即使计算出 logits 也不能向用户输出；何时才会变回普通 `Req` 并进入 decode？ |
+| 调度回退 | pending 不为空为何不代表 prefill 一定优先；接纳失败时 decode 如何接棒？ |
+| overlap 时间线 | 重叠的两件事分别是什么；为什么同一 engine stream 上的两个 forward 仍按顺序执行？ |
+| stream 依赖 | `engine.stream.wait_stream(self.stream)` 与 `copy_done.synchronize()` 分别保护哪一种读写依赖？ |
+| 结束路径 | EOS、输出上限耗尽与 abort 分别如何影响回包、manager 容器和资源释放？ |
+| 重复释放保护 | `finished_reqs` 防住了什么，为什么它不构成完整并发正确性证明？ |
+| 对象与 TP 边界 | `Req`、`Batch`、`Context` 各自拥有何种状态；TP 下为什么主 rank 接收原始 I/O 后再广播？ |
+
+### 推荐的出题方式
+
+后续题目应按依赖关系逐题推进，而不是把多个新概念压进一题。
+
+```text
+先问一个状态在哪：token_pool、KV cache，还是 CPU input_ids
+再问一个长度如何变化：cached_len、device_len，还是 host 长度
+再问一个调度选择：pending、prefill 或 decode
+最后才问跨请求的资源、公平性、graph 与 overlap
+```
+
+答不出时应先回到上一层的因果链，而不是把答案替换成更多术语。比如不知道 `device_len` 时，先重建“本轮 GPU 输入 token 是谁”；不知道容量估算时，先分开“未命中 prompt 后缀”和“未来输出上限”。
+
 ## 本章小结
 
 LLM serving 的调度核心不是“把 token 放进列表”。
