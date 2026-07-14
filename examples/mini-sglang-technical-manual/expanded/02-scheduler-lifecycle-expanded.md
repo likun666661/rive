@@ -1,6 +1,6 @@
 # 第 02 章：Req、Batch、Context 与调度器生命周期
 
-> 读者对象：会读 Python、知道 token 与 Transformer 基本概念，但刚开始接触 LLM serving 的工程师。
+> 读者对象：会读 Python、知道文本会被编码为 token，但刚开始接触 Transformer 与 LLM serving 的工程师。
 
 > 本章以当前 mini-sglang 源码为依据。
 
@@ -22,7 +22,9 @@
 
 你应能从调度路径定位 table row、KV page 和 radix-cache handle 的释放位置。
 
-先修知识只要求你知道：token 是整数序列，KV cache 保存已处理 token 的 attention 状态，GPU stream 中的工作按顺序执行。
+先修知识只要求你知道：token 是整数序列，GPU stream 中的工作按顺序执行。
+
+在进入调度器之前，本章会先建立 `tokenize`、prefill、decode 与 KV cache 的最小模型；不要求你预先知道 Transformer 的内部细节。
 
 不要求你预先掌握 CUDA Graph、NCCL 或具体 attention kernel。
 
@@ -31,6 +33,183 @@
 本章不试图把 mini-sglang 描述成完整生产服务。
 
 它是一个紧凑的实现，特别适合学习“请求状态如何跨 CPU、GPU 表项和缓存资源推进”。
+
+## 进入 Scheduler 前的必要桥梁：模型如何逐 token 生成
+
+这一节先回答后文所有调度术语依赖的四个问题。
+
+第一，文本何时变成 token。
+
+第二，KV 到底是什么。
+
+第三，prefill 和 decode 分别做了哪一次模型计算。
+
+第四，为什么一枚新 token 会先进入 GPU 的 `token_pool`，而不是立刻追加到 CPU 的 `input_ids`。
+
+如果这四点没有建立，`cached_len`、`device_len`、`ChunkedReq` 与 `copy_done` 会显得像彼此无关的实现细节。
+
+### 先分清五种不同的东西
+
+下面五个对象经常被统称为“token”，但它们不是一回事。
+
+| 对象 | 例子或形状 | 谁产生它 | 本章中负责什么 |
+| --- | --- | --- | --- |
+| 文本 | `"解释 KV cache"` | 用户 | 还不能送进模型 |
+| token ID / `input_ids` | `[x0, x1, x2]`，整数 | tokenizer | 模型的离散输入 |
+| 隐藏向量 | 每个位置的一串浮点数 | Transformer 层 | 模型内部表示，通常不长期保留 |
+| logits | 词表大小的一串分数 | 模型最后一层 | 表示“下一 token 各自有多可能” |
+| sampled token | `y0`，一个整数 ID | sampler | 本轮选出的下一枚输出 |
+
+`tokenize` 只完成第二行：把文本变为整数 ID。
+
+mini-sglang 的 `TokenizeManager.tokenize` 调用 tokenizer 的 `encode`，返回 CPU 上的 `torch.int32` tensor。它尚未运行 Transformer，也尚未生成任何 KV。见 `python/minisgl/tokenizer/tokenize.py`。
+
+因此，下面两句话必须明确区分。
+
+```text
+文本 -> input_ids                 是 tokenize
+input_ids -> KV cache + y0        是 prefill
+```
+
+### 从零理解 attention：Q、K、V 不是普通键值数据库
+
+Transformer 处理一个位置时，需要从此前 token 中取回与当前语境有关的信息。
+
+例如，在句子 `“小明把书放在桌子上，因为它很重。”` 中，模型处理 `“它”` 时需要利用前文；它不能只看当前位置的字面 ID。
+
+每个 token 在每一层都有一个当前的浮点向量 `h`。这一层用三组训练好的矩阵把 `h` 投影为三个新向量：
+
+```text
+Q = h @ Wq    当前 token 希望从历史中寻找什么
+K = h @ Wk    当前 token 可以怎样被匹配
+V = h @ Wv    一旦被关注，应当取回什么信息
+```
+
+它们不是人工定义的“主键”和“字段值”。它们都是模型学习出的浮点向量；“检索条件、索引键、取回内容”只是在说明三者的计算职责。
+
+当前 token `i` 的 `Q(i)` 会和此前各 token 的 `K(j)` 计算分数。分数归一化后成为注意力权重，再对相应的 `V(j)` 做加权求和：
+
+```text
+score(i, j)       = Q(i) dot K(j)
+attention_out(i)  = sum_j softmax(score(i, j)) * V(j)
+```
+
+因果 mask 限制 `j <= i`：处理当前位置时只能关注自己和过去，不能偷看未来 token。
+
+### KV cache 是什么实体，为什么不缓存 Q
+
+KV cache 是已处理 token 在**每一层**产生的 K 和 V 浮点向量的集合。
+
+它不是 prompt 文本，不是 token ID，也不是传统数据库中的 key-value 记录。
+
+假设 prompt token 是 `[x0, x1, x2]`，则概念上缓存的是：
+
+```text
+第 1 层：KV(x0), KV(x1), KV(x2)
+第 2 层：KV(x0), KV(x1), KV(x2)
+...
+```
+
+下一枚 token 到来时，模型只需要新算该 token 的 `Q`，用它查询历史 token 的 K/V；然后算新 token 自己的 K/V 并追加到 cache。
+
+历史 token 的 Q 不会再用于产生新的位置输出，因此通常不需要缓存。历史 K/V 则是未来每个新 token 做 attention 都需要读取的状态。
+
+这就是“缓存 KV 能避免重算整个 prompt”的真正含义。
+
+### prefill：一次读完已知 prompt，建立上下文状态并预测 y0
+
+设用户 prompt 已被 tokenizer 编码为：
+
+```text
+x0, x1, x2
+```
+
+在没有前缀命中的最简单情形，prefill 将这段已知 token 一起送入模型。它可以在一次模型调用中处理多个已知位置，同时通过因果 mask 保持“每个位置只能看过去”的语义。
+
+prefill 的结果有两个，不是一个：
+
+```text
+1. KV(x0), KV(x1), KV(x2) 被写入 KV cache
+2. 最后一个位置 x2 的 logits 被 sampler 用来选出 y0
+```
+
+也就是：
+
+```text
+P(y0 | x0, x1, x2)
+```
+
+`y0` 是 prompt 后的首个生成 token。它不是 prompt 的最后一个 token，也不是 tokenizer 的输出。
+
+对于共享前缀，mini-sglang 可以复用已存在的 KV，只计算未命中的 prompt 后缀。对于超长 prompt，chunked prefill 又可以分多轮建立 KV。二者改变的是“本轮新算多少个已知 prompt token”，不改变 prefill 的本质。
+
+### decode：把刚生成的 token 纳入上下文，再预测下一枚
+
+prefill 采样出 `y0` 时，模型已经处理了 `x0, x1, x2`，但还没有处理 `y0` 本身。
+
+采样只是从 logits 中选出一个整数 ID；它不会凭空生成 `KV(y0)`。
+
+为了得到：
+
+```text
+P(y1 | x0, x1, x2, y0)
+```
+
+模型必须把 `y0` 作为下一轮输入。这个一 token 的模型调用就是 decode：
+
+```text
+输入 y0
+  -> 读取 KV(x0), KV(x1), KV(x2)
+  -> 计算并写入 KV(y0)
+  -> 得到 logits
+  -> 采样 y1
+```
+
+然后对 `y1` 重复同样的过程。
+
+```mermaid
+flowchart LR
+    A["文本 prompt"] --> B["tokenizer: CPU input_ids x0..x2"]
+    B --> C["prefill: 计算 prompt 的 KV"]
+    C --> D["最后位置 logits"]
+    D --> E["采样 y0"]
+    E --> F["GPU token_pool 保存 y0"]
+    F --> G["decode: 输入 y0，写入 KV(y0)"]
+    G --> H["采样 y1"]
+    H --> I["下一轮 decode"]
+```
+
+因此一个值得反复使用的判断是：
+
+> “已经采样出 `y0`”不等于“模型已经算出 `KV(y0)`”。后者发生在下一轮 decode。
+
+### token_pool、KV cache 与 CPU input_ids：同一 token 的三种状态
+
+同一枚 `y0` 会出现在三个不同的地方，但它们保存的东西和提交时机不同。
+
+| 位置 | 保存的内容 | 为什么需要它 |
+| --- | --- | --- |
+| GPU `token_pool` | `y0` 的整数 ID | 下一轮 decode 要从这里取出 `y0` 作为模型输入 |
+| GPU KV cache | `y0` 的 K/V 浮点向量 | `y0` 被 decode 处理后，未来 token 要关注它 |
+| CPU `Req.input_ids` | 已确认可由 host 读取的 token IDs | detokenize、回包、host 侧请求状态与前缀管理 |
+
+在 mini-sglang 中，`_forward` 把本轮 sample 得到的 GPU token 写进 `token_pool` 的下一逻辑位置。这样即使 CPU 还没拿到结果，后续 GPU decode 已经拥有它需要的输入 token。
+
+与此同时，`Engine.forward_batch` 发起 `next_tokens_gpu.to("cpu", non_blocking=True)`。这只启动 GPU 到 CPU 的异步拷贝；CPU 得到的 tensor 容器并不保证其中的字节已经写完。
+
+`copy_done` event 记录在该拷贝之后。只有 `copy_done.synchronize()` 返回后，scheduler 才能安全读取 CPU tensor 并调用 `req.append_host(...)`。
+
+若每轮都立刻做全局同步再追加 CPU token，逻辑也能正确，但 CPU 会不断等待 GPU，破坏 overlap。mini-sglang 的设计是让 GPU 的连续推进与 CPU 的延后提交并存。
+
+这一小节之后，后文的长度账本可以这样阅读：
+
+```text
+cached_len：已有 KV 的 token 前缀长度
+device_len：GPU 已处理或为下一输入预留到的位置
+len(input_ids)：CPU 已确认可读的 token 数
+```
+
+它们短暂不相等不是错误，而是异步执行的正常中间状态。
 
 ## 具体问题：为什么不能直接对每个请求调用 `model.forward()`
 
