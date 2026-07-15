@@ -25,6 +25,8 @@
 
 文中标为“建议实验”的内容是教学活动，不代表仓库已经提供了一个可直接跑的 GPU 基准命令。
 
+> 题目驱动阅读：若你更适合先建立因果问题、再读源码细节，可从文末“题目驱动附录：30 道递进问题”开始。它把本章拆为六轮，每次只引入一个新的运行时边界。
+
 ## 具体问题：为什么不能只写一次 `model.forward()`
 
 假设调度器已经选好了五个正在逐 token 生成的请求。
@@ -987,6 +989,83 @@ rank 0 通过 ZMQ 原始 payload 与 gloo message count 让各 rank 收到同序
 最后，初始化和关闭顺序不是装饰。
 
 device/stream、Context、graph、process group 与通信插件的生命周期共同定义了这条执行路径能否安全运行。
+
+## 题目驱动附录：30 道递进问题
+
+这一附录不是另一套考试题，也不要求首次阅读时逐题独立作答。
+
+它是一条更适合从“为什么需要这个对象”进入源码的阅读路线：先用一题建立问题，再回到对应正文、代码和图中补齐答案。后续互动学习应一次只推进一题；答不出时先补当前题缺失的前提，而不是跳到下一组术语。
+
+```text
+第 1 轮：Batch 跨入 Engine 的边界
+第 2 轮：一次 forward 的设备侧推进
+第 3 轮：采样结果为何有 GPU/CPU 两条路径
+第 4 轮：CUDA Graph 怎样约束动态 batch
+第 5 轮：TP 怎样保持控制与计算一致
+第 6 轮：初始化、关闭与全链路复述
+```
+
+### 第 1 轮：Batch 跨入 Engine 的边界
+
+先把第 02 章的 scheduler 边界与本章的 Engine 边界接起来。建议回读“一个贯穿全章的请求故事”以及“从 Batch 到 ForwardOutput”的前两步。
+
+1. 第 02 章的 Scheduler 已经选好 `Batch` 后，Engine 还必须解决哪些 Scheduler 不负责的问题？
+2. 为什么 `Batch` 不能只理解为“若干请求的 Python 列表”，而要包含 positions、映射、页表位置和 attention metadata？
+3. `batch.reqs` 与 `batch.padded_reqs` 分别服务什么语义；为什么不能互换使用？
+4. 在调用 `Engine.forward_batch` 前，`Scheduler._prepare_batch` 已经为真实请求和 dummy 请求分别完成了哪些不同准备？
+5. 为什么 `Engine.forward_batch` 要断言自己运行在 `Engine.stream`，而不是任意当前 CUDA stream？
+
+### 第 2 轮：一次 forward 的设备侧推进
+
+这一轮只关心 Engine 内部如何把一次已准备好的 batch 变成 logits 和下一轮设备状态。建议回读“从 Batch 到 ForwardOutput”的第三到第五步。
+
+6. `with self.ctx.forward_batch(batch)` 在 forward 期间向模型层暴露了什么；离开 `with` 后为什么必须清空 active batch？
+7. 为什么 attention backend 需要通过 `Context.batch` 读取 positions、`out_loc` 和 metadata，而不是由每一层函数手工传入整套对象？
+8. 当前实现用什么精确条件在 CUDA Graph replay 与 eager `model.forward()` 之间选择？
+9. 为什么 eager 是动态形状或超出 graph 覆盖范围时的正确回退，而不表示执行失败？
+10. 模型返回 logits 后，`complete_one()` 为什么只遍历真实 `batch.reqs`；它如何改变 `cached_len` 与 `device_len`？
+
+### 第 3 轮：采样结果为何有 GPU/CPU 两条路径
+
+这一轮建立“logits、sampled token、设备 token 与 host token”之间的边界。建议回读“从 Batch 到 ForwardOutput”的第六、七步以及第 02 章的 token 双路径。
+
+11. logits 为什么不是最终输出 token；Sampler 在这两者之间做了什么选择？
+12. 为什么 `Sampler.sample` 必须使用 `logits[:batch.size]`，而不能对 padded graph 的全部 logits 采样？
+13. 为什么 `ForwardOutput` 同时保存 `next_tokens_gpu` 与 `next_tokens_cpu`？
+14. sampled token 为什么先写入 GPU `token_pool`，而不是等待 CPU `input_ids` 更新后再继续 decode？
+15. `non_blocking=True` 真正承诺了什么；它没有承诺什么？
+16. `copy_done_event.record(self.stream)` 与 `copy_done.synchronize()` 分别位于哪一侧，它们共同建立了什么契约？
+17. 当 `complete_one()` 已执行而 `append_host()` 尚未执行时，为什么请求的 CPU、GPU 与 KV 长度账可以暂时不同？
+
+### 第 4 轮：CUDA Graph 怎样约束动态 batch
+
+这一轮不再把 graph 当作神秘加速开关，而是理解它对形状、buffer 和 dummy 语义提出的约束。建议回读“CUDA Graph：把动态服务中的一小段变成固定形状”。
+
+18. CUDA Graph 主要省去的是哪类重复开销；它没有让哪一部分模型数学自动变快？
+19. 为什么当前 mini-sglang 只对 decode、且真实 batch size 不超过最大捕获尺寸的 batch 尝试 replay？
+20. 已捕获尺寸为 `[1, 2, 4, 8]` 时，真实 decode batch size 为 5，为什么应选择 size 8 而不是 size 4 或临时捕获 size 5？
+21. dummy request 为什么必须拥有合法 token、`table_idx` 和 dummy KV 页，而不能只是空对象？
+22. dummy request 可以参与哪些 kernel 形状相关工作，又绝不能参与哪些用户语义工作？
+23. graph capture 为什么属于 Engine 初始化阶段的成本，而不是每次请求执行时重新发生的工作？
+
+### 第 5 轮：TP 怎样保持控制与计算一致
+
+这一轮区分“让所有 rank 收到同一请求”与“让模型分片交换 GPU tensor”。建议回读“TP 运行时：一条控制线，两条数据通路”。
+
+24. TP 的多个 rank 为什么不是多个互不相关的服务副本；它们为什么必须以兼容顺序进入 collective？
+25. rank 0 接收原始 I/O 后，为什么要同时传播 raw payload 与本轮消息数量？
+26. 若各 rank 接收请求的数量或顺序不同，后续调度和 GPU collective 可能发生什么问题？
+27. ZMQ raw message 广播属于控制面还是 GPU 数据面；模型 all-reduce/all-gather 又属于哪一面？
+28. 启用 PyNCCL 后，为什么 gloo 仍可用于 CPU 控制工作，例如 UID 或消息数量传播？
+
+### 第 6 轮：初始化、关闭与全链路复述
+
+最后把一次运行时的创建、执行与销毁连成闭环。建议回读“从配置到运行时”“启动、环境开关与关闭”以及“正确性与性能不变量”。
+
+29. Engine 为什么要在 CUDA 初始化的早期建立自己的 device、stream、TP 信息和 `Context`；哪些对象被当前代码限制为每进程只初始化一次？
+30. 从“一个已准备好的 decode `Batch`”开始，依次复述：stream 依赖、graph/eager 选择、forward、真实请求进度推进、采样、GPU token 写回、异步 D→H、event 后 host 提交、TP 控制/数据协作，以及关闭时 graph 与通信资源的释放顺序。
+
+完成第 30 题时，你不需要背出每一个类名，但应能指出每一步由 Scheduler、Engine、Sampler、Context 或 TP I/O 中的哪一方负责。若某一步仍只能说“GPU 会处理”，应回到对应轮次继续把输入、状态变化和同步边界说具体。
 
 ## 源码锚点附录
 
